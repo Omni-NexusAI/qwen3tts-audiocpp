@@ -2584,8 +2584,8 @@ if (typeof Alpine === 'undefined') {
     setStatus('Conversation cleared.');
   }
 
-  refs.endpoint.value = localGet('sv_endpoint', 'http://127.0.0.1:1234');
-  refs.model.value = localGet('sv_model', 'gemma-4-e4b');
+  refs.endpoint.value = localGet('sv_endpoint', 'http://host.docker.internal:8818/v1/chat/completions');
+  refs.model.value = localGet('sv_model', 'gemma-4-12B-it-qat-UD-Q4_K_XL.gguf');
   refs['remember-api-key'].checked = localGet('sv_remember_api_key', 'false') === 'true';
   refs['api-key'].value = refs['remember-api-key'].checked ? localGet('sv_api_key', '') : '';
   var savedSystemPrompt = localGet('sv_system_prompt', '');

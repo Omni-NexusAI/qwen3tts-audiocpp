@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+from urllib.parse import urlsplit, urlunsplit
 import subprocess
 import tempfile
 import time
@@ -449,6 +450,45 @@ def _normalize_gradio_seed(payload: dict[str, Any]) -> None:
             payload["seed"] = normalized_seed
 
 
+def _container_reachable_llm_endpoint(endpoint: str) -> str:
+    """Map a Studio user's host-loopback endpoint into the candidate network."""
+    parsed = urlsplit(endpoint)
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return endpoint
+    host = "host.docker.internal"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
+
+
+def _llamacpp_audio_part(data_uri: str) -> dict[str, Any]:
+    """Convert browser-recorded data URIs to llama.cpp's input_audio shape."""
+    header, separator, encoded = data_uri.partition(",")
+    if not separator or not header.startswith("data:audio/") or ";base64" not in header:
+        raise HTTPException(status_code=422, detail="Streaming Playground requires base64 audio data.")
+    audio_format = header.removeprefix("data:audio/").split(";", 1)[0].lower()
+    if audio_format in {"x-wav", "wave"}:
+        audio_format = "wav"
+    return {"type": "input_audio", "input_audio": {"data": encoded, "format": audio_format}}
+
+
+def _llamacpp_history(messages: list[Any]) -> list[dict[str, Any]]:
+    """Keep text history valid when earlier Studio turns originated from audio."""
+    safe: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        if role not in {"user", "assistant", "system"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            safe.append({"role": role, "content": content})
+        elif role == "user" and message.get("audio_data_url"):
+            safe.append({"role": "user", "content": "[Earlier spoken user turn]"})
+    return safe
+
+
 def _voice_profiles() -> list[dict[str, Any]]:
     """Expose only candidate-private Base profiles through the OpenAI boundary."""
     profiles: list[dict[str, Any]] = []
@@ -662,18 +702,18 @@ async def _voice_clone_response(payload: dict[str, Any]) -> Response:
 async def llamacpp_audio_turn(request: Request) -> StreamingResponse:
     """Pass through the Studio's user-configured llama.cpp SSE turn."""
     payload = await request.json()
-    endpoint = str(payload.pop("endpoint", "")).strip()
+    endpoint = _container_reachable_llm_endpoint(str(payload.pop("endpoint", "")).strip())
     api_key = str(payload.pop("api_key", "")).strip()
     if not endpoint.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="A valid llama.cpp HTTP endpoint is required.")
     messages = [{"role": "system", "content": payload.pop("system_prompt", "")}]
-    messages.extend(payload.pop("history", []))
+    messages.extend(_llamacpp_history(payload.pop("history", [])))
     messages.append(
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": payload.pop("prompt", "Respond to the spoken message.")},
-                {"type": "audio_url", "audio_url": {"url": payload.pop("audio_data_url")}},
+                _llamacpp_audio_part(str(payload.pop("audio_data_url", ""))),
             ],
         }
     )
