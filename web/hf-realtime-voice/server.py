@@ -75,18 +75,57 @@ LIMITER_ENABLED = bool(LOAD_BALANCER_URL) and bool(SPACE_ID)
 SERPER_URL = "https://google.serper.dev/search"
 # Cap results so the tool output stays small enough to feed back to the model.
 MAX_RESULTS = 5
-LOCAL_UI_API_VERSION = 12
+LOCAL_UI_API_VERSION = 14
 HERE = os.path.dirname(os.path.abspath(__file__))
+_repo_runtime_dir = Path(HERE).parents[1] / ".runtime"
+# In the repository the legacy shared runtime is two levels above the UI.
+# The self-contained candidate installs this module at /opt/voice-studio, so
+# that parent does not exist there; candidate settings instead live under its
+# private VOICE_LIBRARY_DIR.
+_legacy_runtime_dir = (Path(HERE).parents[2] / ".runtime") if len(Path(HERE).parents) > 2 else _repo_runtime_dir
+_ui_settings_default = (
+    Path(os.environ["VOICE_LIBRARY_DIR"]) / "hf_realtime_ui_settings.json"
+    if os.environ.get("VOICE_LIBRARY_DIR")
+    else _repo_runtime_dir / "hf_realtime_ui_settings.json"
+)
+UI_SETTINGS_PATH = Path(os.environ.get("S2S_UI_SETTINGS_PATH", str(_ui_settings_default)))
+AUDIO_CPP_VALIDATION_PATH = UI_SETTINGS_PATH.with_name("audio_cpp_validation.json")
+TTS_VALIDATION_PATH = UI_SETTINGS_PATH.with_name("tts_backend_validation.json")
+_LEGACY_UI_SETTINGS_PATH = _legacy_runtime_dir / UI_SETTINGS_PATH.name
+_LEGACY_AUDIO_CPP_VALIDATION_PATH = _legacy_runtime_dir / AUDIO_CPP_VALIDATION_PATH.name
+_LEGACY_TTS_VALIDATION_PATH = _legacy_runtime_dir / TTS_VALIDATION_PATH.name
+PUBLIC_UI_SETTING_KEYS = {
+    "directUrl",
+    "voice",
+    "instructions",
+    "noiseGate",
+    "echoGuard",
+    "fullBufferTts",
+    "liveTranscript",
+    "maxResponseTokens",
+    "ttsBackend",
+    "modelProvider",
+    "modelUrl",
+    "modelName",
+    "voiceByBackend",
+}
 DEFAULT_QWEN3_VOICE_ID = "16d9bb336799"
 DEFAULT_QWEN3_VOICE = f"clone:{DEFAULT_QWEN3_VOICE_ID}"
 TTS_BACKENDS = {
-    "faster": {"endpoint": "http://127.0.0.1:8881/v1", "requiredModel": "1.7B-Base"},
-    "groxaxo": {"endpoint": "http://127.0.0.1:8882/v1", "requiredModel": None},
+    "faster": {
+        "endpoint": "http://127.0.0.1:8881/v1", "requiredModel": "1.7B-Base",
+        "displayName": "FasterQwen3TTS", "profileMode": "local", "explicitValidation": False,
+    },
+    "groxaxo": {
+        "endpoint": "http://127.0.0.1:8882/v1", "requiredModel": None,
+        "displayName": "Groxaxo candidate", "profileMode": "readonly", "explicitValidation": False,
+    },
     # This endpoint is intentionally opt-in.  audio.cpp is a separately managed
     # candidate and is never started, stopped, or selected by this application.
     "qwen3tts-audiocpp": {
         "endpoint": os.environ.get("AUDIO_CPP_TTS_BASE_URL", "http://127.0.0.1:8890/v1"),
         "requiredModel": "qwen3-tts",
+        "displayName": "Qwen3TTS audio.cpp", "profileMode": "remote", "explicitValidation": True,
     },
 }
 DEFAULT_VOICE_LIBRARY_DIR = Path(
@@ -97,6 +136,113 @@ DEFAULT_VOICE_LIBRARY_DIR = Path(
 ).expanduser()
 
 app = FastAPI(title="s2s-demo")
+
+
+def _read_public_ui_settings() -> dict[str, Any]:
+    """Load local non-secret UI settings, if the managed frontend has saved any."""
+    paths = (UI_SETTINGS_PATH, _LEGACY_UI_SETTINGS_PATH) if UI_SETTINGS_PATH == _ui_settings_default else (UI_SETTINGS_PATH,)
+    for path in paths:
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(saved, dict):
+            return saved
+    return {}
+
+
+def _write_public_ui_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    """Atomically save frontend preferences without ever retaining API keys."""
+    existing = _read_public_ui_settings()
+    for key in PUBLIC_UI_SETTING_KEYS:
+        value = payload.get(key)
+        if key == "voiceByBackend" and isinstance(value, dict):
+            existing[key] = {
+                str(provider)[:64]: str(voice)[:256]
+                for provider, voice in value.items()
+                if provider in TTS_BACKENDS and isinstance(voice, str) and voice.startswith("clone:")
+            }
+        elif isinstance(value, (str, int, float, bool)):
+            existing[key] = value
+    UI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = UI_SETTINGS_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(UI_SETTINGS_PATH)
+    return existing
+
+
+def _read_audio_cpp_validation() -> dict[str, str]:
+    saved: Any = None
+    paths = (
+        (AUDIO_CPP_VALIDATION_PATH, _LEGACY_AUDIO_CPP_VALIDATION_PATH)
+        if AUDIO_CPP_VALIDATION_PATH == _ui_settings_default.with_name("audio_cpp_validation.json")
+        else (AUDIO_CPP_VALIDATION_PATH,)
+    )
+    for path in paths:
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            break
+        except (OSError, ValueError):
+            continue
+    if not isinstance(saved, dict):
+        return {}
+    model_id = saved.get("model_id")
+    profile_id = saved.get("profile_id")
+    if not isinstance(model_id, str) or not isinstance(profile_id, str):
+        return {}
+    return {"model_id": model_id, "profile_id": profile_id, "validated_at": str(saved.get("validated_at") or "")}
+
+
+def _write_audio_cpp_validation(model_id: str, profile_id: str) -> dict[str, str]:
+    """Remember a successful candidate capability probe, not a model lifecycle action."""
+    saved = {
+        "model_id": model_id,
+        "profile_id": profile_id,
+        "validated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    AUDIO_CPP_VALIDATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = AUDIO_CPP_VALIDATION_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(AUDIO_CPP_VALIDATION_PATH)
+    return saved
+
+
+def _read_tts_validations() -> dict[str, Any]:
+    saved: Any = None
+    paths = (
+        (TTS_VALIDATION_PATH, _LEGACY_TTS_VALIDATION_PATH)
+        if TTS_VALIDATION_PATH == _ui_settings_default.with_name("tts_backend_validation.json")
+        else (TTS_VALIDATION_PATH,)
+    )
+    for path in paths:
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            break
+        except (OSError, ValueError):
+            continue
+    if not isinstance(saved, dict):
+        saved = {}
+    legacy = _read_audio_cpp_validation()
+    if legacy and "qwen3tts-audiocpp" not in saved:
+        saved["qwen3tts-audiocpp"] = {
+            "model": legacy.get("model_id"), "voice": f"clone:{legacy.get('profile_id')}",
+            "validatedAt": legacy.get("validated_at", ""), "speech": True,
+        }
+    return saved
+
+
+def _write_tts_validation(backend: str, model: str | None, voice: str) -> dict[str, Any]:
+    saved = _read_tts_validations()
+    entry = {
+        "model": model, "voice": voice, "speech": True,
+        "validatedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    saved[backend] = entry
+    TTS_VALIDATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = TTS_VALIDATION_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(TTS_VALIDATION_PATH)
+    return entry
 
 # Wire HF OAuth before the app serves (no-op unless the OAuth env is present).
 # Sign-in only matters when we're metering (prod Space), so gate it on that.
@@ -168,6 +314,16 @@ class AudioCppValidationRequest(BaseModel):
 
 class AudioCppModelSwitchRequest(BaseModel):
     model_id: str
+
+
+@app.get("/api/ui-settings")
+def get_public_ui_settings():
+    return {"settings": _read_public_ui_settings(), "apiKeysPersisted": False}
+
+
+@app.put("/api/ui-settings")
+def save_public_ui_settings(payload: dict[str, Any]):
+    return {"settings": _write_public_ui_settings(payload), "apiKeysPersisted": False}
 
 
 class VoiceStudioSynthesisRequest(BaseModel):
@@ -333,6 +489,144 @@ def _profile_response(library_dir: Path) -> dict[str, Any]:
 def qwen3_voices():
     """Return saved Faster-side Base clone profiles for the realtime settings UI."""
     return _profile_response(DEFAULT_VOICE_LIBRARY_DIR)
+
+
+def _normalize_remote_voices(payload: Any) -> list[dict[str, Any]]:
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if items is None and isinstance(payload, dict):
+        items = payload.get("voices")
+    normalized: list[dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        raw_voice = str(item.get("voice") or item.get("id") or "")
+        if not raw_voice.startswith("clone:"):
+            if str(item.get("task") or item.get("task_type") or "").lower() == "base" and raw_voice:
+                raw_voice = f"clone:{raw_voice}"
+            else:
+                continue
+        normalized.append({
+            "id": str(item.get("profile_id") or item.get("id") or raw_voice.removeprefix("clone:")),
+            "voice": raw_voice,
+            "name": str(item.get("name") or raw_voice.removeprefix("clone:")),
+            "task_type": "Base",
+            "language": str(item.get("language") or "Auto"),
+            "ref_text": str(item.get("ref_text") or ""),
+        })
+    return normalized
+
+
+async def _backend_voice_inventory(backend: str) -> dict[str, Any]:
+    if backend not in TTS_BACKENDS:
+        raise HTTPException(status_code=404, detail="Unknown TTS backend.")
+    config = TTS_BACKENDS[backend]
+    endpoint = str(config["endpoint"]).rstrip("/")
+    base = {
+        "backend": backend,
+        "displayName": config.get("displayName", backend),
+        "reachable": False,
+        "writable": config.get("profileMode") in {"local", "remote"},
+        "management": config.get("profileMode"),
+        "defaultVoice": DEFAULT_QWEN3_VOICE if backend == "faster" else None,
+        "selectedVoice": None,
+        "voices": [],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as http:
+            if backend == "qwen3tts-audiocpp":
+                response = await http.get(f"{endpoint}/voices/profiles")
+                response.raise_for_status()
+                remote = response.json()
+                base.update(
+                    reachable=True,
+                    voices=_normalize_remote_voices(remote),
+                    defaultVoice=remote.get("defaultVoice"),
+                    selectedVoice=remote.get("selectedVoice"),
+                )
+                return base
+            response = await http.get(f"{endpoint}/voices")
+            response.raise_for_status()
+            remote_voices = _normalize_remote_voices(response.json())
+            base["reachable"] = True
+            if backend == "faster":
+                local = _load_base_clone_profiles(DEFAULT_VOICE_LIBRARY_DIR)
+                live_names = {
+                    str(item["voice"]).removeprefix("clone:").casefold()
+                    for item in remote_voices
+                }
+                reconciled = [item for item in local if str(item.get("name") or "").casefold() in live_names]
+                base["voices"] = reconciled
+                profile_state = _profile_response(DEFAULT_VOICE_LIBRARY_DIR)
+                base["selectedVoice"] = profile_state["selectedVoice"]
+                if not any(item["voice"] == DEFAULT_QWEN3_VOICE for item in reconciled) and reconciled:
+                    base["defaultVoice"] = reconciled[0]["voice"]
+            else:
+                base["voices"] = remote_voices
+                base["writable"] = False
+                base["defaultVoice"] = remote_voices[0]["voice"] if remote_voices else None
+    except Exception as exc:
+        base["error"] = f"{type(exc).__name__}: {exc}"
+    return base
+
+
+@app.get("/api/tts/backends/{backend}/voices")
+async def backend_voices(backend: str):
+    return await _backend_voice_inventory(backend)
+
+
+async def _remote_profile_request(backend: str, method: str, suffix: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    endpoint = str(TTS_BACKENDS[backend]["endpoint"]).rstrip("/")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=3.0)) as http:
+        response = await http.request(method, f"{endpoint}/voices/profiles{suffix}", json=payload)
+        if response.is_error:
+            try:
+                detail = response.json().get("detail")
+            except Exception:
+                detail = response.text
+            raise HTTPException(status_code=response.status_code, detail=detail or "Backend profile operation failed.")
+        return response.json()
+
+
+@app.post("/api/tts/backends/{backend}/profiles")
+async def create_backend_profile(backend: str, request: Request):
+    payload = await request.json()
+    if backend == "faster":
+        if payload.get("audio_base64"):
+            return import_qwen3_profile(ProfileImportRequest(**payload))
+        return create_qwen3_profile(ProfileCreateRequest(**payload))
+    if backend == "qwen3tts-audiocpp":
+        if payload.get("audio_base64"):
+            payload["ref_audio"] = payload.pop("audio_base64")
+        return await _remote_profile_request(backend, "POST", "", payload)
+    raise HTTPException(status_code=409, detail="The selected backend exposes clone inventory only; manage it in its own Voice Studio.")
+
+
+@app.patch("/api/tts/backends/{backend}/profiles/{profile_id}")
+async def edit_backend_profile(backend: str, profile_id: str, request: Request):
+    payload = await request.json()
+    if backend == "faster":
+        return edit_qwen3_profile(profile_id, ProfileEditRequest(**payload))
+    if backend == "qwen3tts-audiocpp":
+        return await _remote_profile_request(backend, "PATCH", f"/{profile_id}", payload)
+    raise HTTPException(status_code=409, detail="The selected backend profile library is read-only here.")
+
+
+@app.delete("/api/tts/backends/{backend}/profiles/{profile_id}")
+async def delete_backend_profile(backend: str, profile_id: str):
+    if backend == "faster":
+        return delete_qwen3_profile(profile_id)
+    if backend == "qwen3tts-audiocpp":
+        return await _remote_profile_request(backend, "DELETE", f"/{profile_id}")
+    raise HTTPException(status_code=409, detail="The selected backend profile library is read-only here.")
+
+
+@app.post("/api/tts/backends/{backend}/profiles/{profile_id}/select")
+async def select_backend_profile(backend: str, profile_id: str):
+    if backend == "faster":
+        return select_qwen3_profile(ProfileSelectRequest(profile_id=profile_id))
+    if backend == "qwen3tts-audiocpp":
+        return await _remote_profile_request(backend, "POST", f"/{profile_id}/select")
+    return await _backend_voice_inventory(backend)
 
 
 @app.post("/api/qwen3/profiles")
@@ -597,17 +891,20 @@ async def _probe_audio_cpp_candidate(
     endpoint = str(config["endpoint"]).rstrip("/")
     control_endpoint = os.environ.get("AUDIO_CPP_CONTROL_URL", f"{endpoint.removesuffix('/v1')}/control").rstrip("/")
     candidate_models = _audio_cpp_model_ids()
-    expected_model = model_id or candidate_models[-1]
-    if expected_model not in candidate_models:
+    requested_model = model_id or None
+    if requested_model and requested_model not in candidate_models:
         raise HTTPException(status_code=400, detail="The requested audio.cpp model is not configured for this candidate.")
     result: dict[str, Any] = {
         "id": "qwen3tts-audiocpp",
         "endpoint": endpoint,
+        "displayName": "Qwen3TTS audio.cpp",
+        "profileMode": "remote",
+        "explicitValidation": True,
         "reachable": False,
         "streaming": False,
         "cloneCompatible": False,
         "currentModel": None,
-        "requiredModel": expected_model,
+        "requiredModel": requested_model,
         "ready": False,
         "capabilityChecked": run_speech_probe,
         "limitations": [
@@ -615,7 +912,11 @@ async def _probe_audio_cpp_candidate(
         ],
     }
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=2.0)) as http:
+        # Health/model polling should stay quick, but the one-time Base-clone
+        # synthesis deliberately follows the candidate's normal speech timeout.
+        # A 1.7B cold/warm request can exceed the old eight-second probe window.
+        timeout = httpx.Timeout(600.0, connect=5.0) if run_speech_probe else httpx.Timeout(8.0, connect=2.0)
+        async with httpx.AsyncClient(timeout=timeout) as http:
             health = await http.get(f"{endpoint.removesuffix('/v1')}/health")
             health.raise_for_status()
             result["reachable"] = True
@@ -625,20 +926,41 @@ async def _probe_audio_cpp_candidate(
             models = models_response.json().get("data") or []
             ids = [str(item.get("id")) for item in models if isinstance(item, dict) and item.get("id")]
             result["models"] = ids
-            if expected_model not in ids:
-                result["error"] = f"Expected audio.cpp model {expected_model!r} was not advertised."
-                return result
             runtime = (health.json().get("backend") or {}).get("runtime") or {}
             current_model = (health.json().get("backend") or {}).get("model_id")
             result["currentModel"] = current_model
             result["progressivePcm"] = bool(runtime.get("progressive_phrase_pcm"))
             result["nativeIncrementalPcm"] = bool(runtime.get("native_incremental_pcm"))
-            if current_model != expected_model:
-                result["error"] = f"Load {expected_model!r} in the isolated audio.cpp Voice Studio before selecting this provider."
+            if requested_model and current_model != requested_model:
+                result["error"] = f"Load {requested_model!r} in the isolated audio.cpp Voice Studio before selecting this provider."
                 result["state"] = runtime.get("state") or "unloaded"
                 return result
+            if current_model not in ids:
+                result["error"] = "Load one of the configured audio.cpp models in Voice Studio before selecting this provider."
+                result["state"] = runtime.get("state") or "unloaded"
+                return result
+            result["requiredModel"] = current_model
             if not run_speech_probe:
-                result["error"] = "Run the explicit candidate validation after loading a model in Voice Studio."
+                validation = _read_tts_validations().get("qwen3tts-audiocpp") or {}
+                validation_voice = str(validation.get("voice") or "")
+                validation_profile = validation_voice.removeprefix("clone:")
+                if validation.get("model") == current_model and validation.get("speech"):
+                    voices_response = await http.get(f"{endpoint}/voices")
+                    voices_response.raise_for_status()
+                    candidate_voice_ids = {
+                        str(item.get("id")) for item in voices_response.json().get("data") or [] if isinstance(item, dict)
+                    }
+                    if validation_profile in candidate_voice_ids:
+                        result.update(
+                            capabilityChecked=True,
+                            cloneCompatible=True,
+                            ready=True,
+                            streaming=bool(result["progressivePcm"]),
+                            mode="progressive-phrase-pcm",
+                            validation=validation,
+                        )
+                        return result
+                result["error"] = "Validate the loaded audio.cpp model and selected Base clone once from TTS Backend."
                 return result
             voices_response = await http.get(f"{endpoint}/voices")
             voices_response.raise_for_status()
@@ -648,7 +970,7 @@ async def _probe_audio_cpp_candidate(
                 result["cloneCompatible"] = False
                 return result
             payload: dict[str, Any] = {
-                "model": expected_model,
+                "model": current_model,
                 "input": "Capability check.",
                 "voice": f"clone:{profile_id}" if profile_id else "default",
                 "response_format": "pcm",
@@ -687,9 +1009,12 @@ async def _probe_audio_cpp_candidate(
 async def validate_audio_cpp_candidate(req: AudioCppValidationRequest):
     if req.profile_id:
         await _sync_audio_cpp_profile(req.profile_id)
-    return await _probe_audio_cpp_candidate(
+    result = await _probe_audio_cpp_candidate(
         run_speech_probe=True, model_id=req.model_id, profile_id=req.profile_id
     )
+    if result.get("ready") and req.profile_id and result.get("currentModel"):
+        result["validation"] = _write_audio_cpp_validation(str(result["currentModel"]), req.profile_id)
+    return result
 
 
 @app.post("/api/tts/audio-cpp/select-model")
@@ -707,6 +1032,21 @@ async def select_audio_cpp_model(req: AudioCppModelSwitchRequest):
 
 def _audio_cpp_proxy_base() -> str:
     return str(TTS_BACKENDS["qwen3tts-audiocpp"]["endpoint"]).rstrip("/")
+
+
+@app.get("/api/audio-cpp/settings")
+async def proxy_audio_cpp_settings() -> Response:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as http:
+        upstream = await http.get(f"{_audio_cpp_proxy_base()}/voice-studio/settings")
+    return Response(content=upstream.content, status_code=upstream.status_code, media_type="application/json")
+
+
+@app.put("/api/audio-cpp/settings")
+async def save_proxy_audio_cpp_settings(request: Request) -> Response:
+    payload = await request.json()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as http:
+        upstream = await http.put(f"{_audio_cpp_proxy_base()}/voice-studio/settings", json=payload)
+    return Response(content=upstream.content, status_code=upstream.status_code, media_type="application/json")
 
 
 @app.post("/api/audio-cpp/audio/speech")
@@ -798,6 +1138,9 @@ async def _probe_tts_backend(name: str, config: dict) -> dict:
     result = {
         "id": name,
         "endpoint": endpoint,
+        "displayName": config.get("displayName", name),
+        "profileMode": config.get("profileMode", "readonly"),
+        "explicitValidation": bool(config.get("explicitValidation")),
         "reachable": False,
         "streaming": False,
         "cloneCompatible": False,
@@ -849,6 +1192,73 @@ async def tts_backends():
         *(_probe_tts_backend(name, config) for name, config in TTS_BACKENDS.items())
     )
     return {"default": "faster", "backends": statuses}
+
+
+def _voice_for_backend_request(backend: str, voice: str) -> str:
+    if backend not in {"faster", "groxaxo"} or not voice.startswith("clone:"):
+        return voice
+    profile_id = voice.removeprefix("clone:")
+    try:
+        profile = _read_profile(DEFAULT_VOICE_LIBRARY_DIR, profile_id)
+    except HTTPException:
+        return voice
+    name = str(profile.get("name") or "").strip()
+    return f"clone:{name}" if name else voice
+
+
+@app.post("/api/tts/backends/{backend}/validate")
+async def validate_tts_backend(backend: str, request: Request):
+    if backend not in TTS_BACKENDS:
+        raise HTTPException(status_code=404, detail="Unknown TTS backend.")
+    payload = await request.json()
+    voice = str(payload.get("voice") or "")
+    inventory = await _backend_voice_inventory(backend)
+    voices = {str(item.get("voice")) for item in inventory.get("voices") or []}
+    if not inventory.get("reachable"):
+        raise HTTPException(status_code=503, detail=inventory.get("error") or "Selected TTS backend is unreachable.")
+    if not voice or voice not in voices:
+        raise HTTPException(status_code=409, detail="The selected Base clone is not present in the selected backend inventory.")
+
+    if backend == "qwen3tts-audiocpp":
+        profile_id = voice.removeprefix("clone:")
+        result = await _probe_audio_cpp_candidate(run_speech_probe=True, profile_id=profile_id)
+        if not result.get("ready"):
+            return result
+        validation = _write_tts_validation(backend, str(result.get("currentModel") or ""), voice)
+        _write_audio_cpp_validation(str(result.get("currentModel") or ""), profile_id)
+        result["validation"] = validation
+        return result
+
+    status = await _probe_tts_backend(backend, TTS_BACKENDS[backend])
+    if not status.get("ready"):
+        raise HTTPException(status_code=409, detail=status.get("error") or "Selected backend has no ready Base model.")
+    endpoint = str(TTS_BACKENDS[backend]["endpoint"]).rstrip("/")
+    model = "qwen3-tts" if backend == "faster" else str(status.get("currentModel") or "qwen3-tts")
+    started = asyncio.get_running_loop().time()
+    request_payload = {
+        "model": model,
+        "input": "Backend validation complete.",
+        "voice": _voice_for_backend_request(backend, voice),
+        "response_format": "pcm",
+        "stream": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=5.0)) as http:
+            response = await http.post(f"{endpoint}/audio/speech", json=request_payload)
+            response.raise_for_status()
+            audio = response.content
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Selected backend speech validation failed: {exc}") from exc
+    if not audio:
+        raise HTTPException(status_code=502, detail="Selected backend returned no speech bytes.")
+    validation = _write_tts_validation(backend, str(status.get("currentModel") or model), voice)
+    return {
+        **status,
+        "ready": True,
+        "cloneCompatible": True,
+        "speechProbe": {"bytes": len(audio), "elapsedMs": round((asyncio.get_running_loop().time() - started) * 1000)},
+        "validation": validation,
+    }
 
 
 @app.get("/api/me")

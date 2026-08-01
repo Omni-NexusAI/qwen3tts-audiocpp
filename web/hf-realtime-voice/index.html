@@ -314,7 +314,7 @@
             </label>
 
             <details class="field profile-manager">
-              <summary>Manage Faster clone profiles</summary>
+              <summary>Manage selected backend clone profiles</summary>
               <small id="profile-library-status">Loading configured Faster voice library…</small>
               <label class="field">
                 <span>Profile name</span>
@@ -338,11 +338,11 @@
                 <input id="profile-audio" type="file" accept="audio/wav,.wav" />
               </label>
               <button id="profile-import" type="button" class="btn">Import as new clone</button>
-              <small>Profiles are written only to the configured Faster voice library. Base clone metadata and WAV references stay compatible with the existing service.</small>
+              <small>Profile actions target only the selected backend and are disabled when that backend is inventory-only.</small>
             </details>
 
             <details class="field model-manager">
-              <summary>Faster model inventory</summary>
+              <summary>Selected backend model status</summary>
               <small id="model-inventory-status">Loading Faster model state…</small>
               <div class="profile-actions">
                 <button id="faster-model-load" type="button" class="btn">Load</button>
@@ -353,14 +353,8 @@
             </details>
 
             <div class="field">
-              <label class="field">
-                <span>audio.cpp test model</span>
-                <select id="audio-cpp-model">
-                  <option value="qwen3-tts-1.7b-base-bf16">Qwen3-TTS 1.7B Base (BF16)</option>
-                </select>
-              </label>
-              <button id="validate-audio-cpp" type="button" class="btn">Validate audio.cpp candidate</button>
-              <small id="audio-cpp-status">Choose 0.6B or 1.7B for a direct Studio test. The service lazy-loads the requested BF16 model; load/switch/unload controls remain unavailable because audio.cpp does not expose lifecycle endpoints.</small>
+              <button id="validate-audio-cpp" type="button" class="btn">Validate selected TTS backend</button>
+              <small id="audio-cpp-status">Checks live health, resident model, selected clone, capabilities, and a short real synthesis without changing model residency.</small>
             </div>
 
             <div class="field">
@@ -439,6 +433,7 @@
         </div>
 
         <footer class="modal-footer">
+          <small id="settings-save-status"></small>
           <button id="settings-save" type="submit" class="btn primary" value="save">Save</button>
         </footer>
       </form>
@@ -505,6 +500,6 @@
       </div>
     </dialog>
 
-    <script type="module" src="main.js?v=11-voice-studio"></script>
+    <script type="module" src="main.js?v=14-audio-cpp-live-voices"></script>
   </body>
 </html>

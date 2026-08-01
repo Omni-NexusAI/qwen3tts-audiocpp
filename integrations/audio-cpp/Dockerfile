@@ -49,7 +49,7 @@ COPY integrations/audio-cpp/qwen3-tts-base-f16.json /config/qwen3-tts-base-f16.j
 WORKDIR /opt/voice-studio
 COPY web/hf-realtime-voice/requirements.txt .
 RUN python3 -m pip install --no-cache-dir -r requirements.txt "gradio>=5,<6"
-ARG VOICE_STUDIO_SOURCE_REV=progressive-pcm-20260730
+ARG VOICE_STUDIO_SOURCE_REV=voice-studio-ui-and-hfrt-reliability-20260801
 RUN test -n "$VOICE_STUDIO_SOURCE_REV"
 COPY web/hf-realtime-voice/ .
 COPY integrations/audio-cpp/gradio_voice_studio.py /opt/voice-studio/gradio_voice_studio.py

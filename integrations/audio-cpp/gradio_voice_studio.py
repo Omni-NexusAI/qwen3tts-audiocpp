@@ -1476,6 +1476,45 @@ if (typeof Alpine === 'undefined') {
   font-size: 0.9rem;
   gap: 5px;
 }
+#__UID__ .sv-field-label {
+  align-items: center;
+  display: inline-flex;
+  gap: 5px;
+}
+#__UID__ .sv-help {
+  align-items: center;
+  background: rgba(249, 115, 22, 0.10);
+  border: 1px solid rgba(249, 115, 22, 0.35);
+  border-radius: 999px;
+  color: #c2410c;
+  cursor: help;
+  display: inline-flex;
+  font-size: 0.72rem;
+  font-weight: 700;
+  height: 18px;
+  justify-content: center;
+  line-height: 1;
+  width: 18px;
+}
+#__UID__ .sv-help:focus { outline: 2px solid var(--sv-accent); outline-offset: 2px; }
+#__UID__ .sv-check-field {
+  align-items: center;
+  color: var(--sv-muted);
+  cursor: pointer;
+  display: inline-flex;
+  flex-direction: row;
+  font-size: 0.9rem;
+  gap: 8px;
+}
+#__UID__ .sv-checkbox {
+  appearance: auto;
+  cursor: pointer;
+  height: 17px;
+  margin: 0;
+  min-height: 0;
+  padding: 0;
+  width: 17px;
+}
 #__UID__ .sv-input,
 #__UID__ .sv-select,
 #__UID__ .sv-textarea {
@@ -1698,60 +1737,83 @@ if (typeof Alpine === 'undefined') {
 </style>
 
 <details class="sv-settings">
-  <summary>Live scaffolding settings (TTS output is buffered)</summary>
+  <summary>LLM connection</summary>
   <div class="sv-settings-grid">
     <div class="sv-settings-title">llama.cpp chat</div>
-    <label class="sv-field">llama.cpp endpoint
+    <label class="sv-field"><span class="sv-field-label">llama.cpp endpoint <span class="sv-help" tabindex="0" title="OpenAI-compatible llama.cpp chat endpoint. A bare server URL is normalized to /v1/chat/completions.">i</span></span>
       <input class="sv-input" data-role="endpoint" type="text" placeholder="http://127.0.0.1:1234">
     </label>
-    <label class="sv-field">Model name
+    <label class="sv-field"><span class="sv-field-label">Model name <span class="sv-help" tabindex="0" title="The chat model name sent to the configured llama.cpp endpoint.">i</span></span>
       <input class="sv-input" data-role="model" type="text" placeholder="gemma-4-e4b">
     </label>
-    <label class="sv-field">API key
+    <label class="sv-field"><span class="sv-field-label">API key <span class="sv-help" tabindex="0" title="Optional llama.cpp bearer key. It stays in this browser unless explicitly remembered.">i</span></span>
       <input class="sv-input" data-role="api-key" type="password" placeholder="Optional">
     </label>
-    <label class="sv-field">System prompt optional
+    <label class="sv-field"><span class="sv-field-label">System prompt optional <span class="sv-help" tabindex="0" title="Additional chat instructions for this Studio session. Leave empty to use the server-side prompt only.">i</span></span>
       <textarea class="sv-textarea" data-role="system-prompt" rows="3" placeholder="Leave empty to use only the server-side prompt."></textarea>
     </label>
     <div class="sv-row">
-      <label class="sv-field"><input data-role="remember-api-key" type="checkbox"> Remember API key on this browser</label>
+      <label class="sv-check-field"><input class="sv-checkbox" data-role="remember-api-key" type="checkbox"> Remember API key on this browser <span class="sv-help" tabindex="0" title="Stores this key only in this browser profile. It is never saved in candidate profile storage.">i</span></label>
       <button class="sv-button sv-button-secondary" data-action="save-llm-settings" type="button">Save LLM settings</button>
       <span class="sv-status" data-role="llm-save-status"></span>
     </div>
-    <div class="sv-settings-title">Mic thresholds</div>
+  </div>
+</details>
+
+<details class="sv-settings">
+  <summary>Diagnostics &amp; tuning (buffered audio.cpp TTS)</summary>
+  <div class="sv-settings-grid">
+    <div class="sv-settings-title">Microphone transport</div>
     <div class="sv-settings-row">
-      <label class="sv-field">Speech threshold
+      <label class="sv-field"><span class="sv-field-label">LLM microphone format <span class="sv-help" tabindex="0" title="Complete per-turn microphone file sent to llama.cpp. WAV is lossless; MP3 is an explicit compatibility A/B path.">i</span></span>
+        <select class="sv-select" data-role="llm-input-format">
+          <option value="wav">WAV PCM16 — lossless</option>
+          <option value="mp3">MP3 320 kbps — compatibility/A-B</option>
+        </select>
+      </label>
+      <label class="sv-field"><span class="sv-field-label">LLM microphone sample rate <span class="sv-help" tabindex="0" title="Capture resampling rate for the file sent to llama.cpp. 16 kHz is the known-compatible default.">i</span></span>
+        <select class="sv-select" data-role="llm-input-rate">
+          <option value="16000">16 kHz — known compatible</option>
+          <option value="24000">24 kHz</option>
+          <option value="48000">48 kHz</option>
+        </select>
+      </label>
+    </div>
+    <div class="sv-settings-row">
+      <label class="sv-field"><span class="sv-field-label">Speech threshold <span class="sv-help" tabindex="0" title="PCM level needed before VAD begins a candidate turn.">i</span></span>
         <input class="sv-input" data-role="speech-threshold" type="number" min="0.001" max="1" step="0.001">
       </label>
-      <label class="sv-field">Start hold ms
+      <label class="sv-field"><span class="sv-field-label">Start hold ms <span class="sv-help" tabindex="0" title="Continuous speech time required to accept a new turn.">i</span></span>
         <input class="sv-input" data-role="start-hold" type="number" min="0" max="3000" step="25">
       </label>
-      <label class="sv-field">Silence send delay ms
+      <label class="sv-field"><span class="sv-field-label">Silence send delay ms <span class="sv-help" tabindex="0" title="Silence duration that closes and sends an accepted turn.">i</span></span>
         <input class="sv-input" data-role="silence-delay" type="number" min="100" max="5000" step="50">
       </label>
-      <label class="sv-field">Minimum utterance ms
+      <label class="sv-field"><span class="sv-field-label">Minimum utterance ms <span class="sv-help" tabindex="0" title="Shorter accepted audio is discarded before llama.cpp is called.">i</span></span>
         <input class="sv-input" data-role="min-utterance" type="number" min="100" max="5000" step="50">
       </label>
-      <label class="sv-field">Maximum utterance sec
+      <label class="sv-field"><span class="sv-field-label">Maximum utterance sec <span class="sv-help" tabindex="0" title="Safety cap for one microphone turn before it is sent.">i</span></span>
         <input class="sv-input" data-role="max-utterance" type="number" min="2" max="180" step="1">
       </label>
-      <label class="sv-field">Pre-roll ms
+      <label class="sv-field"><span class="sv-field-label">Pre-roll ms <span class="sv-help" tabindex="0" title="PCM retained immediately before VAD starts, helping preserve the start of speech.">i</span></span>
         <input class="sv-input" data-role="pre-roll" type="number" min="0" max="2000" step="25">
       </label>
     </div>
     <div class="sv-settings-title">Progressive PCM diagnostics</div>
     <div class="sv-settings-row">
-      <label class="sv-field">Phrase minimum characters
+      <label class="sv-field"><span class="sv-field-label">Phrase minimum characters <span class="sv-help" tabindex="0" title="Shortest stable LLM phrase eligible for buffered audio.cpp TTS. Lower can improve start latency but may split prosody.">i</span></span>
         <input class="sv-input" data-role="phrase-min" type="number" min="8" max="240" step="1">
       </label>
-      <label class="sv-field">Phrase maximum characters
+      <label class="sv-field"><span class="sv-field-label">Phrase maximum characters <span class="sv-help" tabindex="0" title="Longest phrase sent as one completed audio.cpp request. Higher can improve continuity but increases wait time.">i</span></span>
         <input class="sv-input" data-role="phrase-max" type="number" min="24" max="400" step="1">
       </label>
-      <label class="sv-field">Idle flush ms
+      <label class="sv-field"><span class="sv-field-label">Idle flush ms <span class="sv-help" tabindex="0" title="How long to wait for additional LLM text before speaking a partial stable phrase.">i</span></span>
         <input class="sv-input" data-role="phrase-idle" type="number" min="100" max="3000" step="25">
       </label>
     </div>
-    <p class="sv-status">Buffered phrase PCM: each phrase completes in audio.cpp before playback. Native model-level incremental PCM is unavailable in this build.</p>
+    <p class="sv-status" data-role="capture-diagnostics">Mic transport: WAV PCM16 at 16 kHz. Waiting for a turn.</p>
+    <p class="sv-status"><b>Output transport:</b> model-native PCM16 at 24 kHz. Phrase sizing affects latency and prosody only; it does not change model resolution or bitrate.</p>
+    <p class="sv-status"><span class="sv-help" tabindex="0" title="Stop cancels the active microphone, LLM, or phrase TTS request. A new turn increments cancellation identity so late audio is ignored.">i</span> Buffered phrase PCM: each phrase completes in audio.cpp before playback. Native model-level incremental PCM is unavailable in this build.</p>
   </div>
 </details>
 
@@ -1826,14 +1888,16 @@ if (typeof Alpine === 'undefined') {
     'toggle-record', 'refresh-mics', 'mic-meter', 'status', 'user-audio',
     'user-empty', 'voice-badge', 'voice-name', 'voice-wave', 'ttf', 'tts',
     'ai-audio', 'ai-empty', 'transcript', 'clear', 'speech-threshold',
-    'start-hold', 'silence-delay', 'min-utterance', 'max-utterance', 'pre-roll', 'phrase-min', 'phrase-max', 'phrase-idle'
+    'start-hold', 'silence-delay', 'min-utterance', 'max-utterance', 'pre-roll', 'phrase-min', 'phrase-max', 'phrase-idle',
+    'llm-input-format', 'llm-input-rate', 'capture-diagnostics'
   ].forEach(function(name) {
     refs[name] = root.querySelector('[data-role="' + name + '"], [data-action="' + name + '"]');
   });
 
   var state = {
     audioContext: null,
-    mediaRecorder: null,
+    captureNode: null,
+    captureModuleUrl: null,
     audioStream: null,
     micSource: null,
     analyser: null,
@@ -1842,6 +1906,7 @@ if (typeof Alpine === 'undefined') {
     activeRequest: null,
     rollingChunks: [],
     segmentChunks: [],
+    inputSampleRate: 0,
     segmentStartedAt: 0,
     speechStartedAt: null,
     silenceStartedAt: null,
@@ -1917,6 +1982,8 @@ if (typeof Alpine === 'undefined') {
     refs['phrase-min'].value = localGet('sv_phrase-min', '24');
     refs['phrase-max'].value = localGet('sv_phrase-max', '180');
     refs['phrase-idle'].value = localGet('sv_phrase-idle', '450');
+    refs['llm-input-format'].value = localGet('sv_llm_input_format', 'wav');
+    refs['llm-input-rate'].value = localGet('sv_llm_input_rate', '16000');
   }
 
   function setStatus(message) {
@@ -2102,16 +2169,6 @@ if (typeof Alpine === 'undefined') {
     }
   }
 
-  function chooseMimeType() {
-    var candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/wav', 'audio/mp4'];
-    for (var i = 0; i < candidates.length; i += 1) {
-      if (window.MediaRecorder && MediaRecorder.isTypeSupported(candidates[i])) {
-        return candidates[i];
-      }
-    }
-    return '';
-  }
-
   async function getMicStream() {
     var selected = refs['mic-select'].value;
     if (selected) {
@@ -2144,15 +2201,79 @@ if (typeof Alpine === 'undefined') {
     state.rollingChunks = state.rollingChunks.filter(function(item) { return item.time >= keepAfter; });
   }
 
-  function onRecorderData(event) {
-    if (!event.data || event.data.size <= 0) return;
+  function onPcmData(samples) {
+    if (!(samples instanceof Float32Array) || !samples.length) return;
     var now = performance.now();
-    var item = { blob: event.data, time: now };
+    var item = { samples: samples, time: now };
     state.rollingChunks.push(item);
     if (state.isSegmenting || state.isFinalizingSegment) {
-      state.segmentChunks.push(event.data);
+      state.segmentChunks.push(samples);
     }
     pruneRollingChunks(now, getVadSettings().preRollMs);
+  }
+
+  async function startPcmCapture(stream) {
+    var ctx = getAudioContext();
+    if (!ctx.audioWorklet || !window.AudioWorkletNode) {
+      throw new Error('This browser does not support AudioWorklet PCM capture.');
+    }
+    var workletSource = [
+      'class StudioPcmCapture extends AudioWorkletProcessor {',
+      '  process(inputs) {',
+      '    var input = inputs[0];',
+      '    if (input && input[0] && input[0].length) {',
+      '      var copy = new Float32Array(input[0]);',
+      '      this.port.postMessage(copy, [copy.buffer]);',
+      '    }',
+      '    return true;',
+      '  }',
+      '}',
+      "registerProcessor('studio-pcm-capture', StudioPcmCapture);"
+    ].join('\n');
+    state.captureModuleUrl = URL.createObjectURL(new Blob([workletSource], { type: 'application/javascript' }));
+    await ctx.audioWorklet.addModule(state.captureModuleUrl);
+    state.captureNode = new AudioWorkletNode(ctx, 'studio-pcm-capture', { numberOfInputs: 1, numberOfOutputs: 0 });
+    state.captureNode.port.onmessage = function(event) { onPcmData(new Float32Array(event.data)); };
+    state.micSource.connect(state.captureNode);
+    state.inputSampleRate = ctx.sampleRate;
+  }
+
+  function flattenPcmChunks(chunks) {
+    var total = chunks.reduce(function(sum, chunk) { return sum + chunk.length; }, 0);
+    var joined = new Float32Array(total);
+    var offset = 0;
+    chunks.forEach(function(chunk) { joined.set(chunk, offset); offset += chunk.length; });
+    return joined;
+  }
+
+  function resamplePcm(samples, sourceRate, targetRate) {
+    if (!samples.length || sourceRate === targetRate) return samples;
+    var length = Math.max(1, Math.round(samples.length * targetRate / sourceRate));
+    var output = new Float32Array(length);
+    var ratio = sourceRate / targetRate;
+    for (var i = 0; i < length; i += 1) {
+      var position = i * ratio;
+      var left = Math.floor(position);
+      var right = Math.min(samples.length - 1, left + 1);
+      var fraction = position - left;
+      output[i] = samples[left] + (samples[right] - samples[left]) * fraction;
+    }
+    return output;
+  }
+
+  function pcmToWav(samples, sampleRate) {
+    var buffer = new ArrayBuffer(44 + samples.length * 2);
+    var view = new DataView(buffer);
+    function textAt(offset, value) { for (var i = 0; i < value.length; i += 1) view.setUint8(offset + i, value.charCodeAt(i)); }
+    textAt(0, 'RIFF'); view.setUint32(4, 36 + samples.length * 2, true); textAt(8, 'WAVE');
+    textAt(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    textAt(36, 'data'); view.setUint32(40, samples.length * 2, true);
+    for (var i = 0; i < samples.length; i += 1) {
+      var sample = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(44 + i * 2, sample < 0 ? sample * 32768 : sample * 32767, true);
+    }
+    return new Blob([buffer], { type: 'audio/wav' });
   }
 
   function beginSpeechSegment(now, settings) {
@@ -2162,7 +2283,7 @@ if (typeof Alpine === 'undefined') {
     state.silenceStartedAt = null;
     state.segmentChunks = state.rollingChunks
       .filter(function(item) { return item.time >= now - settings.preRollMs; })
-      .map(function(item) { return item.blob; });
+      .map(function(item) { return item.samples; });
     refs['mic-badge'].textContent = 'Speech';
     setStatus('Speech detected. The turn will send after silence.');
   }
@@ -2183,26 +2304,24 @@ if (typeof Alpine === 'undefined') {
     setProcessing(true);
     refs['mic-badge'].textContent = 'Sending';
     setStatus('Sending detected speech to llama.cpp.');
-    try {
-      if (state.mediaRecorder && state.mediaRecorder.state === 'recording') {
-        state.mediaRecorder.requestData();
-      }
-    } catch (err) {}
     window.setTimeout(function() {
       var chunks = state.segmentChunks.slice();
-      var mime = chunks[0] ? chunks[0].type : 'audio/webm';
       discardSpeechSegment('');
       if (!chunks.length) {
         setProcessing(false);
         setStatus(state.isLive ? 'Listening. Speak when ready.' : 'Ready.');
         return;
       }
-      var blob = new Blob(chunks, { type: mime || 'audio/webm' });
+      var targetRate = parseInt(refs['llm-input-rate'].value, 10) || 16000;
+      var samples = resamplePcm(flattenPcmChunks(chunks), state.inputSampleRate || getAudioContext().sampleRate, targetRate);
+      var blob = pcmToWav(samples, targetRate);
+      var duration = samples.length / targetRate;
+      refs['capture-diagnostics'].textContent = 'Mic capture: PCM16 WAV source at ' + targetRate + ' Hz, ' + duration.toFixed(2) + ' s, ' + blob.size + ' bytes; LLM send format: ' + refs['llm-input-format'].value.toUpperCase() + '.';
       if (state.userAudioUrl) URL.revokeObjectURL(state.userAudioUrl);
       state.userAudioUrl = URL.createObjectURL(blob);
       showAudio(refs['user-audio'], refs['user-empty'], state.userAudioUrl);
       sendToLLM(blob);
-    }, 160);
+    }, 40);
   }
 
   function handleVadLevel(level, now) {
@@ -2253,13 +2372,7 @@ if (typeof Alpine === 'undefined') {
       state.audioStream = await getMicStream();
       await refreshMics(false);
       startVadLoop(state.audioStream);
-      var mimeType = chooseMimeType();
-      state.mediaRecorder = mimeType ? new MediaRecorder(state.audioStream, { mimeType: mimeType }) : new MediaRecorder(state.audioStream);
-      state.mediaRecorder.ondataavailable = onRecorderData;
-      state.mediaRecorder.onstop = function() {
-        discardSpeechSegment('');
-      };
-      state.mediaRecorder.start(250);
+      await startPcmCapture(state.audioStream);
       setLive(true);
       setStatus('Listening. Speak when ready.');
     } catch (err) {
@@ -2281,9 +2394,8 @@ if (typeof Alpine === 'undefined') {
     }
     setLive(false);
     discardSpeechSegment('');
-    if (state.mediaRecorder && state.mediaRecorder.state !== 'inactive') {
-      try { state.mediaRecorder.stop(); } catch (err) {}
-    }
+    if (state.captureNode) { try { state.captureNode.disconnect(); } catch (err) {} state.captureNode = null; }
+    if (state.captureModuleUrl) { URL.revokeObjectURL(state.captureModuleUrl); state.captureModuleUrl = null; }
     if (state.audioStream) {
       state.audioStream.getTracks().forEach(function(track) { track.stop(); });
       state.audioStream = null;
@@ -2327,6 +2439,7 @@ if (typeof Alpine === 'undefined') {
           system_prompt: systemPrompt,
           history: state.historyMessages.slice(-8),
           audio_data_url: audioDataUri,
+          llm_input_format: refs['llm-input-format'].value || 'wav',
           prompt: 'Respond to the user spoken message.',
           stream: true,
           max_tokens: 512
@@ -2515,7 +2628,12 @@ if (typeof Alpine === 'undefined') {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: state.activeRequest.signal,
       body: JSON.stringify({ input: phrase, voice: config.ttsVoice, language: config.language || 'Auto', response_format: 'pcm', stream: false })
     }).then(function(response) {
-      if (!response.ok) return response.text().then(function(body) { throw new Error(response.status + ': ' + body); });
+      if (!response.ok) return response.text().then(function(body) {
+        if (response.status === 409 && body.indexOf('No candidate model is loaded') >= 0) {
+          throw new Error('No audio.cpp model is resident. Load the selected model in Settings before starting a streaming turn.');
+        }
+        throw new Error(response.status + ': ' + body);
+      });
       return response.arrayBuffer();
     }).then(function(buffer) {
       if (currentTurn !== state.turnId) return;
@@ -2548,6 +2666,9 @@ if (typeof Alpine === 'undefined') {
     }).then(function(response) {
       if (!response.ok) {
         return response.text().then(function(body) {
+          if (response.status === 409 && body.indexOf('No candidate model is loaded') >= 0) {
+            throw new Error('No audio.cpp model is resident. Load the selected model in Settings before generating.');
+          }
           throw new Error(response.status + ': ' + body);
         });
       }
@@ -2597,6 +2718,70 @@ if (typeof Alpine === 'undefined') {
   loadVadSettings();
   refs['voice-name'].textContent = config.profileLabel + ' -> ' + config.ttsVoice;
 
+  function studioSettingsPayload() {
+    return {
+      endpoint: refs.endpoint.value.trim(),
+      model: refs.model.value.trim(),
+      system_prompt: refs['system-prompt'].value,
+      mic_id: refs['mic-select'].value || '',
+      llm_input_format: refs['llm-input-format'].value || 'wav',
+      llm_input_rate: refs['llm-input-rate'].value || '16000',
+      vad: {
+        'speech-threshold': refs['speech-threshold'].value,
+        'start-hold': refs['start-hold'].value,
+        'silence-delay': refs['silence-delay'].value,
+        'min-utterance': refs['min-utterance'].value,
+        'max-utterance': refs['max-utterance'].value,
+        'pre-roll': refs['pre-roll'].value
+      },
+      phrase: {
+        'phrase-min': refs['phrase-min'].value,
+        'phrase-max': refs['phrase-max'].value,
+        'phrase-idle': refs['phrase-idle'].value
+      }
+    };
+  }
+
+  function applyPersistedStudioSettings(settings) {
+    if (!settings || typeof settings !== 'object') return;
+    if (typeof settings.endpoint === 'string') refs.endpoint.value = settings.endpoint;
+    if (typeof settings.model === 'string') refs.model.value = settings.model;
+    if (typeof settings.system_prompt === 'string') refs['system-prompt'].value = settings.system_prompt;
+    if (settings.llm_input_format === 'wav' || settings.llm_input_format === 'mp3') refs['llm-input-format'].value = settings.llm_input_format;
+    if (['16000', '24000', '48000'].indexOf(String(settings.llm_input_rate)) >= 0) refs['llm-input-rate'].value = String(settings.llm_input_rate);
+    if (settings.vad && typeof settings.vad === 'object') {
+      Object.keys(settings.vad).forEach(function(name) { if (refs[name]) refs[name].value = settings.vad[name]; });
+    }
+    if (settings.phrase && typeof settings.phrase === 'object') {
+      Object.keys(settings.phrase).forEach(function(name) { if (refs[name]) refs[name].value = settings.phrase[name]; });
+    }
+    if (typeof settings.mic_id === 'string' && settings.mic_id) localSet('sv_mic_id', settings.mic_id);
+  }
+
+  function savePersistentStudioSettings(showConfirmation) {
+    return fetch(config.proxyBaseUrl + '/settings', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(studioSettingsPayload())
+    }).then(function(response) {
+      if (!response.ok) throw new Error('settings save failed: ' + response.status);
+      return response.json();
+    }).then(function() {
+      if (showConfirmation) refs['llm-save-status'].textContent = 'Saved to candidate storage. API key stays browser-only.';
+    }).catch(function(error) {
+      if (showConfirmation) refs['llm-save-status'].textContent = 'Browser saved; candidate save failed: ' + error.message;
+    });
+  }
+
+  function loadPersistentStudioSettings() {
+    return fetch(config.proxyBaseUrl + '/settings').then(function(response) {
+      if (!response.ok) throw new Error('settings load failed: ' + response.status);
+      return response.json();
+    }).then(function(payload) {
+      applyPersistedStudioSettings(payload.settings);
+    }).catch(function() {
+      // Browser-local values remain a usable fallback while the candidate starts.
+    });
+  }
+
   function saveLlmSettings() {
     localSet('sv_endpoint', refs.endpoint.value.trim());
     localSet('sv_model', refs.model.value.trim());
@@ -2604,15 +2789,21 @@ if (typeof Alpine === 'undefined') {
     localSet('sv_remember_api_key', String(refs['remember-api-key'].checked));
     if (refs['remember-api-key'].checked) localSet('sv_api_key', refs['api-key'].value);
     else localStorage.removeItem('sv_api_key');
-    refs['llm-save-status'].textContent = 'Saved.';
+    savePersistentStudioSettings(true);
   }
   ['speech-threshold', 'start-hold', 'silence-delay', 'min-utterance', 'max-utterance', 'pre-roll'].forEach(function(name) {
-    refs[name].addEventListener('change', saveVadSettings);
+    refs[name].addEventListener('change', function() { saveVadSettings(); savePersistentStudioSettings(false); });
   });
   ['phrase-min', 'phrase-max', 'phrase-idle'].forEach(function(name) {
-    refs[name].addEventListener('change', function() { localSet('sv_' + name, refs[name].value); });
+    refs[name].addEventListener('change', function() { localSet('sv_' + name, refs[name].value); savePersistentStudioSettings(false); });
   });
-  refs['mic-select'].addEventListener('change', function() { localSet('sv_mic_id', refs['mic-select'].value); });
+  ['llm-input-format', 'llm-input-rate'].forEach(function(name) {
+    refs[name].addEventListener('change', function() {
+      localSet(name === 'llm-input-format' ? 'sv_llm_input_format' : 'sv_llm_input_rate', refs[name].value);
+      savePersistentStudioSettings(false);
+    });
+  });
+  refs['mic-select'].addEventListener('change', function() { localSet('sv_mic_id', refs['mic-select'].value); savePersistentStudioSettings(false); });
   refs['save-llm-settings'].addEventListener('click', saveLlmSettings);
   refs['toggle-record'].addEventListener('click', toggleLiveMic);
   refs['refresh-mics'].addEventListener('click', function() { refreshMics(true); });
@@ -2622,6 +2813,7 @@ if (typeof Alpine === 'undefined') {
     navigator.mediaDevices.addEventListener('devicechange', function() { refreshMics(false); });
   }
   renderTranscript();
+  loadPersistentStudioSettings().then(function() { refreshMics(false); });
   refreshMics(false);
 })();
 </script>
@@ -3449,7 +3641,14 @@ if (typeof Alpine === 'undefined') {
             outputs=[s_streaming_widget],
         )
 
-        demo.load(fn=on_library_refresh, inputs=[library_dir_in], outputs=[library_table, play_profile_id, s_voice_profile_id])
+        # The Playground defaults to streaming scaffolding.  Render the same
+        # profile-bound widget on initial load that profile changes render later;
+        # do not leave the first visit on the legacy placeholder.
+        demo.load(fn=on_library_refresh, inputs=[library_dir_in], outputs=[library_table, play_profile_id, s_voice_profile_id]).then(
+            fn=on_update_streaming_widget,
+            inputs=[base_url_in, s_voice_profile_id, library_dir_in],
+            outputs=[s_streaming_widget],
+        )
         demo.load(
             fn=load_backend_models,
             inputs=[base_url_in],

@@ -71,6 +71,18 @@ and returns exactly one selected format: WAV and PCM stay native/lossless, FLAC
 is lossless, and MP3/AAC/Opus use high-quality 320 kbps final encodes. The
 result pane labels the one output's container separately from its codec (for
 example, `WAV / PCM S16LE` is one WAV file, not two outputs).
+Non-secret Studio controls (LLM endpoint/model/prompt, selected microphone,
+VAD, and phrase tuning) are atomically retained in the private volume, so they
+survive candidate recreation. API keys intentionally remain browser-only. A
+bare local llama.cpp server address such as `http://127.0.0.1:8818` is accepted
+and normalized to `/v1/chat/completions`; a full OpenAI-compatible endpoint is
+also accepted. The Streaming Playground captures mono Float32 PCM through an
+AudioWorklet, applies VAD and pre-roll over PCM buffers, and creates a complete
+PCM16 RIFF/WAV for every accepted turn. Lossless WAV at 16 kHz is the default;
+24 kHz and 48 kHz encodes and an explicit server-converted MP3 320 kbps A/B
+transport are available. llama.cpp input metadata always matches the bytes
+sent. A candidate restart always releases the active model process, so
+the Studio must explicitly load its selected model before its next generation.
 Gradio's `-1` random-seed sentinel is removed by the adapter before synthesis;
 non-negative explicit seeds are normalized to unsigned integer values for
 audio.cpp.

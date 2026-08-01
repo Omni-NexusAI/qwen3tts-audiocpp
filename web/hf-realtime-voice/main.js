@@ -52,6 +52,7 @@ const STORAGE_KEYS = {
   liveTranscript: "s2s.ws.liveTranscript",
   maxResponseTokens: "s2s.ws.maxResponseTokens",
   ttsBackend: "s2s.ws.ttsBackend",
+  voiceByBackend: "s2s.ws.voiceByBackend",
   modelProvider: "s2s.ws.modelProvider",
   modelUrl: "s2s.ws.modelUrl",
   modelName: "s2s.ws.modelName",
@@ -122,9 +123,15 @@ function loadSettings() {
     localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "2");
   }
   const storedTtsBackend = localStorage.getItem(STORAGE_KEYS.ttsBackend) || "faster";
+  let voiceByBackend = {};
+  try { voiceByBackend = JSON.parse(localStorage.getItem(STORAGE_KEYS.voiceByBackend) || "{}"); } catch (_) {}
+  if (!voiceByBackend || typeof voiceByBackend !== "object") voiceByBackend = {};
+  const normalizedBackend = storedTtsBackend === "audio-cpp" ? "qwen3tts-audiocpp" : storedTtsBackend;
+  const storedVoice = voiceByBackend[normalizedBackend] || localStorage.getItem(STORAGE_KEYS.voice) || DEFAULT_VOICE;
   return {
     directUrl: localStorage.getItem(STORAGE_KEYS.directUrl) || "http://127.0.0.1:8765",
-    voice: localStorage.getItem(STORAGE_KEYS.voice) || DEFAULT_VOICE,
+    voice: storedVoice,
+    voiceByBackend: { faster: DEFAULT_VOICE, ...voiceByBackend, [normalizedBackend]: storedVoice },
     instructions: localStorage.getItem(STORAGE_KEYS.instructions) || DEFAULT_INSTRUCTIONS,
     noiseGate: loadGateThreshold(),
     echoGuard,
@@ -132,7 +139,7 @@ function loadSettings() {
     liveTranscript: localStorage.getItem(STORAGE_KEYS.liveTranscript) === "1",
     maxResponseTokens: Math.min(1024, Math.max(64, Number(localStorage.getItem(STORAGE_KEYS.maxResponseTokens)) || 384)),
     // Preserve old local settings while converging on the public provider name.
-    ttsBackend: storedTtsBackend === "audio-cpp" ? "qwen3tts-audiocpp" : storedTtsBackend,
+    ttsBackend: normalizedBackend,
     modelProvider: localStorage.getItem(STORAGE_KEYS.modelProvider) || "local",
     modelUrl: localStorage.getItem(STORAGE_KEYS.modelUrl) || "",
     modelName: localStorage.getItem(STORAGE_KEYS.modelName) || "",
@@ -155,6 +162,7 @@ function loadGateThreshold() {
 
 /** @param {ReturnType<typeof loadSettings>} s */
 function saveSettings(s) {
+  s.voiceByBackend = { ...(s.voiceByBackend || {}), [s.ttsBackend]: s.voice };
   localStorage.setItem(STORAGE_KEYS.directUrl, s.directUrl);
   localStorage.setItem(STORAGE_KEYS.voice, s.voice);
   localStorage.setItem(STORAGE_KEYS.instructions, s.instructions);
@@ -165,10 +173,58 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.liveTranscript, s.liveTranscript ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.maxResponseTokens, String(s.maxResponseTokens));
   localStorage.setItem(STORAGE_KEYS.ttsBackend, s.ttsBackend);
+  localStorage.setItem(STORAGE_KEYS.voiceByBackend, JSON.stringify(s.voiceByBackend));
   localStorage.setItem(STORAGE_KEYS.modelProvider, s.modelProvider);
   localStorage.setItem(STORAGE_KEYS.modelUrl, s.modelUrl);
   localStorage.setItem(STORAGE_KEYS.modelName, s.modelName);
   localStorage.setItem(STORAGE_KEYS.modelApiKey, s.modelApiKey);
+  // Browser storage is convenient, but an environment/browser reset clears it.
+  // Preserve only non-secret preferences in the managed local UI state. API
+  // keys remain browser-only and are intentionally excluded from this payload.
+  return fetch("/api/ui-settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(publicSettingsPayload(s)),
+  }).then((response) => {
+    if (!response.ok) throw new Error(`settings save failed: HTTP ${response.status}`);
+    return response.json().then((payload) => ({ ok: true, payload }));
+  }).catch((error) => ({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+}
+
+function publicSettingsPayload(s) {
+  return {
+    directUrl: s.directUrl,
+    voice: s.voice,
+    voiceByBackend: s.voiceByBackend,
+    instructions: s.instructions,
+    noiseGate: s.noiseGate,
+    echoGuard: s.echoGuard,
+    fullBufferTts: s.fullBufferTts,
+    liveTranscript: s.liveTranscript,
+    maxResponseTokens: s.maxResponseTokens,
+    ttsBackend: s.ttsBackend,
+    modelProvider: s.modelProvider,
+    modelUrl: s.modelUrl,
+    modelName: s.modelName,
+  };
+}
+
+async function restorePersistentSettings() {
+  try {
+    const response = await fetch("/api/ui-settings");
+    if (!response.ok) return;
+    const payload = await response.json();
+    if (!payload?.settings || typeof payload.settings !== "object") return;
+    // Preserve any page-session-only API key already present in this browser.
+    settings = { ...settings, ...payload.settings, modelApiKey: settings.modelApiKey };
+    settings.voiceByBackend = payload.settings.voiceByBackend || settings.voiceByBackend || {};
+    settings.voice = settings.voiceByBackend[settings.ttsBackend] || settings.voice || DEFAULT_VOICE;
+    await saveSettings(settings);
+    if (settings.modelProvider === "local") void refreshLocalPipeline();
+  } catch (_) {
+    // The UI remains fully usable from browser-local settings if the managed
+    // frontend is temporarily unavailable during startup.
+  }
 }
 
 /** @returns {{ web_search: boolean, camera_snapshot: boolean }} */
@@ -311,7 +367,6 @@ const fasterModelSwitchBtn = $("#faster-model-switch");
 const fasterModelUnloadBtn = $("#faster-model-unload");
 const validateAudioCppBtn = $("#validate-audio-cpp");
 const audioCppStatus = $("#audio-cpp-status");
-const inputAudioCppModel = $("#audio-cpp-model");
 const ttsStreamingStatus = $("#tts-streaming-status");
 /** @type {HTMLSelectElement} */
 const inputTtsBackend = $("#tts-backend");
@@ -357,6 +412,7 @@ const restartBtn = $("#restart-conversation");
 /** @type {HTMLElement} */
 const restartHint = $("#restart-hint");
 const settingsForm = /** @type {HTMLFormElement} */ (settingsModal.querySelector("form"));
+const settingsSaveStatus = $("#settings-save-status");
 
 /** @type {AppState} */
 let currentState = "idle";
@@ -369,10 +425,13 @@ let profileLibraryWritable = false;
 let localPipeline = null;
 /** @type {Record<string, any>} */
 let ttsBackendStatuses = {};
+// A backend switch can finish before an older inventory response.  Only the
+// most recently requested backend is allowed to change the voice picker.
+let voiceInventoryRequest = 0;
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 12;
+const EXPECTED_UI_API_VERSION = 14;
 const EXPECTED_BACKEND_API_VERSION = 7;
 const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };
@@ -540,7 +599,7 @@ function renderVoiceOptions() {
   if (!voiceProfiles.length) {
     const option = document.createElement("option");
     option.value = settings.voice || defaultVoice;
-    option.textContent = "No Base clone profiles found";
+    option.textContent = "No live Base clone profiles found for this backend";
     option.disabled = true;
     option.selected = true;
     inputVoice.append(option);
@@ -552,7 +611,9 @@ function renderVoiceOptions() {
   const voices = new Set(voiceProfiles.map((profile) => profile.voice));
   if (!voices.has(settings.voice)) {
     settings.voice = voices.has(defaultVoice) ? defaultVoice : voiceProfiles[0].voice;
+    settings.voiceByBackend = { ...(settings.voiceByBackend || {}), [settings.ttsBackend]: settings.voice };
     saveSettings(settings);
+    profileLibraryStatus.textContent = `Selected ${voiceProfiles.find((item) => item.voice === settings.voice)?.name || settings.voice} because the saved clone is unavailable on this backend.`;
   }
 
   for (const profile of voiceProfiles) {
@@ -573,8 +634,8 @@ function selectedProfile() {
 function syncSelectedProfileEditor() {
   const profile = selectedProfile();
   profileLibraryStatus.textContent = profileLibraryWritable
-    ? "Changes persist to the configured Faster voice library."
-    : "Configured Faster voice library is read-only; profile changes are disabled.";
+    ? `Changes persist only to the selected ${settings.ttsBackend} clone library.`
+    : "The selected backend is inventory-only here; use its own Voice Studio for profile changes.";
   for (const button of [profileCreateBtn, profileSaveBtn, profileDeleteBtn, profileImportBtn]) {
     button.disabled = !profileLibraryWritable;
   }
@@ -595,10 +656,20 @@ async function qwen3Json(url, options = {}) {
   return payload;
 }
 
-function applyVoiceProfilePayload(payload) {
+function applyVoiceProfilePayload(payload, backend = settings.ttsBackend) {
+  if (backend !== settings.ttsBackend) return;
   defaultVoice = payload.defaultVoice || DEFAULT_VOICE;
   voiceProfiles = Array.isArray(payload.voices) ? payload.voices : [];
   profileLibraryWritable = !!payload.writable;
+  const liveVoices = new Set(voiceProfiles.map((profile) => profile.voice));
+  const saved = settings.voiceByBackend?.[backend] || settings.voice;
+  const providerSelected = payload.selectedVoice;
+  if (liveVoices.size) {
+    settings.voice = liveVoices.has(saved)
+      ? saved
+      : (liveVoices.has(providerSelected) ? providerSelected : (liveVoices.has(defaultVoice) ? defaultVoice : voiceProfiles[0].voice));
+    settings.voiceByBackend = { ...(settings.voiceByBackend || {}), [backend]: settings.voice };
+  }
   renderVoiceOptions();
 }
 
@@ -606,12 +677,17 @@ async function selectVoiceProfile() {
   const profile = selectedProfile();
   if (!profile) return;
   settings.voice = profile.voice;
+  settings.voiceByBackend = { ...(settings.voiceByBackend || {}), [settings.ttsBackend]: profile.voice };
   saveSettings(settings);
+  if (settings.ttsBackend === "qwen3tts-audiocpp") {
+    const validation = ttsBackendStatuses[settings.ttsBackend]?.validation;
+    if (validation?.voice !== profile.voice) {
+      audioCppStatus.textContent = `Needs validation for ${profile.name || profile.voice}. Use Validate selected TTS backend before starting a conversation.`;
+    }
+  }
   if (!profileLibraryWritable) return;
   try {
-    const payload = await qwen3Json("api/qwen3/profiles/select", {
-      method: "POST", body: JSON.stringify({ profile_id: profile.id }),
-    });
+    const payload = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/profiles/${encodeURIComponent(profile.id)}/select`, { method: "POST", body: JSON.stringify({}) });
     applyVoiceProfilePayload(payload);
   } catch (err) {
     profileLibraryStatus.textContent = `Could not persist selection: ${err instanceof Error ? err.message : String(err)}`;
@@ -1032,10 +1108,10 @@ function renderTtsBackendOptions() {
     const status = ttsBackendStatuses[id];
     const option = document.createElement("option");
     option.value = id;
-    const name = id === "faster" ? "FasterQwen3TTS" : id === "groxaxo" ? "Groxaxo candidate" : "Qwen3TTS audio.cpp";
+    const name = status?.displayName || (id === "faster" ? "FasterQwen3TTS" : id === "groxaxo" ? "Groxaxo candidate" : "Qwen3TTS audio.cpp");
     const model = status?.currentModel || "no Base model";
-    option.textContent = `${name} - ${model} (${status?.ready ? "ready" : "unavailable"})`;
-    option.disabled = id === "qwen3tts-audiocpp" && !status?.ready;
+    const state = status?.ready ? "ready" : status?.reachable ? "needs validation" : "unavailable";
+    option.textContent = `${name} - ${model} (${state})`;
     inputTtsBackend.append(option);
   }
   inputTtsBackend.value = settings.ttsBackend;
@@ -1213,24 +1289,16 @@ async function refreshTtsBackends() {
     console.warn("[ui] failed to load TTS backend status:", err);
     ttsBackendStatuses = {};
   }
-  const candidate = ttsBackendStatuses["qwen3tts-audiocpp"];
-  if (candidate?.models?.length) {
-    inputAudioCppModel.replaceChildren();
-    for (const model of candidate.models) {
-      const option = document.createElement("option");
-      option.value = model;
-      option.textContent = model;
-      option.selected = model === candidate.currentModel;
-      inputAudioCppModel.append(option);
-    }
-  }
   renderTtsBackendOptions();
 }
 
 async function assertTtsBackendReady() {
   await refreshTtsBackends();
+  await fetchVoiceProfiles();
   const status = ttsBackendStatuses[settings.ttsBackend];
-  if (status?.ready) return;
+  const selectedExists = voiceProfiles.some((profile) => profile.voice === settings.voice);
+  if (status?.ready && selectedExists && (!status.explicitValidation || status.validation?.voice === settings.voice)) return;
+  if (!selectedExists) throw new Error("The selected clone is not present in the selected TTS backend. Refresh or choose an available clone.");
   if (settings.ttsBackend === "groxaxo") {
     throw new Error("Groxaxo is unavailable or has no 0.6B-Base/1.7B-Base model loaded in Voice Studio.");
   }
@@ -1302,8 +1370,8 @@ async function fetchConfig() {
   // Login chip + remaining-budget (no-op / hidden when the limiter is off).
   void account.refresh();
   await fetchVoiceProfiles();
-  await refreshFasterModelInventory();
   await refreshTtsBackends();
+  await refreshFasterModelInventory();
   ttsStreamingStatus.textContent = settings.fullBufferTts
     ? "Non-streaming assistant dispatch is selected. The backend's actual PCM capability remains separately reported."
     : "Streaming assistant dispatch is selected by default; phrase-sized text reaches the backend as it is generated.";
@@ -1312,14 +1380,30 @@ async function fetchConfig() {
 }
 
 async function fetchVoiceProfiles() {
+  const backend = settings.ttsBackend || "faster";
+  const request = ++voiceInventoryRequest;
+  // Do not leave a previous provider's clones visible while the selected
+  // provider is loading or unavailable.
+  voiceProfiles = [];
+  profileLibraryWritable = false;
+  defaultVoice = DEFAULT_VOICE;
+  inputVoice.replaceChildren();
+  const loading = document.createElement("option");
+  loading.textContent = `Loading live Base clone profiles for ${backend}…`;
+  loading.disabled = true;
+  loading.selected = true;
+  inputVoice.append(loading);
+  inputVoice.disabled = true;
   try {
-    const res = await fetch("api/qwen3/voices");
+    const res = await fetch(`api/tts/backends/${encodeURIComponent(backend)}/voices`, { cache: "no-store" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
-    applyVoiceProfilePayload(json);
+    if (request !== voiceInventoryRequest || backend !== settings.ttsBackend) return;
+    applyVoiceProfilePayload(json, backend);
     return;
   } catch (err) {
-    console.warn("[ui] failed to load Qwen3 clone voices:", err);
+    if (request !== voiceInventoryRequest || backend !== settings.ttsBackend) return;
+    console.warn(`[ui] failed to load ${backend} clone voices:`, err);
     defaultVoice = DEFAULT_VOICE;
     voiceProfiles = [];
     profileLibraryWritable = false;
@@ -1328,19 +1412,11 @@ async function fetchVoiceProfiles() {
 }
 
 async function refreshFasterModelInventory() {
-  try {
-    const inventory = await qwen3Json("api/qwen3/models");
-    fasterModelInventory = inventory;
-    const active = inventory.models?.find((model) => model.loaded)?.displayName || inventory.activeModel || "not loaded";
-    modelInventoryStatus.textContent = `${active}. ${inventory.controls?.reason || ""}`;
-    const enabled = !!inventory.controls?.load;
-    fasterModelLoadBtn.disabled = !enabled;
-    fasterModelSwitchBtn.disabled = !inventory.controls?.switch;
-    fasterModelUnloadBtn.disabled = !inventory.controls?.unload;
-  } catch (err) {
-    modelInventoryStatus.textContent = `Faster inventory unavailable: ${err instanceof Error ? err.message : String(err)}`;
-    for (const button of [fasterModelLoadBtn, fasterModelSwitchBtn, fasterModelUnloadBtn]) button.disabled = true;
-  }
+  const status = ttsBackendStatuses[settings.ttsBackend];
+  const model = status?.currentModel || status?.requiredModel || "no resident Base model";
+  const state = status?.ready ? "ready" : status?.reachable ? "reachable; validation required" : "unavailable";
+  modelInventoryStatus.textContent = `${status?.displayName || settings.ttsBackend}: ${model}; ${state}. HFRT does not change backend model residency.`;
+  for (const button of [fasterModelLoadBtn, fasterModelSwitchBtn, fasterModelUnloadBtn]) button.disabled = true;
 }
 
 async function runFasterModelOperation(action) {
@@ -1354,19 +1430,19 @@ async function runFasterModelOperation(action) {
 
 async function validateAudioCppCandidate() {
   validateAudioCppBtn.disabled = true;
-  audioCppStatus.textContent = "Checking health, model identity, OpenAI speech, and PCM chunks…";
+  audioCppStatus.textContent = "Checking the loaded Voice Studio model, selected clone, and buffered speech compatibility…";
   try {
     const profile = selectedProfile();
-    const status = await qwen3Json("api/tts/audio-cpp/validate", {
+    const status = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/validate`, {
       method: "POST",
-      body: JSON.stringify({ model_id: inputAudioCppModel.value, profile_id: profile?.id || null }),
+      body: JSON.stringify({ voice: profile?.voice || settings.voice }),
     });
     const limitations = Array.isArray(status.limitations) ? status.limitations.join(" ") : "";
     audioCppStatus.textContent = status.ready
-      ? "audio.cpp candidate is verified."
-      : `${status.error || "Candidate is not ready."} ${limitations}`.trim();
+      ? `${status.displayName || settings.ttsBackend} is verified for ${profile?.name || settings.voice}${status.speechProbe?.bytes ? `; ${status.speechProbe.bytes} speech bytes in ${status.speechProbe.elapsedMs} ms` : ""}.`
+      : `${status.error || "Selected backend is not ready."} ${limitations}`.trim();
   } catch (err) {
-    audioCppStatus.textContent = `Candidate validation failed: ${err instanceof Error ? err.message : String(err)}`;
+    audioCppStatus.textContent = `Backend validation failed: ${err instanceof Error ? err.message : String(err)}`;
   } finally {
     validateAudioCppBtn.disabled = false;
     await refreshTtsBackends();
@@ -1374,10 +1450,20 @@ async function validateAudioCppCandidate() {
 }
 
 inputVoice.addEventListener("change", () => { void selectVoiceProfile(); });
+inputTtsBackend.addEventListener("change", async () => {
+  const previous = settings.ttsBackend;
+  settings.voiceByBackend = { ...(settings.voiceByBackend || {}), [previous]: settings.voice };
+  settings.ttsBackend = inputTtsBackend.value || "faster";
+  settings.voice = settings.voiceByBackend[settings.ttsBackend] || (settings.ttsBackend === "faster" ? DEFAULT_VOICE : "");
+  await fetchVoiceProfiles();
+  await refreshTtsBackends();
+  await refreshFasterModelInventory();
+  saveSettings(settings);
+});
 profileCreateBtn.addEventListener("click", async () => {
   const source = selectedProfile();
   try {
-    const payload = await qwen3Json("api/qwen3/profiles", {
+    const payload = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/profiles`, {
       method: "POST",
       body: JSON.stringify({
         name: inputProfileName.value.trim(), ref_text: inputProfileRefText.value,
@@ -1385,14 +1471,14 @@ profileCreateBtn.addEventListener("click", async () => {
       }),
     });
     applyVoiceProfilePayload(payload);
-    profileLibraryStatus.textContent = "Clone duplicated in the Faster voice library.";
+    profileLibraryStatus.textContent = "Clone duplicated in the selected backend library.";
   } catch (err) { profileLibraryStatus.textContent = err instanceof Error ? err.message : String(err); }
 });
 profileSaveBtn.addEventListener("click", async () => {
   const profile = selectedProfile();
   if (!profile) return;
   try {
-    const payload = await qwen3Json(`api/qwen3/profiles/${encodeURIComponent(profile.id)}`, {
+    const payload = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/profiles/${encodeURIComponent(profile.id)}`, {
       method: "PATCH",
       body: JSON.stringify({ name: inputProfileName.value.trim(), ref_text: inputProfileRefText.value, language: inputProfileLanguage.value.trim() || "Auto" }),
     });
@@ -1404,7 +1490,7 @@ profileDeleteBtn.addEventListener("click", async () => {
   const profile = selectedProfile();
   if (!profile || !window.confirm(`Delete clone profile ${profile.name}?`)) return;
   try {
-    const payload = await qwen3Json(`api/qwen3/profiles/${encodeURIComponent(profile.id)}`, { method: "DELETE" });
+    const payload = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/profiles/${encodeURIComponent(profile.id)}`, { method: "DELETE" });
     if (settings.voice === profile.voice) settings.voice = defaultVoice;
     saveSettings(settings);
     applyVoiceProfilePayload(payload);
@@ -1417,12 +1503,12 @@ profileImportBtn.addEventListener("click", async () => {
   try {
     const dataUrl = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(reader.error); reader.readAsDataURL(file); });
     const audio_base64 = String(dataUrl).split(",", 2)[1] || "";
-    const payload = await qwen3Json("api/qwen3/profiles/import", {
+    const payload = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/profiles`, {
       method: "POST",
       body: JSON.stringify({ name: inputProfileName.value.trim(), ref_text: inputProfileRefText.value, language: inputProfileLanguage.value.trim() || "Auto", audio_base64, audio_filename: file.name }),
     });
     applyVoiceProfilePayload(payload);
-    profileLibraryStatus.textContent = "Reference WAV imported into the Faster voice library.";
+    profileLibraryStatus.textContent = "Reference WAV imported into the selected backend library.";
   } catch (err) { profileLibraryStatus.textContent = err instanceof Error ? err.message : String(err); }
 });
 fasterModelLoadBtn.addEventListener("click", () => { void runFasterModelOperation("load"); });
@@ -1493,16 +1579,19 @@ function createResumedAudioContext() {
 /** Read the editable settings out of the form. The URL field is only honoured
  *  in direct mode (in LB mode it's locked and server-owned). */
 function readSettingsFromForm() {
+  const backend = inputTtsBackend.value || "faster";
+  const voice = inputVoice.value || settings.voiceByBackend?.[backend] || defaultVoice;
   return {
     directUrl: allowDirect ? inputLbUrl.value.trim() : settings.directUrl,
-    voice: inputVoice.value || defaultVoice,
+    voice,
+    voiceByBackend: { ...(settings.voiceByBackend || {}), [backend]: voice },
     instructions: inputInstructions.value.trim() || DEFAULT_INSTRUCTIONS,
     noiseGate: readGateThreshold(),
     echoGuard: ["off", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "adaptive",
     fullBufferTts: inputFullBufferTts.checked,
     liveTranscript: inputLiveTranscript.checked,
     maxResponseTokens: Math.min(1024, Math.max(64, Number(inputMaxResponseTokens.value) || 384)),
-    ttsBackend: inputTtsBackend.value || "faster",
+    ttsBackend: backend,
     modelProvider: inputModelProvider.value === "remote" ? "remote" : "local",
     modelUrl: inputModelUrl.value.trim(),
     modelName: inputModelName.value.trim(),
@@ -1588,12 +1677,15 @@ function promptServerUrl() {
   inputLbUrl.focus();
 }
 
-settingsForm.addEventListener("submit", (event) => {
+settingsForm.addEventListener("submit", async (event) => {
   const submitter = /** @type {HTMLButtonElement | null} */ ((/** @type {SubmitEvent} */ (event)).submitter);
   if (submitter?.value !== "save") return;
+  event.preventDefault();
 
   settings = readSettingsFromForm();
-  saveSettings(settings);
+  settingsSaveStatus.textContent = "Saving...";
+  const saved = await saveSettings(settings);
+  settingsSaveStatus.textContent = saved.ok ? "Saved to managed runtime storage." : `Browser saved; server persistence failed: ${saved.error}`;
   ttsStreamingStatus.textContent = settings.fullBufferTts
     ? "Non-streaming assistant dispatch is selected. The backend's actual PCM capability remains separately reported."
     : "Streaming assistant dispatch is selected by default; phrase-sized text reaches the backend as it is generated.";
@@ -1609,6 +1701,7 @@ settingsForm.addEventListener("submit", (event) => {
     });
     client.setEchoGuard(settings.echoGuard);
   }
+  if (saved.ok) window.setTimeout(() => settingsModal.close(), 350);
 });
 
 // The noise gate applies live (worklet param), so tune it without a restart:
@@ -2134,6 +2227,7 @@ chat.renderEmptyState();
 initGateArc();
 void fetchConfig();
 if (settings.modelProvider === "local") void refreshLocalPipeline();
+void restorePersistentSettings();
 // Restore an already-enabled camera after a reload. Browsers only prompt if the
 // user has not yet made a permission choice.
 void autoStartCamera();

@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import re
+import shutil
+from secrets import token_hex
 from urllib.parse import urlsplit, urlunsplit
 import subprocess
 import tempfile
@@ -32,6 +34,7 @@ MAX_BUSY_PERCENT = 85
 MIN_SYNTHESIS_FREE_MIB = 2048
 MAX_SYNTHESIS_BUSY_PERCENT = 95
 GPU_GUARD_SETTINGS_PATH = VOICE_LIBRARY_DIR / "candidate_gpu_guard.json"
+VOICE_STUDIO_SETTINGS_PATH = VOICE_LIBRARY_DIR / "voice_studio_settings.json"
 GPU_GUARD_MODES = {"enforced", "custom", "disabled"}
 EVENTS: deque[dict[str, Any]] = deque(maxlen=20)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -83,6 +86,33 @@ def _save_gpu_guard_settings() -> None:
     temporary = GPU_GUARD_SETTINGS_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(gpu_guard_settings, indent=2, sort_keys=True), encoding="utf-8")
     temporary.replace(GPU_GUARD_SETTINGS_PATH)
+
+
+def _read_voice_studio_settings() -> dict[str, Any]:
+    try:
+        saved = json.loads(VOICE_STUDIO_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return saved if isinstance(saved, dict) else {}
+
+
+def _write_voice_studio_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    """Atomically persist non-secret Studio controls in the candidate volume."""
+    allowed = {"endpoint", "model", "system_prompt", "mic_id", "llm_input_format", "llm_input_rate", "vad", "phrase"}
+    settings = _read_voice_studio_settings()
+    for key in allowed:
+        value = payload.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            settings[key] = value
+        elif key in {"vad", "phrase"} and isinstance(value, dict):
+            settings[key] = {str(k): str(v) for k, v in value.items()}
+    # API keys remain page-session/browser-only by design.
+    VOICE_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = VOICE_STUDIO_SETTINGS_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(settings, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(VOICE_STUDIO_SETTINGS_PATH)
+    _record_event("voice-studio-settings-saved")
+    return settings
 
 
 def _guard_policy(model_id: str, operation: str) -> tuple[int, int, bool]:
@@ -363,6 +393,103 @@ async def voices() -> dict[str, Any]:
     return {"object": "list", "data": _voice_profiles()}
 
 
+def _candidate_profile_path(profile_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", profile_id):
+        raise HTTPException(status_code=422, detail="Invalid clone profile id.")
+    path = VOICE_LIBRARY_DIR / "profiles" / profile_id
+    if not path.is_dir():
+        raise HTTPException(status_code=404, detail="Clone profile is unavailable.")
+    return path
+
+
+def _candidate_profile_payload(profile_id: str, *, include_audio: bool = False) -> dict[str, Any]:
+    path = _candidate_profile_path(profile_id)
+    try:
+        meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        reference = path / str(meta.get("ref_audio_filename") or "ref_audio.wav")
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=f"Clone profile metadata is invalid: {exc}") from exc
+    result = {**meta, "id": profile_id, "voice": f"clone:{profile_id}"}
+    if include_audio:
+        if not reference.is_file():
+            raise HTTPException(status_code=409, detail="Clone profile reference audio is missing.")
+        result["ref_audio"] = base64.b64encode(reference.read_bytes()).decode("ascii")
+    return result
+
+
+def _candidate_profile_response() -> dict[str, Any]:
+    selected = None
+    try:
+        selected = str(json.loads((VOICE_LIBRARY_DIR / "selected_profile.json").read_text(encoding="utf-8")).get("profile_id") or "")
+    except (OSError, ValueError):
+        pass
+    profiles = [_candidate_profile_payload(item["id"]) for item in _voice_profiles()]
+    return {
+        "backend": "qwen3tts-audiocpp",
+        "writable": True,
+        "selectedVoice": f"clone:{selected}" if selected else None,
+        "defaultVoice": profiles[0]["voice"] if profiles else None,
+        "voices": profiles,
+    }
+
+
+@app.get("/v1/voices/profiles")
+async def voice_profiles() -> dict[str, Any]:
+    return _candidate_profile_response()
+
+
+@app.get("/v1/voices/profiles/{profile_id}")
+async def voice_profile(profile_id: str) -> dict[str, Any]:
+    return _candidate_profile_payload(profile_id, include_audio=True)
+
+
+@app.post("/v1/voices/profiles")
+async def create_voice_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    source_id = str(payload.get("source_profile_id") or "")
+    if source_id and not payload.get("ref_audio"):
+        source = _candidate_profile_payload(source_id, include_audio=True)
+        payload = {**source, **payload, "ref_audio": source["ref_audio"]}
+    profile_id = token_hex(6)
+    _write_candidate_profile(profile_id, payload)
+    return _candidate_profile_response()
+
+
+@app.patch("/v1/voices/profiles/{profile_id}")
+async def edit_voice_profile(profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    current = _candidate_profile_payload(profile_id, include_audio=True)
+    _write_candidate_profile(profile_id, {**current, **payload, "ref_audio": current["ref_audio"]})
+    _record_event("profile-edited", profile_id=profile_id)
+    return _candidate_profile_response()
+
+
+@app.delete("/v1/voices/profiles/{profile_id}")
+async def delete_voice_profile(profile_id: str) -> dict[str, Any]:
+    path = _candidate_profile_path(profile_id)
+    shutil.rmtree(path)
+    _record_event("profile-deleted", profile_id=profile_id)
+    return _candidate_profile_response()
+
+
+@app.post("/v1/voices/profiles/{profile_id}/select")
+async def select_voice_profile(profile_id: str) -> dict[str, Any]:
+    _candidate_profile_path(profile_id)
+    VOICE_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = VOICE_LIBRARY_DIR / ".selected_profile.json.tmp"
+    temporary.write_text(json.dumps({"profile_id": profile_id}, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(VOICE_LIBRARY_DIR / "selected_profile.json")
+    return _candidate_profile_response()
+
+
+@app.get("/v1/voice-studio/settings")
+async def voice_studio_settings() -> dict[str, Any]:
+    return {"settings": _read_voice_studio_settings(), "apiKeyPersisted": False}
+
+
+@app.put("/v1/voice-studio/settings")
+async def save_voice_studio_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    return {"settings": _write_voice_studio_settings(payload), "apiKeyPersisted": False}
+
+
 @app.post("/v1/voices/profiles/{profile_id}")
 async def import_voice_profile(profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return _write_candidate_profile(profile_id, payload)
@@ -451,25 +578,88 @@ def _normalize_gradio_seed(payload: dict[str, Any]) -> None:
 
 
 def _container_reachable_llm_endpoint(endpoint: str) -> str:
-    """Map a Studio user's host-loopback endpoint into the candidate network."""
+    """Normalize an OpenAI-compatible LLM URL and map host loopback into Docker.
+
+    The Studio accepts either a complete ``/v1/chat/completions`` URL or the
+    common server-base form (for example ``http://127.0.0.1:8818``).  Sending
+    the latter verbatim is a valid HTTP request but reaches llama.cpp's root
+    and produces an unhelpful 404 during a live turn.
+    """
     parsed = urlsplit(endpoint)
-    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+    path = parsed.path.rstrip("/")
+    if parsed.scheme in {"http", "https"} and parsed.hostname:
+        if not path:
+            path = "/v1/chat/completions"
+        elif path == "/v1":
+            path = "/v1/chat/completions"
+    else:
         return endpoint
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
     host = "host.docker.internal"
     if parsed.port:
         host = f"{host}:{parsed.port}"
-    return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
+    return urlunsplit((parsed.scheme, host, path, parsed.query, parsed.fragment))
 
 
-def _llamacpp_audio_part(data_uri: str) -> dict[str, Any]:
-    """Convert browser-recorded data URIs to llama.cpp's input_audio shape."""
+def _transcode_llm_audio(audio: bytes, source_format: str, target_format: str) -> bytes:
+    """Convert a complete browser turn to a truthful llama.cpp WAV or MP3 input."""
+    if target_format not in {"wav", "mp3"}:
+        raise HTTPException(status_code=422, detail="LLM microphone format must be wav or mp3.")
+    with tempfile.TemporaryDirectory(prefix="audio-cpp-llm-input-") as directory:
+        source = Path(directory) / f"recording.{source_format}"
+        output = Path(directory) / f"recording.{target_format}"
+        source.write_bytes(audio)
+        codec_args = ["-c:a", "pcm_s16le"] if target_format == "wav" else ["-c:a", "libmp3lame", "-b:a", "320k"]
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-v", "error", "-y", "-i", str(source),
+                    "-vn", "-ac", "1", *codec_args, str(output),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HTTPException(status_code=503, detail=f"Could not convert the browser microphone recording to {target_format.upper()}.") from exc
+        if result.returncode != 0 or not output.is_file() or not output.stat().st_size:
+            detail = result.stderr.strip() or f"ffmpeg produced no {target_format.upper()} output"
+            raise HTTPException(status_code=422, detail=f"Browser microphone audio could not be converted to {target_format.upper()}: {detail}")
+        return output.read_bytes()
+
+
+def _transcode_llm_audio_to_wav(audio: bytes, source_format: str) -> bytes:
+    """Backward-compatible wrapper used by focused tests and older callers."""
+    return _transcode_llm_audio(audio, source_format, "wav")
+
+
+def _llamacpp_audio_part(data_uri: str, requested_format: str = "wav") -> dict[str, Any]:
+    """Convert browser recorder data into the WAV/MP3 formats accepted by the LLM."""
     header, separator, encoded = data_uri.partition(",")
     if not separator or not header.startswith("data:audio/") or ";base64" not in header:
         raise HTTPException(status_code=422, detail="Streaming Playground requires base64 audio data.")
     audio_format = header.removeprefix("data:audio/").split(";", 1)[0].lower()
     if audio_format in {"x-wav", "wave"}:
         audio_format = "wav"
-    return {"type": "input_audio", "input_audio": {"data": encoded, "format": audio_format}}
+    if audio_format in {"mpeg", "x-mp3"}:
+        audio_format = "mp3"
+    try:
+        audio = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="Streaming Playground requires valid base64 audio data.") from exc
+    if not audio:
+        raise HTTPException(status_code=422, detail="Streaming Playground received empty microphone audio.")
+    requested_format = requested_format.strip().lower() or "wav"
+    if requested_format not in {"wav", "mp3"}:
+        raise HTTPException(status_code=422, detail="LLM microphone format must be wav or mp3.")
+    if audio_format != requested_format:
+        audio = _transcode_llm_audio(audio, audio_format or "wav", requested_format)
+        audio_format = requested_format
+    return {
+        "type": "input_audio",
+        "input_audio": {"data": base64.b64encode(audio).decode("ascii"), "format": audio_format},
+    }
 
 
 def _llamacpp_history(messages: list[Any]) -> list[dict[str, Any]]:
@@ -713,7 +903,10 @@ async def llamacpp_audio_turn(request: Request) -> StreamingResponse:
             "role": "user",
             "content": [
                 {"type": "text", "text": payload.pop("prompt", "Respond to the spoken message.")},
-                _llamacpp_audio_part(str(payload.pop("audio_data_url", ""))),
+                _llamacpp_audio_part(
+                    str(payload.pop("audio_data_url", "")),
+                    str(payload.pop("llm_input_format", "wav")),
+                ),
             ],
         }
     )
