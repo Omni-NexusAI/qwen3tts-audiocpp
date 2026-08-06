@@ -7,10 +7,12 @@ from collections import deque
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
 from secrets import token_hex
+import sys
 from urllib.parse import urlsplit, urlunsplit
 import subprocess
 import tempfile
@@ -23,19 +25,61 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
+MODULE_DIR = Path(__file__).resolve().parent
+if str(MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(MODULE_DIR))
+from profile_library import canonical_profile, live_profiles, valid_profile_id
+
 TEMPLATE = Path(os.environ.get("AUDIO_CPP_CONFIG_TEMPLATE", "/config/qwen3-tts-base-f16.json"))
 ACTIVE_CONFIG = Path("/run/audio-cpp-active.json")
 ENGINE_BIN = os.environ.get("AUDIO_CPP_SERVER_BIN", "/opt/audio.cpp/build/linux-cuda-release/bin/audiocpp_server")
 ENGINE_URL = "http://127.0.0.1:8081"
 ACTIVE_MODEL = os.environ.get("AUDIO_CPP_ACTIVE_MODEL", "qwen3-tts-1.7b-base-bf16")
+NATIVE_INCREMENTAL_PCM_ENABLED = os.environ.get("AUDIO_CPP_NATIVE_INCREMENTAL_PCM", "false").lower() == "true"
+NATIVE_LOAD_WARMUP_ENABLED = os.environ.get("AUDIO_CPP_NATIVE_LOAD_WARMUP", "false").lower() == "true"
+NATIVE_LOAD_WARMUP_TIMEOUT_SECONDS = float(os.environ.get("AUDIO_CPP_NATIVE_LOAD_WARMUP_TIMEOUT_SECONDS", "180"))
 VOICE_LIBRARY_DIR = Path(os.environ.get("VOICE_LIBRARY_DIR", "/voices"))
-MIN_FREE_MIB = {"qwen3-tts-0.6b-base-bf16": 5500, "qwen3-tts-1.7b-base-bf16": 10500}
-MAX_BUSY_PERCENT = 85
 MIN_SYNTHESIS_FREE_MIB = 2048
+# The 0.6B reserve is derived from the observed 7,266 -> 1,636 MiB load delta
+# (~5,630 MiB), rounded up to 6,000 MiB before adding the unchanged synthesis
+# floor. The 1.7B value remains the pre-existing total admission threshold: its
+# residency delta has not been measured, so adding another floor would invent
+# headroom and could make it unloadable on this 16 GiB Windows GPU.
+MODEL_RESIDENCY_RESERVE_MIB = {
+    "qwen3-tts-0.6b-base-bf16": 6000,
+}
+MIN_FREE_MIB = {
+    "qwen3-tts-0.6b-base-bf16": MODEL_RESIDENCY_RESERVE_MIB["qwen3-tts-0.6b-base-bf16"] + MIN_SYNTHESIS_FREE_MIB,
+    "qwen3-tts-1.7b-base-bf16": 10500,
+}
+MAX_BUSY_PERCENT = 85
 MAX_SYNTHESIS_BUSY_PERCENT = 95
 GPU_GUARD_SETTINGS_PATH = VOICE_LIBRARY_DIR / "candidate_gpu_guard.json"
 VOICE_STUDIO_SETTINGS_PATH = VOICE_LIBRARY_DIR / "voice_studio_settings.json"
+TUNING_PROFILES_PATH = VOICE_LIBRARY_DIR / "tts_profiles.json"
 GPU_GUARD_MODES = {"enforced", "custom", "disabled"}
+TUNING_PROVIDER = "qwen3tts-audiocpp"
+TUNING_SCOPES = {"voice-studio", "realtime"}
+MODEL_REQUIRED_LEFT_CONTEXT_FRAMES = 72
+BUILTIN_TUNING_PROFILE_IDS = {"quality", "balanced", "low-latency"}
+TUNING_VALUE_FIELDS = {
+    "model",
+    "clone_mode",
+    "max_reference_seconds",
+    "first_block_frames",
+    "steady_block_frames",
+    "left_context_frames",
+    "text_lookahead",
+    "phrase_flush_ms",
+    "temperature",
+    "top_k",
+    "top_p",
+    "repetition_penalty",
+    "seed",
+}
+ENGINE_DECODE_MODE_HEADER = "X-AudioCPP-Qwen3-Decode-Mode"
+OFFLINE_FULL_DECODE_MODE = "offline-full-decoder"
+SUPPORTED_MASTER_OUTPUT_FORMATS = {"wav", "pcm", "flac", "mp3", "aac", "opus"}
 EVENTS: deque[dict[str, Any]] = deque(maxlen=20)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("audio_cpp_candidate")
@@ -49,14 +93,52 @@ state: dict[str, Any] = {
     "reason": None,
     "lastError": None,
     "lastLoadElapsedS": None,
+    "lastWarmupElapsedS": None,
+    "lastWarmupProfileId": None,
+    "lastWarmupStatus": None,
+    "lastWarmupError": None,
+    "engineEpoch": 0,
     "gpu": None,
     "lastAction": None,
 }
 
 
+def _configured_model_mode() -> str:
+    """Return the engine session mode advertised and configured by this process."""
+    return "streaming" if NATIVE_INCREMENTAL_PCM_ENABLED else "offline"
+
+
+def _enforced_gpu_policy() -> dict[str, Any]:
+    """Describe evidence-backed per-model load admission without invented reserves."""
+    models: dict[str, dict[str, Any]] = {}
+    for model_id, load_minimum_mib in MIN_FREE_MIB.items():
+        residency_mib = MODEL_RESIDENCY_RESERVE_MIB.get(model_id)
+        if residency_mib is not None:
+            models[model_id] = {
+                "loadMinimumFreeMiB": load_minimum_mib,
+                "admissionKind": "measured-residency-plus-synthesis-floor",
+                "residencyReserveMiB": residency_mib,
+                "postLoadSynthesisReserveMiB": MIN_SYNTHESIS_FREE_MIB,
+                "formula": "measured model/graph residency reserve + post-load synthesis floor",
+            }
+        else:
+            models[model_id] = {
+                "loadMinimumFreeMiB": load_minimum_mib,
+                "admissionKind": "existing-total-threshold",
+                "residencyReserveMiB": None,
+                "postLoadSynthesisReserveMiB": None,
+                "formula": "existing total admission threshold; residency delta not yet measured",
+            }
+    return {
+        "synthesisReserveMiB": MIN_SYNTHESIS_FREE_MIB,
+        "formula": "per-model evidence-backed admission; measured residency + synthesis floor where available",
+        "models": models,
+    }
+
+
 def _default_gpu_guard_settings() -> dict[str, int | str]:
     return {
-        "mode": "enforced",
+        "mode": "disabled",
         # 1.7B is the candidate default, so expose its safe reserve as the
         # editable Custom starting point. Enforced mode remains model-specific.
         "load_min_free_mib": MIN_FREE_MIB[ACTIVE_MODEL],
@@ -113,6 +195,131 @@ def _write_voice_studio_settings(payload: dict[str, Any]) -> dict[str, Any]:
     temporary.replace(VOICE_STUDIO_SETTINGS_PATH)
     _record_event("voice-studio-settings-saved")
     return settings
+
+
+def _default_tuning_profiles() -> dict[str, Any]:
+    """Candidate-owned, model-native tuning defaults (24 kHz PCM is fixed)."""
+    return {
+        "version": 2,
+        # `selected` is a compatibility alias for older Realtime clients.
+        "selected": {TUNING_PROVIDER: "balanced"},
+        "selections": {
+            "voice-studio": {TUNING_PROVIDER: "balanced"},
+            "realtime": {TUNING_PROVIDER: "balanced"},
+        },
+        "profiles": {
+        "quality": {"id": "quality", "name": "Quality", "revision": 2, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 30, "first_block_frames": 6, "steady_block_frames": 16, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 128, "phrase_flush_ms": 900, "temperature": 0.8, "top_k": 50, "top_p": 0.95, "repetition_penalty": 1.05, "seed": None},
+        "balanced": {"id": "balanced", "name": "Balanced", "revision": 2, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 20, "first_block_frames": 4, "steady_block_frames": 12, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 64, "phrase_flush_ms": 500, "temperature": 1.0, "top_k": 50, "top_p": 0.95, "repetition_penalty": 1.05, "seed": None},
+        "low-latency": {"id": "low-latency", "name": "Low Latency", "revision": 2, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 12, "first_block_frames": 2, "steady_block_frames": 8, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 32, "phrase_flush_ms": 250, "temperature": 1.0, "top_k": 40, "top_p": 0.9, "repetition_penalty": 1.05, "seed": None},
+    }}
+
+
+def _normalize_tuning_document(saved: Any) -> dict[str, Any]:
+    """Migrate tuning definitions while keeping each surface selection independent."""
+    defaults = _default_tuning_profiles()
+    source = saved if isinstance(saved, dict) else {}
+    source_profiles = source.get("profiles") if isinstance(source.get("profiles"), dict) else {}
+    profiles = dict(source_profiles)
+    for profile_id, default in defaults["profiles"].items():
+        # Built-ins are versioned product defaults, not user-editable records.
+        # Old documents may contain mutations from the earlier editor; replace
+        # them during migration while leaving every custom profile untouched.
+        profiles[profile_id] = dict(default)
+
+    legacy_selected = source.get("selected") if isinstance(source.get("selected"), dict) else {}
+    legacy_profile = str(legacy_selected.get(TUNING_PROVIDER) or "balanced")
+    if legacy_profile not in profiles:
+        legacy_profile = "balanced"
+    saved_selections = source.get("selections") if isinstance(source.get("selections"), dict) else {}
+    selections: dict[str, dict[str, str]] = {}
+    for scope in sorted(TUNING_SCOPES):
+        scoped = saved_selections.get(scope) if isinstance(saved_selections.get(scope), dict) else {}
+        selected = str(scoped.get(TUNING_PROVIDER) or legacy_profile or "balanced")
+        if selected not in profiles:
+            selected = "balanced"
+        selections[scope] = {TUNING_PROVIDER: selected}
+    realtime_selected = selections["realtime"][TUNING_PROVIDER]
+    return {
+        **source,
+        "version": defaults["version"],
+        "profiles": profiles,
+        "selections": selections,
+        "selected": {TUNING_PROVIDER: realtime_selected},
+    }
+
+
+def _selected_tuning_profile(document: dict[str, Any], scope: str) -> str:
+    """Resolve one surface's selection with Balanced as the durable fallback."""
+    if scope not in TUNING_SCOPES:
+        raise HTTPException(status_code=422, detail="Tuning scope must be voice-studio or realtime.")
+    selected = str(document.get("selections", {}).get(scope, {}).get(TUNING_PROVIDER) or "balanced")
+    return selected if selected in document.get("profiles", {}) else "balanced"
+
+
+def _read_tuning_profiles() -> dict[str, Any]:
+    try:
+        saved = json.loads(TUNING_PROFILES_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    return _normalize_tuning_document(saved)
+
+
+def _write_tuning_profiles(document: dict[str, Any]) -> dict[str, Any]:
+    document = _normalize_tuning_document(document)
+    VOICE_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = TUNING_PROFILES_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(TUNING_PROFILES_PATH)
+    _record_event("tts-tuning-profiles-saved")
+    return document
+
+
+def _normalize_seed_value(value: Any) -> int | None:
+    """Normalize UI randomness sentinels while accepting only a real uint32."""
+    if isinstance(value, str):
+        value = value.strip()
+    if value is None or value == "" or value == -1 or value == "-1":
+        return None
+    if isinstance(value, bool):
+        raise HTTPException(status_code=422, detail="seed must be null or uint32.")
+    if isinstance(value, str):
+        if not value.isdecimal():
+            raise HTTPException(status_code=422, detail="seed must be null or uint32.")
+        value = int(value)
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise HTTPException(status_code=422, detail="seed must be null or uint32.")
+        value = int(value)
+    if not isinstance(value, int) or not 0 <= value <= 2**32 - 1:
+        raise HTTPException(status_code=422, detail="seed must be null or uint32.")
+    return value
+
+
+def _validate_tuning_profile(profile: dict[str, Any]) -> None:
+    if profile.get("clone_mode", "full_icl") != "full_icl":
+        raise HTTPException(status_code=422, detail="x_vector_only_mode is not supported by this Base candidate.")
+    for field in ("first_block_frames", "steady_block_frames", "left_context_frames"):
+        value = profile.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 300:
+            raise HTTPException(status_code=422, detail=f"{field} must be 1-300 whole 80 ms codec frames.")
+    if profile["steady_block_frames"] < profile["first_block_frames"]:
+        raise HTTPException(status_code=422, detail="steady_block_frames must be at least first_block_frames.")
+    if profile["left_context_frames"] + profile["steady_block_frames"] > 300:
+        raise HTTPException(status_code=422, detail="left_context_frames + steady_block_frames must not exceed 300 codec frames.")
+    if isinstance(profile.get("max_reference_seconds"), bool) or not isinstance(profile.get("max_reference_seconds"), int) or not 1 <= profile["max_reference_seconds"] <= 30:
+        raise HTTPException(status_code=422, detail="max_reference_seconds must be 1-30.")
+    for key, minimum, maximum in (("text_lookahead", 16, 512), ("phrase_flush_ms", 50, 3000), ("top_k", 1, 200)):
+        if key in profile and (isinstance(profile[key], bool) or not isinstance(profile[key], int) or not minimum <= profile[key] <= maximum):
+            raise HTTPException(status_code=422, detail=f"{key} must be a whole number from {minimum}-{maximum}.")
+    for key, minimum, maximum in (("top_p", .05, 1), ("repetition_penalty", .8, 2)):
+        if key in profile and (isinstance(profile[key], bool) or not isinstance(profile[key], (int, float)) or not minimum <= profile[key] <= maximum):
+            raise HTTPException(status_code=422, detail=f"{key} must be {minimum}-{maximum}.")
+    temperature = profile.get("temperature")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 < temperature <= 2:
+        raise HTTPException(status_code=422, detail="temperature must be greater than 0 and at most 2.")
+    profile["seed"] = _normalize_seed_value(profile.get("seed"))
+    if profile.get("model") is not None and profile["model"] not in MIN_FREE_MIB:
+        raise HTTPException(status_code=422, detail="model must be an exact candidate model id.")
 
 
 def _guard_policy(model_id: str, operation: str) -> tuple[int, int, bool]:
@@ -184,6 +391,10 @@ def gpu_guard(
         "operation": operation,
         "guardMode": gpu_guard_settings["mode"],
     }
+    if operation == "load" and minimum_free_mib is None and str(gpu_guard_settings["mode"]) == "enforced":
+        details.update(_enforced_gpu_policy()["models"][model_id])
+    elif operation == "load" and minimum_free_mib is None and str(gpu_guard_settings["mode"]) == "custom":
+        details["customAbsoluteLoadThreshold"] = True
     if apply_policy and bypassed:
         return {
             "ok": True,
@@ -191,8 +402,24 @@ def gpu_guard(
             "reason": "GPU guard manually disabled by candidate user; load or synthesis may still fail if VRAM is exhausted.",
             **details,
         }
-    if free_mib < required or utilization >= utilization_limit:
-        return {"ok": False, "reason": "GPU busy/insufficient VRAM; operation was not attempted.", **details}
+    if free_mib < required:
+        if operation == "load" and details.get("admissionKind") == "measured-residency-plus-synthesis-floor":
+            reason = (
+                f"GPU load blocked: {free_mib} MiB free, but enforced admission requires {required} MiB "
+                f"({details['residencyReserveMiB']} MiB measured/rounded model/graph residency + "
+                f"{details['postLoadSynthesisReserveMiB']} MiB post-load synthesis floor)."
+            )
+        elif operation == "load" and details.get("admissionKind") == "existing-total-threshold":
+            reason = (
+                f"GPU load blocked: {free_mib} MiB free, but enforced admission requires the existing "
+                f"{required} MiB total threshold; this model's residency delta has not been measured, "
+                "so no unverified reserve was added."
+            )
+        else:
+            reason = f"GPU insufficient VRAM: {free_mib} MiB free, {required} MiB required; operation was not attempted."
+        return {"ok": False, "reason": reason, **details}
+    if utilization >= utilization_limit:
+        return {"ok": False, "reason": f"GPU busy: {utilization}% utilization meets or exceeds the {utilization_limit}% limit; operation was not attempted.", **details}
     return {"ok": True, **details}
 
 
@@ -224,12 +451,18 @@ def _start_engine(model_id: str) -> None:
     model = dict(_models()[model_id])
     model["session_options"] = {
         **dict(model.get("session_options") or {}),
-        "qwen3_tts.mem_saver": "true",
+        # Retain the talker graph for native-streaming benchmarks.  This does
+        # not change the BF16 checkpoint or permit a second resident model.
+        "qwen3_tts.mem_saver": "false" if NATIVE_INCREMENTAL_PCM_ENABLED else "true",
     }
     config = _template(); config["port"] = 8081; config["models"] = [model]
+    # Keep the published buffered candidate in Offline mode.  The experimental
+    # engine accepts Streaming only when the separately enabled native path is
+    # installed and validated.
+    config["models"][0]["mode"] = _configured_model_mode()
     ACTIVE_CONFIG.write_text(json.dumps(config), encoding="utf-8")
     engine = subprocess.Popen([ENGINE_BIN, "--config", str(ACTIVE_CONFIG)])
-    _record_event("child-start", model_id=model_id, memSaver=True)
+    _record_event("child-start", model_id=model_id, memSaver=not NATIVE_INCREMENTAL_PCM_ENABLED)
 
 
 async def _engine_ready() -> bool:
@@ -238,20 +471,73 @@ async def _engine_ready() -> bool:
         except httpx.HTTPError: return False
 
 
+async def _complete_native_load_warmup(model_id: str) -> None:
+    """Bound the private warmup and leave a truthful, retryable state."""
+    try:
+        warmup = await asyncio.wait_for(
+            _run_native_load_warmup(model_id),
+            timeout=NATIVE_LOAD_WARMUP_TIMEOUT_SECONDS,
+        )
+        state.update(
+            lastWarmupElapsedS=warmup.get("elapsedSeconds"),
+            lastWarmupProfileId=warmup.get("profileId"),
+            lastWarmupStatus=warmup.get("status"),
+            lastWarmupError=None,
+            reason=warmup.get("reason"),
+        )
+    except asyncio.CancelledError:
+        _stop_engine(action="warmup-cancelled-release")
+        message = "Native load warmup was cancelled; the candidate model was released."
+        state.update(state="error", reason=message, lastError=message, lastWarmupStatus="cancelled", lastWarmupError=message)
+        _record_event("model-warmup-cancelled", model_id=model_id)
+        raise
+    except Exception as exc:
+        message = f"Native load warmup failed; the first synthesis may remain cold: {exc}"
+        state.update(lastWarmupStatus="failed", lastWarmupError=message, reason=message)
+        _record_event("model-warmup-failed", model_id=model_id, error=str(exc))
+    if not await _engine_ready():
+        _stop_engine(action="warmup-failed-release")
+        message = "audio.cpp stopped responding during native load warmup."
+        state.update(state="error", reason=message, lastError=message)
+        raise HTTPException(status_code=503, detail={"state": "error", "message": message})
+
+
 async def switch_model(model_id: str) -> dict[str, Any]:
     if model_id not in _models(): raise HTTPException(status_code=404, detail="Unknown candidate model.")
     async with switch_lock:
         _reconcile_engine()
+        warm_after_load = NATIVE_INCREMENTAL_PCM_ENABLED and NATIVE_LOAD_WARMUP_ENABLED
         if state["state"] == "loaded" and state["activeModel"] == model_id and await _engine_ready():
-            _record_event("load-noop", model_id=model_id, reason="selected model is already resident")
+            if not warm_after_load or state.get("lastWarmupStatus") == "complete":
+                _record_event("load-noop", model_id=model_id, reason="selected model is already resident and ready")
+                return {**state, "singleResident": True, "events": list(EVENTS)}
+            started = time.monotonic()
+            state.update(
+                state="warming",
+                reason="Retrying the native decoder warmup.",
+                lastError=None,
+                lastWarmupStatus="pending",
+                lastWarmupError=None,
+            )
+            await _complete_native_load_warmup(model_id)
+            state.update(state="loaded", lastError=None, lastLoadElapsedS=round(time.monotonic() - started, 3))
+            _record_event(
+                "model-ready",
+                model_id=model_id,
+                loadElapsedS=state["lastLoadElapsedS"],
+                warmupStatus=state["lastWarmupStatus"],
+                warmupElapsedS=state["lastWarmupElapsedS"],
+                warmupRetry=True,
+            )
             return {**state, "singleResident": True, "events": list(EVENTS)}
         guard = gpu_guard(model_id, operation="load")
         if not guard["ok"]:
             state.update(reason=guard["reason"], lastError=guard["reason"])
             _record_event("gpu-blocked-load", model_id=model_id, gpu=guard)
             raise HTTPException(status_code=409, detail={"state": "blocked", **guard})
+        state.update(state="loading", reason=None, lastError=None)
+        state["engineEpoch"] = int(state.get("engineEpoch") or 0) + 1
         async with generation_lock:
-            state.update(state="loading", reason=None, lastError=None)
             _record_event("load-requested", model_id=model_id, gpu=guard)
             if engine is not None:
                 _stop_engine(action="old-model-released")  # release old model before the new child exists
@@ -268,13 +554,30 @@ async def switch_model(model_id: str) -> dict[str, Any]:
                 raise HTTPException(status_code=503, detail={"state": "error", "message": message})
             state.update(
                 activeModel=model_id,
-                state="loaded",
-                reason=None,
+                state="warming" if warm_after_load else "loaded",
+                reason="Preparing the native decoder for consistent first-turn latency." if warm_after_load else None,
                 lastError=None,
-                lastLoadElapsedS=round(time.monotonic() - started, 3),
+                lastWarmupElapsedS=None,
+                lastWarmupProfileId=None,
+                lastWarmupStatus="pending" if warm_after_load else "disabled",
+                lastWarmupError=None,
                 gpu=guard,
             )
-            _record_event("model-ready", model_id=model_id, loadElapsedS=state["lastLoadElapsedS"], gpu=guard)
+        if warm_after_load:
+            await _complete_native_load_warmup(model_id)
+        state.update(
+            state="loaded",
+            lastError=None,
+            lastLoadElapsedS=round(time.monotonic() - started, 3),
+        )
+        _record_event(
+            "model-ready",
+            model_id=model_id,
+            loadElapsedS=state["lastLoadElapsedS"],
+            warmupStatus=state["lastWarmupStatus"],
+            warmupElapsedS=state["lastWarmupElapsedS"],
+            gpu=guard,
+        )
         return {**state, "singleResident": True, "events": list(EVENTS)}
 
 
@@ -307,19 +610,24 @@ async def health() -> dict[str, Any]:
                 "last_load_elapsed_s": state["lastLoadElapsedS"],
                 "gpu": state["gpu"],
                 "events": list(EVENTS),
-                "mem_saver": True,
-                "native_incremental_pcm": False,
+                "mem_saver": not NATIVE_INCREMENTAL_PCM_ENABLED,
+                "native_incremental_pcm": NATIVE_INCREMENTAL_PCM_ENABLED,
+                "native_load_warmup": NATIVE_LOAD_WARMUP_ENABLED,
+                "native_load_warmup_timeout_seconds": NATIVE_LOAD_WARMUP_TIMEOUT_SECONDS,
+                "cuda_graphs_disabled": os.environ.get("GGML_CUDA_DISABLE_GRAPHS") is not None,
                 "progressive_phrase_pcm": True,
                 "sample_rate": 24000,
                 "sample_format": "pcm_s16le",
+                "load_headroom_mib": _guard_policy(str(state["activeModel"]), "load")[0],
                 "synthesis_headroom_mib": _guard_policy(str(state["activeModel"]), "synthesis")[0],
+                "enforced_gpu_policy": _enforced_gpu_policy(),
                 "gpu_guard": dict(gpu_guard_settings),
             },
         },
         **state,
         "singleResident": True,
-        "nativeIncrementalPcm": False,
-        "ttsMode": "offline-buffered",
+        "nativeIncrementalPcm": NATIVE_INCREMENTAL_PCM_ENABLED,
+        "ttsMode": "native-incremental-pcm" if NATIVE_INCREMENTAL_PCM_ENABLED else "offline-buffered",
     }
 
 
@@ -332,6 +640,7 @@ async def control_status() -> dict[str, Any]:
         "availableModels": list(_models()),
         "events": list(EVENTS),
         "gpu_guard": dict(gpu_guard_settings),
+        "enforced_gpu_policy": _enforced_gpu_policy(),
     }
 
 
@@ -368,12 +677,16 @@ def _update_gpu_guard(payload: dict[str, Any]) -> dict[str, Any]:
     gpu_guard_settings.update(updated)
     _save_gpu_guard_settings()
     _record_event("gpu-guard-updated", mode=mode, settings=dict(gpu_guard_settings))
-    return {"gpu_guard": dict(gpu_guard_settings), "warning": "Disabled mode bypasses admission checks only; it cannot prevent a CUDA out-of-memory failure."}
+    return {
+        "gpu_guard": dict(gpu_guard_settings),
+        "enforced_gpu_policy": _enforced_gpu_policy(),
+        "warning": "Disabled mode bypasses admission checks only; it cannot prevent a CUDA out-of-memory failure.",
+    }
 
 
 @app.get("/control/gpu-guard")
 async def control_gpu_guard() -> dict[str, Any]:
-    return {"gpu_guard": dict(gpu_guard_settings)}
+    return {"gpu_guard": dict(gpu_guard_settings), "enforced_gpu_policy": _enforced_gpu_policy()}
 
 
 @app.post("/control/gpu-guard")
@@ -384,7 +697,8 @@ async def control_gpu_guard_update(payload: dict[str, Any]) -> dict[str, Any]:
 @app.get("/v1/models")
 async def models() -> dict[str, Any]:
     active = str(state["activeModel"])
-    return {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "engine", "family": "qwen3_tts", "task": "tts", "mode": "offline", "active": model_id == active} for model_id in _models()]}
+    mode = _configured_model_mode()
+    return {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "engine", "family": "qwen3_tts", "task": "tts", "mode": mode, "active": model_id == active} for model_id in _models()]}
 
 
 @app.get("/v1/voices")
@@ -394,7 +708,7 @@ async def voices() -> dict[str, Any]:
 
 
 def _candidate_profile_path(profile_id: str) -> Path:
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", profile_id):
+    if not valid_profile_id(profile_id):
         raise HTTPException(status_code=422, detail="Invalid clone profile id.")
     path = VOICE_LIBRARY_DIR / "profiles" / profile_id
     if not path.is_dir():
@@ -404,11 +718,10 @@ def _candidate_profile_path(profile_id: str) -> Path:
 
 def _candidate_profile_payload(profile_id: str, *, include_audio: bool = False) -> dict[str, Any]:
     path = _candidate_profile_path(profile_id)
-    try:
-        meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
-        reference = path / str(meta.get("ref_audio_filename") or "ref_audio.wav")
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=409, detail=f"Clone profile metadata is invalid: {exc}") from exc
+    meta = canonical_profile(VOICE_LIBRARY_DIR, profile_id, normalize=True)
+    if meta is None:
+        raise HTTPException(status_code=409, detail="Clone profile metadata or reference audio is unavailable.")
+    reference = path / str(meta["ref_audio_filename"])
     result = {**meta, "id": profile_id, "voice": f"clone:{profile_id}"}
     if include_audio:
         if not reference.is_file():
@@ -424,6 +737,9 @@ def _candidate_profile_response() -> dict[str, Any]:
     except (OSError, ValueError):
         pass
     profiles = [_candidate_profile_payload(item["id"]) for item in _voice_profiles()]
+    live_ids = {str(profile["id"]) for profile in profiles}
+    if selected not in live_ids:
+        selected = None
     return {
         "backend": "qwen3tts-audiocpp",
         "writable": True,
@@ -466,6 +782,13 @@ async def edit_voice_profile(profile_id: str, payload: dict[str, Any]) -> dict[s
 async def delete_voice_profile(profile_id: str) -> dict[str, Any]:
     path = _candidate_profile_path(profile_id)
     shutil.rmtree(path)
+    selected_path = VOICE_LIBRARY_DIR / "selected_profile.json"
+    try:
+        selected = json.loads(selected_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        selected = {}
+    if isinstance(selected, dict) and selected.get("profile_id") == profile_id:
+        selected_path.unlink(missing_ok=True)
     _record_event("profile-deleted", profile_id=profile_id)
     return _candidate_profile_response()
 
@@ -490,6 +813,277 @@ async def save_voice_studio_settings(payload: dict[str, Any]) -> dict[str, Any]:
     return {"settings": _write_voice_studio_settings(payload), "apiKeyPersisted": False}
 
 
+@app.get("/v1/tuning/profiles")
+async def get_tuning_profiles() -> dict[str, Any]:
+    return _read_tuning_profiles()
+
+
+def _profile_values_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Read the complete safe schema from Save As or legacy flat requests."""
+    nested = payload.get("values")
+    if nested is not None and not isinstance(nested, dict):
+        raise HTTPException(status_code=422, detail="Profile values must be an object.")
+    values = dict(nested or {})
+    unknown = set(values) - TUNING_VALUE_FIELDS
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported tuning profile field(s): {', '.join(sorted(unknown))}.",
+        )
+    for key in TUNING_VALUE_FIELDS:
+        if key in payload:
+            values[key] = payload[key]
+    if values.get("clone_mode", "full_icl") != "full_icl":
+        raise HTTPException(
+            status_code=422,
+            detail="x_vector_only_mode is not supported by this Base candidate.",
+        )
+    if "seed" in values:
+        values["seed"] = _normalize_seed_value(values["seed"])
+    return values
+
+
+def _created_profile_response(
+    document: dict[str, Any], profile_id: str, scope: str | None,
+) -> dict[str, Any]:
+    """Keep the document response compatible while identifying Save As state."""
+    selected = _selected_tuning_profile(document, scope) if scope else None
+    return {
+        **document,
+        "profile": document["profiles"][profile_id],
+        "created_profile_id": profile_id,
+        "selected_profile_id": selected,
+        "selected_scope": scope,
+    }
+
+
+@app.post("/v1/tuning/profiles")
+async def create_tuning_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    document = _read_tuning_profiles()
+    provider = str(payload.get("provider") or TUNING_PROVIDER)
+    if provider != TUNING_PROVIDER:
+        raise HTTPException(status_code=422, detail="Tuning profiles are available only for qwen3tts-audiocpp.")
+    profile_id = str(payload.get("id") or token_hex(5))
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", profile_id):
+        raise HTTPException(status_code=422, detail="Invalid tuning profile id.")
+    if profile_id in document["profiles"]:
+        raise HTTPException(status_code=409, detail="A tuning profile with that id already exists; built-ins and custom profiles are never overwritten.")
+    clone_from = str(payload.get("clone_from") or "balanced")
+    source_profile = document["profiles"].get(clone_from)
+    if not isinstance(source_profile, dict):
+        raise HTTPException(status_code=404, detail="Unknown source tuning profile.")
+    source = dict(source_profile)
+    source.update(_profile_values_from_payload(payload))
+    if "name" in payload:
+        source["name"] = str(payload["name"])
+    source.update(id=profile_id, revision=1, clone_mode="full_icl", crossfade_samples=0)
+    _validate_tuning_profile(source)
+    document["profiles"][profile_id] = source
+    scope: str | None = None
+    if bool(payload.get("select")):
+        scope = str(payload.get("scope") or "realtime")
+        if scope not in TUNING_SCOPES:
+            raise HTTPException(status_code=422, detail="Tuning scope must be voice-studio or realtime.")
+        document.setdefault("selections", {}).setdefault(scope, {})[TUNING_PROVIDER] = profile_id
+        if scope == "realtime":
+            document.setdefault("selected", {})[TUNING_PROVIDER] = profile_id
+    written = _write_tuning_profiles(document)
+    return _created_profile_response(written, profile_id, scope)
+
+
+@app.patch("/v1/tuning/profiles/{profile_id}")
+async def patch_tuning_profile(profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    document = _read_tuning_profiles()
+    profile = document["profiles"].get(profile_id)
+    if not isinstance(profile, dict):
+        raise HTTPException(status_code=404, detail="Unknown tuning profile.")
+    if profile_id in BUILTIN_TUNING_PROFILE_IDS:
+        raise HTTPException(status_code=409, detail="Built-in tuning profiles are immutable; clone one before editing.")
+    expected_revision = payload.get("revision")
+    if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+        raise HTTPException(status_code=422, detail="A numeric profile revision is required for updates.")
+    if expected_revision != profile.get("revision", 1):
+        raise HTTPException(status_code=409, detail={"state": "conflict", "current_revision": profile.get("revision", 1)})
+    unknown = set(payload) - ({"revision", "name", "values"} | TUNING_VALUE_FIELDS)
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unsupported tuning profile field(s): {', '.join(sorted(unknown))}.")
+    if "name" in payload:
+        profile["name"] = str(payload["name"])
+    profile.update(_profile_values_from_payload(payload))
+    profile.update(clone_mode="full_icl", crossfade_samples=0, revision=int(profile.get("revision", 1)) + 1)
+    _validate_tuning_profile(profile)
+    return _write_tuning_profiles(document)
+
+
+@app.delete("/v1/tuning/profiles/{profile_id}")
+async def delete_tuning_profile(profile_id: str) -> dict[str, Any]:
+    document = _read_tuning_profiles()
+    if profile_id in BUILTIN_TUNING_PROFILE_IDS:
+        raise HTTPException(status_code=409, detail="Built-in tuning profiles cannot be deleted; reset them instead.")
+    document["profiles"].pop(profile_id, None)
+    for scope in TUNING_SCOPES:
+        if document.get("selections", {}).get(scope, {}).get(TUNING_PROVIDER) == profile_id:
+            document["selections"][scope][TUNING_PROVIDER] = "balanced"
+    if document.get("selected", {}).get(TUNING_PROVIDER) == profile_id:
+        document["selected"][TUNING_PROVIDER] = "balanced"
+    return _write_tuning_profiles(document)
+
+
+@app.post("/v1/tuning/profiles/{profile_id}/clone")
+async def clone_tuning_profile(profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    document = _read_tuning_profiles(); source = document["profiles"].get(profile_id)
+    if not isinstance(source, dict): raise HTTPException(status_code=404, detail="Unknown tuning profile.")
+    clone_id = str(payload.get("id") or token_hex(5))
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", clone_id):
+        raise HTTPException(status_code=422, detail="Invalid clone id.")
+    if clone_id in document["profiles"]:
+        raise HTTPException(status_code=409, detail="A tuning profile with that id already exists.")
+    clone = dict(source)
+    clone.update(_profile_values_from_payload(payload))
+    clone.update(id=clone_id, name=str(payload.get("name") or f"{source['name']} copy"), revision=1, clone_mode="full_icl", crossfade_samples=0)
+    _validate_tuning_profile(clone)
+    document["profiles"][clone_id] = clone
+    scope: str | None = None
+    if bool(payload.get("select")):
+        scope = str(payload.get("scope") or "realtime")
+        if scope not in TUNING_SCOPES:
+            raise HTTPException(status_code=422, detail="Tuning scope must be voice-studio or realtime.")
+        document.setdefault("selections", {}).setdefault(scope, {})[TUNING_PROVIDER] = clone_id
+        if scope == "realtime":
+            document.setdefault("selected", {})[TUNING_PROVIDER] = clone_id
+    written = _write_tuning_profiles(document)
+    return _created_profile_response(written, clone_id, scope)
+
+
+@app.post("/v1/tuning/profiles/{profile_id}/reset")
+async def reset_tuning_profile(profile_id: str) -> dict[str, Any]:
+    defaults = _default_tuning_profiles()["profiles"]
+    if profile_id not in defaults: raise HTTPException(status_code=409, detail="Only built-in tuning profiles can be reset.")
+    document = _read_tuning_profiles(); document["profiles"][profile_id] = defaults[profile_id]
+    return _write_tuning_profiles(document)
+
+
+@app.get("/v1/tuning/export")
+async def export_tuning_profiles() -> dict[str, Any]:
+    return {"schema": "qwen3tts-audiocpp.tuning/v1", "document": _read_tuning_profiles()}
+
+
+@app.post("/v1/tuning/import")
+async def import_tuning_profiles(payload: dict[str, Any]) -> dict[str, Any]:
+    incoming = payload.get("document")
+    if payload.get("schema") != "qwen3tts-audiocpp.tuning/v1" or not isinstance(incoming, dict) or not isinstance(incoming.get("profiles"), dict):
+        raise HTTPException(status_code=422, detail="Invalid tuning profile export.")
+    document = _read_tuning_profiles()
+    imported: dict[str, dict[str, Any]] = {}
+    for profile_id, profile in incoming["profiles"].items():
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", str(profile_id)) or not isinstance(profile, dict):
+            raise HTTPException(status_code=422, detail="Invalid imported profile.")
+        candidate = dict(profile); candidate.update(id=str(profile_id), clone_mode="full_icl", crossfade_samples=0, revision=1)
+        _validate_tuning_profile(candidate)
+        if profile_id in BUILTIN_TUNING_PROFILE_IDS:
+            continue
+        if profile_id in document["profiles"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "state": "profile-import-conflict",
+                    "profile_id": profile_id,
+                    "message": "Imported custom profiles never overwrite an existing id.",
+                },
+            )
+        imported[str(profile_id)] = candidate
+    document["profiles"].update(imported)
+    return _write_tuning_profiles(document)
+
+
+@app.put("/v1/tuning/selection")
+async def select_tuning_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    document = _read_tuning_profiles(); provider = str(payload.get("provider") or TUNING_PROVIDER); profile_id = str(payload.get("profile_id") or "balanced")
+    scope = str(payload.get("scope") or "realtime")
+    if provider != TUNING_PROVIDER:
+        raise HTTPException(status_code=422, detail="Tuning profile selection is available only for qwen3tts-audiocpp.")
+    if scope not in TUNING_SCOPES:
+        raise HTTPException(status_code=422, detail="Tuning scope must be voice-studio or realtime.")
+    if profile_id not in document["profiles"]:
+        raise HTTPException(status_code=404, detail="Unknown tuning profile.")
+    document.setdefault("selections", {}).setdefault(scope, {})[provider] = profile_id
+    if scope == "realtime":
+        document.setdefault("selected", {})[provider] = profile_id
+    return _write_tuning_profiles(document)
+
+
+@app.post("/v1/tuning/resolve")
+async def resolve_tuning_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    document = _read_tuning_profiles(); provider = str(payload.get("provider") or TUNING_PROVIDER)
+    scope = str(payload.get("scope") or "realtime")
+    if provider != TUNING_PROVIDER:
+        raise HTTPException(status_code=422, detail="Tuning profiles are available only for qwen3tts-audiocpp.")
+    selected = _selected_tuning_profile(document, scope)
+    profile_id = str(payload.get("profile_id") or selected)
+    profile = document["profiles"].get(profile_id)
+    if not isinstance(profile, dict):
+        raise HTTPException(status_code=404, detail="Unknown tuning profile.")
+    if profile.get("model") and profile["model"] != state["activeModel"]:
+        raise HTTPException(status_code=409, detail={"active": state["activeModel"], "required": profile["model"], "auto_switch": False})
+    overrides = payload.get("overrides") or {}
+    if not isinstance(overrides, dict): raise HTTPException(status_code=422, detail="Temporary overrides must be an object.")
+    supported = TUNING_VALUE_FIELDS - {"clone_mode"}
+    unknown = set(overrides) - supported
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unsupported tuning override field(s): {', '.join(sorted(unknown))}.")
+    requested_model = overrides.get("model")
+    if requested_model and requested_model != state["activeModel"]:
+        raise HTTPException(status_code=409, detail={"active": state["activeModel"], "required": requested_model, "auto_switch": False})
+    bounds = {"text_lookahead": (16, 512), "phrase_flush_ms": (50, 3000), "top_k": (1, 200), "top_p": (.05, 1), "repetition_penalty": (.8, 2)}
+    for key, (minimum, maximum) in bounds.items():
+        if key in overrides and (not isinstance(overrides[key], (int, float)) or not minimum <= overrides[key] <= maximum):
+            raise HTTPException(status_code=422, detail=f"{key} must be {minimum}-{maximum}.")
+    if "temperature" in overrides:
+        temperature = overrides["temperature"]
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 < temperature <= 2:
+            raise HTTPException(status_code=422, detail="temperature must be greater than 0 and at most 2.")
+    if "seed" in overrides:
+        overrides = dict(overrides)
+        overrides["seed"] = _normalize_seed_value(overrides["seed"])
+    candidate = dict(profile)
+    candidate.update(overrides)
+    _validate_tuning_profile(candidate)
+    native_fields = ["first_block_frames", "steady_block_frames", "left_context_frames"]
+    effective_fields = ["temperature", "top_k", "top_p", "repetition_penalty", "seed"]
+    if NATIVE_INCREMENTAL_PCM_ENABLED:
+        effective_fields.extend(native_fields)
+    warnings = [
+        "crossfade is sample-aligned and fixed at zero",
+        "codec frames are 80 ms",
+        "blank and -1 seeds request engine randomness; explicit seeds are uint32",
+        "max_reference_seconds applies only when the clone stores a transcript-matched excerpt",
+        "lookahead and flush apply to the buffered phrase queues",
+        *(["native decoder block/context fields are inactive until native incremental PCM is enabled"] if not NATIVE_INCREMENTAL_PCM_ENABLED else []),
+    ]
+    if int(candidate["left_context_frames"]) < MODEL_REQUIRED_LEFT_CONTEXT_FRAMES:
+        warnings.append(
+            f"Reduced decoder context is experimental and may degrade quality; the model requires {MODEL_REQUIRED_LEFT_CONTEXT_FRAMES} frames."
+        )
+    return {
+        "profile": profile,
+        "scope": scope,
+        "transport": {"sample_rate": 24000, "format": "pcm_s16le", "read_only": True},
+        "capabilities": {"full_icl": True, "x_vector_only": False, "native_incremental_pcm": NATIVE_INCREMENTAL_PCM_ENABLED},
+        "effectiveFields": effective_fields,
+        "conditionalFields": ["max_reference_seconds"],
+        "inactiveFields": ["crossfade_samples", "x_vector_only_mode", *(native_fields if not NATIVE_INCREMENTAL_PCM_ENABLED else [])],
+        "phraseQueueFields": ["text_lookahead", "phrase_flush_ms"],
+        "referenceDurationLimit": {
+            "requestedSeconds": int(candidate["max_reference_seconds"]),
+            "condition": "matched-excerpt-only",
+            "effective": None,
+            "pairing": "resolved-per-request",
+        },
+        "warnings": warnings,
+        "temporaryOverrides": overrides,
+    }
+
+
 @app.post("/v1/voices/profiles/{profile_id}")
 async def import_voice_profile(profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return _write_candidate_profile(profile_id, payload)
@@ -512,13 +1106,14 @@ async def backend_models() -> dict[str, Any]:
             "gpu_now": gpu_guard(active, minimum_free_mib=0, apply_policy=False),
             "load_headroom_mib": _guard_policy(active, "load")[0],
             "synthesis_headroom_mib": _guard_policy(active, "synthesis")[0],
+            "enforced_gpu_policy": _enforced_gpu_policy(),
             "gpu_guard": dict(gpu_guard_settings),
-            "mem_saver": True,
-            "native_incremental_pcm": False,
+            "mem_saver": not NATIVE_INCREMENTAL_PCM_ENABLED,
+            "native_incremental_pcm": NATIVE_INCREMENTAL_PCM_ENABLED,
             "progressive_phrase_pcm": True,
             "sample_rate": 24000,
             "sample_format": "pcm_s16le",
-            "tts_mode": "offline-buffered",
+            "tts_mode": "native-incremental-pcm" if NATIVE_INCREMENTAL_PCM_ENABLED else "offline-buffered",
         },
         "events": list(EVENTS),
         "last_action": state["lastAction"],
@@ -553,28 +1148,42 @@ def _apply_clone_profile(payload: dict[str, Any]) -> None:
         raise HTTPException(status_code=404, detail=f"Clone profile `{profile_id}` is unavailable: {exc}") from exc
     if not reference.is_file():
         raise HTTPException(status_code=404, detail=f"Clone profile `{profile_id}` is missing its reference audio.")
+    matched_pairs: list[dict[str, str]] = []
+    excerpts = meta.get("reference_excerpts")
+    if isinstance(excerpts, list):
+        for excerpt in excerpts:
+            if not isinstance(excerpt, dict):
+                continue
+            filename = str(excerpt.get("ref_audio_filename") or "").strip()
+            transcript = str(excerpt.get("ref_text") or "").strip()
+            if not filename or Path(filename).name != filename or not transcript:
+                continue
+            excerpt_path = profile_root / filename
+            if excerpt_path.is_file():
+                matched_pairs.append(
+                    {
+                        "ref_audio": base64.b64encode(excerpt_path.read_bytes()).decode("ascii"),
+                        "ref_text": transcript,
+                    }
+                )
     payload.update(
         task_type="Base",
         ref_audio=base64.b64encode(reference.read_bytes()).decode("ascii"),
         ref_text=str(meta.get("ref_text") or ""),
         x_vector_only_mode=bool(meta.get("x_vector_only_mode")),
+        _matched_reference_pairs=matched_pairs,
     )
 
 
 def _normalize_gradio_seed(payload: dict[str, Any]) -> None:
-    """Translate Gradio's negative random-seed sentinel for audio.cpp."""
-    seed = payload.get("seed")
-    if seed is None:
+    """Omit randomness sentinels and forward an explicit uint32 seed."""
+    if "seed" not in payload:
         return
-    try:
-        normalized_seed = int(seed)
-    except (TypeError, ValueError):
+    seed = _normalize_seed_value(payload.get("seed"))
+    if seed is None:
         payload.pop("seed", None)
     else:
-        if normalized_seed < 0:
-            payload.pop("seed", None)
-        else:
-            payload["seed"] = normalized_seed
+        payload["seed"] = seed
 
 
 def _container_reachable_llm_endpoint(endpoint: str) -> str:
@@ -680,34 +1289,30 @@ def _llamacpp_history(messages: list[Any]) -> list[dict[str, Any]]:
 
 
 def _voice_profiles() -> list[dict[str, Any]]:
-    """Expose only candidate-private Base profiles through the OpenAI boundary."""
-    profiles: list[dict[str, Any]] = []
-    root = VOICE_LIBRARY_DIR / "profiles"
-    if not root.is_dir():
-        return profiles
-    for meta_path in sorted(root.glob("*/meta.json")):
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            profile_id = meta_path.parent.name
-            reference = meta_path.parent / str(meta.get("ref_audio_filename") or "ref_audio.wav")
-            if reference.is_file():
-                profiles.append({
-                    "id": profile_id,
-                    "voice": f"clone:{profile_id}",
-                    "name": str(meta.get("name") or profile_id),
-                    "task": str(meta.get("task_type") or "Base"),
-                    "language": str(meta.get("language") or "Auto"),
-                })
-        except (OSError, ValueError):
-            continue
-    return profiles
+    """Expose the same uncached, canonical Base inventory used by Gradio."""
+    return [
+        {
+            "id": str(meta["profile_id"]),
+            "voice": f"clone:{meta['profile_id']}",
+            "name": str(meta["name"]),
+            "task": "Base",
+            "language": str(meta["language"]),
+            "provider": TUNING_PROVIDER,
+        }
+        for meta in live_profiles(VOICE_LIBRARY_DIR, normalize=True)
+    ]
 
 
 def _write_candidate_profile(profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Atomically import a compatible Base profile into the private candidate library."""
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", profile_id):
+    if not valid_profile_id(profile_id):
         raise HTTPException(status_code=422, detail="Invalid clone profile id.")
     encoded = str(payload.get("ref_audio") or "")
+    if bool(payload.get("x_vector_only_mode")):
+        raise HTTPException(status_code=422, detail="x_vector_only_mode is unavailable; import a full ICL reference and transcript.")
+    reference_text = str(payload.get("ref_text") or "").strip()
+    if not reference_text:
+        raise HTTPException(status_code=422, detail="A full ICL reference transcript is required.")
     if not encoded:
         raise HTTPException(status_code=422, detail="Clone reference audio is required.")
     try:
@@ -716,6 +1321,22 @@ def _write_candidate_profile(profile_id: str, payload: dict[str, Any]) -> dict[s
         raise HTTPException(status_code=422, detail="Invalid clone reference audio.") from exc
     if not audio:
         raise HTTPException(status_code=422, detail="Clone reference audio is empty.")
+    prepared_excerpts: list[tuple[str, bytes, str]] = []
+    excerpts = payload.get("reference_excerpts") or []
+    if not isinstance(excerpts, list):
+        raise HTTPException(status_code=422, detail="reference_excerpts must be a list of matched audio/transcript pairs.")
+    for index, excerpt in enumerate(excerpts, start=1):
+        if not isinstance(excerpt, dict):
+            raise HTTPException(status_code=422, detail="Each reference excerpt must be an object.")
+        excerpt_text = str(excerpt.get("ref_text") or "").strip()
+        excerpt_encoded = str(excerpt.get("ref_audio") or "")
+        if not excerpt_text or not excerpt_encoded:
+            raise HTTPException(status_code=422, detail="Each reference excerpt requires audio and its exact transcript.")
+        try:
+            excerpt_audio, _ = _decode_reference_wav(excerpt_encoded, "matched reference excerpt")
+        except HTTPException as exc:
+            raise HTTPException(status_code=422, detail=exc.detail) from exc
+        prepared_excerpts.append((f"ref_excerpt_{index}.wav", excerpt_audio, excerpt_text))
     profile_dir = VOICE_LIBRARY_DIR / "profiles" / profile_id
     profile_dir.mkdir(parents=True, exist_ok=True)
     reference_name = "ref_audio.wav"
@@ -723,14 +1344,27 @@ def _write_candidate_profile(profile_id: str, payload: dict[str, Any]) -> dict[s
     temp_meta = profile_dir / ".meta.json.tmp"
     temp_audio.write_bytes(audio)
     temp_audio.replace(profile_dir / reference_name)
+    for excerpt_name, excerpt_audio, _ in prepared_excerpts:
+        temp_excerpt = profile_dir / f".{excerpt_name}.tmp"
+        temp_excerpt.write_bytes(excerpt_audio)
+        temp_excerpt.replace(profile_dir / excerpt_name)
     metadata = {
         "profile_id": profile_id,
         "name": str(payload.get("name") or profile_id),
         "task_type": "Base",
+        "created_at": str(payload.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
         "language": str(payload.get("language") or "Auto"),
-        "ref_text": str(payload.get("ref_text") or ""),
-        "x_vector_only_mode": bool(payload.get("x_vector_only_mode")),
+        "voice": f"clone:{profile_id}",
+        "instructions": str(payload.get("instructions") or ""),
+        "ref_text": reference_text,
+        "x_vector_only_mode": False,
         "ref_audio_filename": reference_name,
+        "origin": str(payload.get("origin") or "audio.cpp Base clone"),
+        "provider": TUNING_PROVIDER,
+        "reference_excerpts": [
+            {"ref_audio_filename": filename, "ref_text": transcript}
+            for filename, _, transcript in prepared_excerpts
+        ],
     }
     temp_meta.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
     temp_meta.replace(profile_dir / "meta.json")
@@ -740,9 +1374,16 @@ def _write_candidate_profile(profile_id: str, payload: dict[str, Any]) -> dict[s
 
 def _render_master_wav(master_wav: bytes, requested_format: str) -> tuple[bytes, str, str, dict[str, int | str]]:
     """Return exactly one requested output, using audio.cpp's complete WAV as master."""
-    fmt = (requested_format or "wav").lower()
+    fmt = (requested_format or "wav").strip().lower()
+    if fmt not in SUPPORTED_MASTER_OUTPUT_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unsupported audio format `{fmt}`.")
     try:
         with wave.open(io.BytesIO(master_wav), "rb") as reader:
+            if reader.getframerate() != 24000 or reader.getsampwidth() != 2:
+                raise HTTPException(
+                    status_code=502,
+                    detail="audio.cpp WAV master must be model-native 24 kHz PCM16; it is never resampled or requantized by the candidate.",
+                )
             metadata: dict[str, int | str] = {
                 "codec": "pcm_s16le",
                 "container": "WAV",
@@ -764,128 +1405,738 @@ def _render_master_wav(master_wav: bytes, requested_format: str) -> tuple[bytes,
     encoders = {
         # Never resample or downmix the native WAV master.  Lossless formats
         # preserve it bit-for-bit; lossy formats use intentionally high rates.
-        "mp3": ("libmp3lame", ["-b:a", "320k"], "audio/mpeg", "mp3", "high-quality 320 kbps"),
-        "flac": ("flac", ["-compression_level", "8"], "audio/flac", "flac", "lossless"),
-        "aac": ("aac", ["-b:a", "320k"], "audio/aac", "aac", "high-quality 320 kbps"),
-        "opus": ("libopus", ["-b:a", "320k"], "audio/ogg", "opus", "high-quality 320 kbps"),
+        "mp3": ("libmp3lame", ["-b:a", "320k"], "audio/mpeg", "mp3", "mp3", "MP3", "high-quality 320 kbps"),
+        "flac": ("flac", ["-compression_level", "8"], "audio/flac", "flac", "flac", "FLAC", "lossless"),
+        "aac": ("aac", ["-b:a", "320k"], "audio/aac", "aac", "aac", "ADTS", "high-quality 320 kbps"),
+        # libopus caps this mono stream at 256 kbps.  Asking ffmpeg for
+        # 320 kbps fails instead of silently clamping, so use the codec's
+        # highest supported rate while preserving the 24 kHz master.
+        "opus": ("libopus", ["-b:a", "256k"], "audio/ogg", "opus", "opus", "OGG", "maximum-quality 256 kbps"),
     }
-    if fmt not in encoders:
-        raise HTTPException(status_code=400, detail=f"Unsupported audio format `{fmt}`.")
-    encoder, encoder_args, media_type, extension, quality = encoders[fmt]
+    encoder, encoder_args, media_type, extension, codec, container, quality = encoders[fmt]
     with tempfile.TemporaryDirectory(prefix="audio-cpp-output-") as directory:
         source = Path(directory) / "master.wav"
         output = Path(directory) / f"output.{extension}"
         source.write_bytes(master_wav)
-        result = subprocess.run(
-            ["ffmpeg", "-v", "error", "-y", "-i", str(source), "-c:a", encoder, *encoder_args, str(output)],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", str(source), "-c:a", encoder, *encoder_args, str(output)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HTTPException(status_code=503, detail=f"Could not encode `{fmt}` output.") from exc
         if result.returncode != 0 or not output.exists():
             raise HTTPException(status_code=502, detail=f"Failed to encode `{fmt}` output: {result.stderr.strip()}")
-        metadata["codec"] = encoder
-        metadata["container"] = extension.upper()
+        metadata["codec"] = codec
+        metadata["container"] = container
         metadata["quality"] = quality
         return output.read_bytes(), media_type, extension, metadata
+
+
+async def _assert_synthesis_ready(payload: dict[str, Any]) -> str:
+    """Check candidate admission before returning a buffered or chunked response."""
+    model_id = str(payload.get("model") or state["activeModel"])
+    if model_id != state["activeModel"]:
+        raise HTTPException(status_code=409, detail="Selected model is not active; switch it in Voice Studio before synthesis.")
+    if state["state"] != "loaded":
+        raise HTTPException(status_code=409, detail="No candidate model is loaded. Use Voice Studio model controls first.")
+    guard = gpu_guard(model_id, operation="synthesis")
+    if not guard["ok"]:
+        state.update(reason=guard["reason"], lastError=guard["reason"])
+        _record_event("gpu-blocked-synthesis", model_id=model_id, gpu=guard)
+        raise HTTPException(status_code=409, detail={"state": "blocked", **guard})
+    admission_epoch = int(state.get("engineEpoch") or 0)
+    if not await _engine_ready():
+        raise HTTPException(status_code=503, detail="Candidate model is switching/loading; retry when Voice Studio reports loaded.")
+    if state["state"] != "loaded" or state["activeModel"] != model_id or admission_epoch != int(state.get("engineEpoch") or 0):
+        raise HTTPException(status_code=409, detail="Candidate model changed while the synthesis request was being admitted; retry the request.")
+    payload["_engine_epoch"] = admission_epoch
+    return model_id
+
+
+def _revalidate_generation_admission(payload: dict[str, Any], model_id: str, *, internal_warmup: bool = False) -> None:
+    """Reject a request that queued behind a model transition."""
+    expected_epoch = payload.get("_engine_epoch")
+    # Route-level admission always stamps an epoch.  Direct contract tests and
+    # internal helper callers without one are intentionally left unchanged.
+    if expected_epoch is None and not internal_warmup:
+        return
+    if expected_epoch is not None and int(expected_epoch) != int(state.get("engineEpoch") or 0):
+        raise HTTPException(status_code=409, detail="Candidate model changed before synthesis began; retry the request.")
+    if state["activeModel"] != model_id:
+        raise HTTPException(status_code=409, detail="Selected model is no longer active; retry after the model switch completes.")
+    allowed_states = {"warming"} if internal_warmup else {"loaded"}
+    if state["state"] not in allowed_states:
+        raise HTTPException(status_code=409, detail="Candidate model is switching or warming; retry when it reports loaded.")
+
+
+def _native_pcm_requested(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("stream")) and str(payload.get("response_format") or "wav").lower() == "pcm"
+
+
+def _delivery_mode_for_payload(payload: dict[str, Any]) -> str:
+    if "response_format" not in payload and "stream" not in payload:
+        return "profile-resolution"
+    if _native_pcm_requested(payload):
+        return "native-incremental-pcm"
+    if str(payload.get("response_format") or "wav").lower() == "pcm":
+        return "buffered-fallback"
+    return "offline-full-decoder"
+
+
+def _resolve_request_tuning(
+    payload: dict[str, Any], *, force_offline_full: bool = False,
+) -> dict[str, Any]:
+    """Resolve one immutable request policy without mixing offline and stream knobs."""
+    tuning = payload.get("tuning") or {}
+    if not isinstance(tuning, dict): raise HTTPException(status_code=422, detail="tuning must be an object.")
+    provider = tuning.get("provider")
+    if provider is not None and provider != TUNING_PROVIDER:
+        raise HTTPException(status_code=422, detail="tuning is available only for qwen3tts-audiocpp.")
+    scope = str(tuning.get("scope") or "realtime")
+    document = _read_tuning_profiles()
+    selected = _selected_tuning_profile(document, scope)
+    profile_id = str(tuning.get("profile_id") or selected)
+    profile = document["profiles"].get(profile_id)
+    if not isinstance(profile, dict): raise HTTPException(status_code=404, detail="Unknown tuning profile.")
+    required_model = tuning.get("model") or profile.get("model")
+    if required_model and required_model != state["activeModel"]:
+        raise HTTPException(status_code=409, detail={"active": state["activeModel"], "required": required_model, "auto_switch": False})
+    allowed_names = TUNING_VALUE_FIELDS - {"clone_mode"}
+    allowed = {key: profile[key] for key in allowed_names if key in profile}
+    overrides = tuning.get("overrides") or {}
+    if not isinstance(overrides, dict) or any(key not in allowed_names for key in overrides):
+        raise HTTPException(status_code=422, detail="Unsupported tuning override.")
+    seed_supplied = "seed" in overrides or "seed" in payload
+    if "seed" in overrides:
+        overrides = dict(overrides)
+        overrides["seed"] = _normalize_seed_value(overrides["seed"])
+        request_seed = overrides["seed"]
+    elif "seed" in payload:
+        request_seed = _normalize_seed_value(payload["seed"])
+    else:
+        request_seed = None
+    candidate = dict(profile); candidate.update(overrides); _validate_tuning_profile(candidate)
+    if candidate.get("model") and candidate["model"] != state["activeModel"]:
+        raise HTTPException(status_code=409, detail={"active": state["activeModel"], "required": candidate["model"], "auto_switch": False})
+    allowed.update(overrides)
+    delivery_mode = OFFLINE_FULL_DECODE_MODE if force_offline_full else _delivery_mode_for_payload(payload)
+    offline_full_quality = delivery_mode == "offline-full-decoder"
+    # Full-WAV synthesis is a fixed offline policy, not the mutable streaming
+    # selection.  Use the shipped Quality sampler defaults even if a built-in
+    # profile was edited for interactive experiments.
+    quality = _default_tuning_profiles()["profiles"]["quality"]
+    # audio.cpp accepts these sampler fields directly. Lookahead and flush
+    # belong to the browser phrase queue and are never sent to the engine.
+    sampler_source = quality if offline_full_quality else allowed
+    engine_fields = {
+        key: sampler_source[key]
+        for key in ("temperature", "top_k", "top_p", "repetition_penalty", "seed")
+        if key in sampler_source and sampler_source[key] is not None
+    }
+    # A seed is request identity rather than a quality preset.  Preserve a
+    # caller's explicit uint32 even when Full WAV pins every other sampler to
+    # Quality; null/blank/-1 deliberately removes a profile seed for random
+    # generation.
+    if seed_supplied:
+        if request_seed is None:
+            engine_fields.pop("seed", None)
+        else:
+            engine_fields["seed"] = request_seed
+    if offline_full_quality:
+        effective = {
+            key: value
+            for key, value in allowed.items()
+            if key == "model"
+        }
+        effective.update(engine_fields)
+        inactive_fields = [
+            "max_reference_seconds", "first_block_frames",
+            "steady_block_frames", "left_context_frames", "text_lookahead",
+            "phrase_flush_ms",
+        ]
+        phrase_queue_fields: dict[str, Any] = {}
+    else:
+        effective = allowed
+        inactive_fields = [
+            *([] if NATIVE_INCREMENTAL_PCM_ENABLED else ["first_block_frames", "steady_block_frames", "left_context_frames"]),
+        ]
+        phrase_queue_fields = {
+            key: allowed[key]
+            for key in ("text_lookahead", "phrase_flush_ms")
+            if key in allowed
+        }
+    warnings: list[str] = []
+    if not offline_full_quality and int(candidate["left_context_frames"]) < MODEL_REQUIRED_LEFT_CONTEXT_FRAMES:
+        warnings.append(
+            f"Reduced decoder context is experimental and may degrade quality; the model requires {MODEL_REQUIRED_LEFT_CONTEXT_FRAMES} frames."
+        )
+    return {
+        "id": profile_id,
+        "scope": scope,
+        "revision": profile.get("revision", 1),
+        "policy": "offline-full-quality" if offline_full_quality else "profile-streaming",
+        "delivery_mode": delivery_mode,
+        "effective": effective,
+        "engine_fields": engine_fields,
+        "reference_limit_seconds": int(candidate["max_reference_seconds"]),
+        "reference_limit_condition": "matched-excerpt-only",
+        "inactive_fields": inactive_fields,
+        "phrase_queue_fields": phrase_queue_fields,
+        "warnings": warnings,
+    }
 
 
 @app.post("/v1/audio/speech")
 async def speech(request: Request) -> Response:
     payload = await request.json()
+    payload.setdefault("response_format", "wav")
+    payload.setdefault("stream", False)
+    payload["_tuning_snapshot"] = _resolve_request_tuning(payload)
     _apply_clone_profile(payload)
+    model_id = await _assert_synthesis_ready(payload)
+    if _native_pcm_requested(payload):
+        if not NATIVE_INCREMENTAL_PCM_ENABLED:
+            raise HTTPException(status_code=409, detail="Native incremental PCM is not enabled in this candidate build; use buffered phrase PCM or deploy a validated native build.")
+        if not (payload.get("task_type") == "Base" or payload.get("ref_audio")):
+            raise HTTPException(status_code=422, detail="Native streaming currently supports Base clone requests only.")
+        return _native_clone_pcm_response(payload, model_id)
     async with generation_lock:
-        model_id = str(payload.get("model") or state["activeModel"])
-        if model_id != state["activeModel"]: raise HTTPException(status_code=409, detail="Selected model is not active; switch it in Voice Studio before synthesis.")
-        if state["state"] != "loaded":
-            raise HTTPException(status_code=409, detail="No candidate model is loaded. Use Voice Studio model controls first.")
-        guard = gpu_guard(
-            model_id,
-            operation="synthesis",
-        )
-        if not guard["ok"]:
-            state.update(reason=guard["reason"], lastError=guard["reason"])
-            _record_event("gpu-blocked-synthesis", model_id=model_id, gpu=guard)
-            raise HTTPException(status_code=409, detail={"state": "blocked", **guard})
-        if not await _engine_ready(): raise HTTPException(status_code=503, detail="Candidate model is switching/loading; retry when Voice Studio reports loaded.")
+        _revalidate_generation_admission(payload, model_id)
+        _record_event("generation-start", model_id=model_id, requestedFormat=str(payload.get("response_format") or "wav"))
         if payload.get("task_type") == "Base" or payload.get("ref_audio"):
-            _record_event("generation-start", model_id=model_id, requestedFormat=str(payload.get("response_format") or "wav"))
             return await _voice_clone_response(payload)
+        payload.pop("_tuning_snapshot", None)
+        payload.pop("tuning", None)
         payload["stream"] = False
-        async with httpx.AsyncClient(timeout=600.0) as client: response = await client.post(f"{ENGINE_URL}/v1/audio/speech", json=payload)
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            response = await client.post(f"{ENGINE_URL}/v1/audio/speech", json=payload)
         return Response(content=response.content, status_code=response.status_code, media_type=response.headers.get("content-type"))
 
 
 @app.post("/v1/audio/voice-clone")
 async def voice_clone(request: Request) -> Response:
     """Compatibility adapter for the copied Gradio Base-profile playground."""
-    payload = await request.json(); model_id = str(payload.get("model") or state["activeModel"])
-    if model_id != state["activeModel"]:
-        raise HTTPException(status_code=409, detail="Load the selected model before generation.")
-    if state["state"] != "loaded":
-        raise HTTPException(status_code=409, detail="No candidate model is loaded. Use Voice Studio model controls first.")
-    guard = gpu_guard(
-        model_id,
-        operation="synthesis",
+    payload = await request.json()
+    payload.setdefault("response_format", "wav")
+    payload.setdefault("stream", False)
+    # This endpoint is the Studio's format-independent full-quality contract.
+    # Even PCM means raw frames extracted from one completed offline WAV master,
+    # never the buffered or incremental streaming decoder.
+    payload["_tuning_snapshot"] = _resolve_request_tuning(
+        payload, force_offline_full=True,
     )
-    if not guard["ok"]:
-        state.update(reason=guard["reason"], lastError=guard["reason"])
-        _record_event("gpu-blocked-synthesis", model_id=model_id, gpu=guard)
-        raise HTTPException(status_code=409, detail={"state": "blocked", **guard})
+    model_id = await _assert_synthesis_ready(payload)
     async with generation_lock:
+        _revalidate_generation_admission(payload, model_id)
         _record_event("generation-start", model_id=model_id, requestedFormat=str(payload.get("response_format") or "wav"))
         return await _voice_clone_response(payload)
 
 
+def _decode_reference_wav(raw: str, label: str) -> tuple[bytes, float]:
+    """Decode one complete WAV and return its immutable bytes and duration."""
+    try:
+        audio = base64.b64decode(raw, validate=True)
+        with wave.open(io.BytesIO(audio), "rb") as reader:
+            rate = reader.getframerate()
+            frames = reader.getnframes()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid {label} WAV: {exc}") from exc
+    if rate <= 0 or frames <= 0:
+        raise HTTPException(status_code=400, detail=f"{label.capitalize()} WAV is empty.")
+    return audio, frames / rate
+
+
+def _prepare_reference_pair(
+    payload: dict[str, Any],
+    tuning_snapshot: dict[str, Any],
+    filename: str,
+) -> tuple[Path, dict[str, Any], str]:
+    """Select one transcript-matched reference without audio-only truncation.
+
+    A duration limit can select an explicitly stored excerpt only when that
+    excerpt carries its own exact transcript.  Otherwise the complete source
+    audio and complete source transcript remain inseparable.  Full-WAV policy
+    always uses the complete pair regardless of the requested stream limit.
+    """
+    full_audio, source_seconds = _decode_reference_wav(
+        str(payload.get("ref_audio") or ""), "clone reference"
+    )
+    full_text = str(payload.get("ref_text") or "").strip()
+    if not full_text:
+        raise HTTPException(status_code=400, detail="A Base clone reference transcript is required.")
+    requested_limit = int(tuning_snapshot.get("reference_limit_seconds", 30))
+    delivery_mode = str(
+        tuning_snapshot.get("delivery_mode") or _delivery_mode_for_payload(payload)
+    )
+    chosen_audio = full_audio
+    chosen_text = full_text
+    used_seconds = source_seconds
+    pairing = "full"
+    limit_applied = False
+    excerpts = payload.pop("_matched_reference_pairs", [])
+    if (
+        delivery_mode != "offline-full-decoder"
+        and source_seconds > requested_limit
+        and isinstance(excerpts, list)
+    ):
+        candidates: list[tuple[float, bytes, str]] = []
+        for excerpt in excerpts:
+            if not isinstance(excerpt, dict):
+                continue
+            excerpt_text = str(excerpt.get("ref_text") or "").strip()
+            if not excerpt_text:
+                continue
+            try:
+                excerpt_audio, excerpt_seconds = _decode_reference_wav(
+                    str(excerpt.get("ref_audio") or ""), "matched reference excerpt"
+                )
+            except HTTPException:
+                continue
+            if 0 < excerpt_seconds <= requested_limit and excerpt_seconds < source_seconds:
+                candidates.append((excerpt_seconds, excerpt_audio, excerpt_text))
+        if candidates:
+            used_seconds, chosen_audio, chosen_text = max(candidates, key=lambda item: item[0])
+            pairing = "matched-excerpt"
+            limit_applied = True
+    reference = Path(tempfile.gettempdir()) / filename
+    reference.write_bytes(chosen_audio)
+    stats = {
+        "source_seconds": round(source_seconds, 3),
+        "requested_limit_seconds": requested_limit,
+        "used_seconds": round(used_seconds, 3),
+        "limit_applied": limit_applied,
+        "pairing": pairing,
+        # Compatibility alias for existing clients.  It no longer means that
+        # the supervisor cut a WAV while retaining the original transcript.
+        "truncated": limit_applied,
+    }
+    return reference, stats, chosen_text
+
+
+def _reference_headers(stats: dict[str, Any], delivery_mode: str) -> dict[str, str]:
+    return {
+        "X-TTS-Reference-Source-Seconds": str(stats["source_seconds"]),
+        "X-TTS-Reference-Requested-Limit-Seconds": str(stats["requested_limit_seconds"]),
+        "X-TTS-Reference-Used-Seconds": str(stats["used_seconds"]),
+        "X-TTS-Reference-Limit-Applied": str(bool(stats["limit_applied"])).lower(),
+        "X-TTS-Reference-Pairing": str(stats["pairing"]),
+        "X-TTS-Reference-Truncated": str(bool(stats["truncated"])).lower(),
+        "X-TTS-Delivery-Mode": delivery_mode,
+    }
+
+
+def _reference_event_fields(stats: dict[str, Any], delivery_mode: str) -> dict[str, Any]:
+    return {
+        "sourceReferenceSeconds": stats["source_seconds"],
+        "requestedReferenceLimitSeconds": stats["requested_limit_seconds"],
+        "usedReferenceSeconds": stats["used_seconds"],
+        "referenceLimitApplied": stats["limit_applied"],
+        "referencePairing": stats["pairing"],
+        "deliveryMode": delivery_mode,
+    }
+
+
+def _apply_engine_tuning(engine_payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip supervisor-only fields and forward only supported sampler knobs."""
+    snapshot = engine_payload.pop("_tuning_snapshot", {})
+    engine_payload.pop("tuning", None)
+    for key in ("temperature", "top_k", "top_p", "repetition_penalty", "seed"):
+        engine_payload.pop(key, None)
+    if not isinstance(snapshot, dict):
+        return {}
+    fields = snapshot.get("engine_fields", {})
+    if isinstance(fields, dict):
+        for key in ("temperature", "top_k", "top_p", "repetition_penalty", "seed"):
+            if key in fields:
+                engine_payload[key] = fields[key]
+    return snapshot
+
+
+def _strip_private_engine_fields(engine_payload: dict[str, Any]) -> None:
+    """Keep supervisor bookkeeping out of audio.cpp's public request schema."""
+    for key in list(engine_payload):
+        if key.startswith("_"):
+            engine_payload.pop(key, None)
+
+
+def _engine_decode_mode(response: httpx.Response | Any) -> str | None:
+    """Read result-derived engine proof without trusting request metadata."""
+    headers = getattr(response, "headers", {})
+    return headers.get(ENGINE_DECODE_MODE_HEADER) or headers.get(
+        ENGINE_DECODE_MODE_HEADER.lower()
+    )
+
+
+def _validate_engine_decode_mode(
+    response: httpx.Response | Any, expected: str | None,
+) -> str:
+    """Require result-derived proof whenever a specific decoder was requested."""
+    actual = _engine_decode_mode(response)
+    if expected and not actual:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "state": "decoder-mode-proof-missing",
+                "expected": expected,
+            },
+        )
+    if actual and expected and actual != expected:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "state": "decoder-mode-mismatch",
+                "expected": expected,
+                "actual": actual,
+            },
+        )
+    return actual or "unreported"
+
+
 async def _voice_clone_response(payload: dict[str, Any]) -> Response:
+    if bool(payload.get("x_vector_only_mode")):
+        raise HTTPException(status_code=422, detail="x_vector_only_mode is unavailable; use a full ICL reference and transcript.")
     raw = str(payload.get("ref_audio") or "")
     if not raw:
         raise HTTPException(status_code=400, detail="A Base clone reference WAV is required.")
-    try:
-        reference = Path("/tmp/gradio-clone-reference.wav")
-        reference.write_bytes(base64.b64decode(raw))
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid clone reference audio: {exc}") from exc
     engine_payload = dict(payload)
+    tuning_snapshot = _apply_engine_tuning(engine_payload)
+    delivery_mode = str(
+        tuning_snapshot.get("delivery_mode") or _delivery_mode_for_payload(payload)
+    )
     # Gradio uses -1 as its "random seed" sentinel. audio.cpp validates seed
     # as unsigned, so omission is the compatible way to request randomness.
     _normalize_gradio_seed(engine_payload)
-    requested_format = str(payload.get("response_format") or "wav").lower()
+    requested_format = str(payload.get("response_format") or "wav").strip().lower()
+    if requested_format not in SUPPORTED_MASTER_OUTPUT_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unsupported audio format `{requested_format}`.")
+    options = engine_payload.get("options") or {}
+    if not isinstance(options, dict):
+        raise HTTPException(status_code=422, detail="options must be an object.")
+    options = dict(options)
+    options.pop("qwen3_tts.decode_mode", None)
+    expected_decode_mode: str | None = None
+    if delivery_mode == OFFLINE_FULL_DECODE_MODE:
+        options["qwen3_tts.decode_mode"] = "offline_full"
+        expected_decode_mode = OFFLINE_FULL_DECODE_MODE
+    if options:
+        engine_payload["options"] = options
+    else:
+        engine_payload.pop("options", None)
+    reference, reference_stats, reference_text = _prepare_reference_pair(
+        engine_payload,
+        tuning_snapshot,
+        f"audio-cpp-reference-{token_hex(8)}.wav",
+    )
     engine_payload.update(
         model=state["activeModel"],
         voice_ref=str(reference),
-        reference_text=str(payload.get("ref_text") or ""),
+        reference_text=reference_text,
         response_format="wav",
         stream=False,
     )
-    async with httpx.AsyncClient(timeout=600.0) as client:
-        response = await client.post(f"{ENGINE_URL}/v1/audio/speech", json=engine_payload)
-    if response.is_error:
-        _record_event("generation-error", model_id=state["activeModel"], status=response.status_code)
-        return Response(content=response.content, status_code=response.status_code, media_type=response.headers.get("content-type"))
-    content, media_type, extension, metadata = _render_master_wav(response.content, requested_format)
-    _record_event(
-        "generation-complete",
-        model_id=state["activeModel"],
-        requestedFormat=requested_format,
-        returnedFormat=extension,
-        bytes=len(content),
-        durationSeconds=metadata.get("durationSeconds"),
-    )
-    return Response(
-        content=content,
-        media_type=media_type,
-        headers={
+    _strip_private_engine_fields(engine_payload)
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            response = await client.post(f"{ENGINE_URL}/v1/audio/speech", json=engine_payload)
+        if response.is_error:
+            proven_decoder_mode = _engine_decode_mode(response)
+            upstream_decoder_mode = proven_decoder_mode or "unreported"
+            _record_event(
+                "generation-error",
+                model_id=state["activeModel"],
+                status=response.status_code,
+                decoderMode=upstream_decoder_mode,
+                **_reference_event_fields(reference_stats, delivery_mode),
+            )
+            error_headers = {
+                "X-TTS-Decoder-Mode": upstream_decoder_mode,
+                **_reference_headers(reference_stats, delivery_mode),
+            }
+            if proven_decoder_mode:
+                error_headers[ENGINE_DECODE_MODE_HEADER] = proven_decoder_mode
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                media_type=response.headers.get("content-type"),
+                headers=error_headers,
+            )
+        try:
+            decoder_mode = _validate_engine_decode_mode(response, expected_decode_mode)
+        except HTTPException as exc:
+            _record_event(
+                "generation-error",
+                model_id=state["activeModel"],
+                status=exc.status_code,
+                decoderMode=_engine_decode_mode(response),
+                expectedDecoderMode=expected_decode_mode,
+                **_reference_event_fields(reference_stats, delivery_mode),
+            )
+            raise
+        try:
+            content, media_type, extension, metadata = _render_master_wav(
+                response.content, requested_format,
+            )
+        except HTTPException as exc:
+            _record_event(
+                "generation-error",
+                model_id=state["activeModel"],
+                status=exc.status_code,
+                decoderMode=decoder_mode,
+                requestedFormat=requested_format,
+                stage="completed-master-export",
+                **_reference_event_fields(reference_stats, delivery_mode),
+            )
+            raise
+        _record_event(
+            "generation-complete",
+            model_id=state["activeModel"],
+            requestedFormat=requested_format,
+            returnedFormat=extension,
+            bytes=len(content),
+            durationSeconds=metadata.get("durationSeconds"),
+            decoderMode=decoder_mode,
+            codec=metadata.get("codec"),
+            container=metadata.get("container"),
+            sampleRate=metadata.get("sampleRate"),
+            bitsPerSample=metadata.get("bitsPerSample"),
+            channels=metadata.get("channels"),
+            **_reference_event_fields(reference_stats, delivery_mode),
+        )
+        result_headers = {
             "X-TTS-Model": state["activeModel"],
             "X-TTS-Codec": str(metadata["codec"]),
             "X-TTS-Container": str(metadata["container"]),
             "X-TTS-Quality": str(metadata["quality"]),
             "X-TTS-Sample-Rate": str(metadata["sampleRate"]),
             "X-TTS-Bits-Per-Sample": str(metadata["bitsPerSample"]),
+            "X-TTS-Channels": str(metadata["channels"]),
             "X-TTS-Duration-Seconds": str(metadata["durationSeconds"]),
             "X-TTS-Format": extension,
+            "X-TTS-Decoder-Mode": decoder_mode,
+            **_reference_headers(reference_stats, delivery_mode),
+        }
+        if "seed" in engine_payload:
+            result_headers["X-TTS-Seed"] = str(engine_payload["seed"])
+        if decoder_mode != "unreported":
+            result_headers[ENGINE_DECODE_MODE_HEADER] = decoder_mode
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers=result_headers,
+        )
+    finally:
+        reference.unlink(missing_ok=True)
+
+
+def _native_clone_pcm_response(payload: dict[str, Any], model_id: str) -> StreamingResponse:
+    """Relay one engine request as raw, incrementally-produced PCM16 blocks.
+
+    The engine is the sole producer of stream chunks.  The supervisor never
+    reconstructs or re-chunks them, which preserves cancellation identity and
+    prevents a buffered result from being replayed beside native PCM.
+    """
+    if bool(payload.get("x_vector_only_mode")):
+        raise HTTPException(status_code=422, detail="Native PCM supports full ICL Base cloning only; x_vector_only_mode is unavailable.")
+    raw = str(payload.get("ref_audio") or "")
+    if not raw:
+        raise HTTPException(status_code=400, detail="A Base clone reference WAV is required.")
+    internal_warmup = bool(payload.get("_internal_warmup"))
+    engine_payload = dict(payload)
+    tuning_snapshot = _apply_engine_tuning(engine_payload)
+    delivery_mode = "native-incremental-pcm"
+    effective = tuning_snapshot.get("effective", {}) if isinstance(tuning_snapshot, dict) else {}
+    raw_options = engine_payload.get("options") or {}
+    if not isinstance(raw_options, dict):
+        raise HTTPException(status_code=422, detail="options must be an object.")
+    options = dict(raw_options)
+    options.pop("qwen3_tts.decode_mode", None)
+    for key in {"first_block_frames", "steady_block_frames", "left_context_frames"}:
+        if key in effective:
+            options[f"qwen3_tts.stream_{key}"] = effective[key]
+    if options:
+        engine_payload["options"] = options
+    _normalize_gradio_seed(engine_payload)
+    reference, reference_stats, reference_text = _prepare_reference_pair(
+        engine_payload,
+        tuning_snapshot,
+        f"audio-cpp-reference-{token_hex(8)}.wav",
+    )
+    engine_payload.update(
+        model=model_id,
+        voice_ref=str(reference),
+        reference_text=reference_text,
+        response_format="pcm",
+        stream=True,
+        stream_format="audio",
+    )
+    _strip_private_engine_fields(engine_payload)
+
+    async def relay() -> Any:
+        started = time.monotonic()
+        bytes_sent = 0
+        chunks_sent = 0
+        first_chunk_s: float | None = None
+        try:
+            async with generation_lock:
+                _revalidate_generation_admission(payload, model_id, internal_warmup=internal_warmup)
+                if not internal_warmup:
+                    _record_event(
+                        "generation-start",
+                        model_id=model_id,
+                        requestedFormat="pcm",
+                        nativeIncremental=True,
+                        **_reference_event_fields(reference_stats, delivery_mode),
+                    )
+                async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=600.0)) as client:
+                    async with client.stream("POST", f"{ENGINE_URL}/v1/audio/speech", json=engine_payload) as response:
+                        if response.is_error:
+                            detail = (await response.aread())[:2048]
+                            if not internal_warmup:
+                                _record_event(
+                                    "generation-error",
+                                    model_id=model_id,
+                                    status=response.status_code,
+                                    nativeIncremental=True,
+                                    **_reference_event_fields(reference_stats, delivery_mode),
+                                )
+                            raise RuntimeError(f"audio.cpp native stream failed ({response.status_code}): {detail.decode('utf-8', errors='replace')}")
+                        actual_decode_mode = _engine_decode_mode(response)
+                        if actual_decode_mode and actual_decode_mode != "native-incremental-pcm":
+                            if not internal_warmup:
+                                _record_event(
+                                    "generation-error",
+                                    model_id=model_id,
+                                    status=502,
+                                    decoderMode=actual_decode_mode,
+                                    expectedDecoderMode="native-incremental-pcm",
+                                    **_reference_event_fields(reference_stats, delivery_mode),
+                                )
+                            raise RuntimeError(
+                                "audio.cpp native stream returned decoder-mode proof "
+                                f"`{actual_decode_mode}` instead of `native-incremental-pcm`."
+                            )
+                        async for chunk in response.aiter_raw():
+                            if not chunk:
+                                continue
+                            if first_chunk_s is None:
+                                first_chunk_s = time.monotonic() - started
+                                if not internal_warmup:
+                                    _record_event("native-pcm-first", model_id=model_id, latencySeconds=round(first_chunk_s, 3), bytes=len(chunk))
+                            chunks_sent += 1
+                            bytes_sent += len(chunk)
+                            yield chunk
+            if not internal_warmup:
+                _record_event(
+                    "generation-complete",
+                    model_id=model_id,
+                    requestedFormat="pcm",
+                    returnedFormat="pcm",
+                    nativeIncremental=True,
+                    chunks=chunks_sent,
+                    bytes=bytes_sent,
+                    firstChunkSeconds=round(first_chunk_s, 3) if first_chunk_s is not None else None,
+                    elapsedSeconds=round(time.monotonic() - started, 3),
+                    **_reference_event_fields(reference_stats, delivery_mode),
+                )
+        except asyncio.CancelledError:
+            if not internal_warmup:
+                _record_event(
+                    "generation-cancelled",
+                    model_id=model_id,
+                    nativeIncremental=True,
+                    chunks=chunks_sent,
+                    **_reference_event_fields(reference_stats, delivery_mode),
+                )
+            raise
+        finally:
+            reference.unlink(missing_ok=True)
+
+    return StreamingResponse(
+        relay(),
+        media_type="audio/pcm",
+        headers={
+            "X-TTS-Model": model_id,
+            "X-TTS-Codec": "pcm_s16le",
+            "X-TTS-Container": "raw PCM",
+            "X-TTS-Format": "pcm",
+            "X-TTS-Sample-Rate": "24000",
+            "X-TTS-Bits-Per-Sample": "16",
+            "X-TTS-Channels": "1",
+            "X-TTS-Streaming-Mode": "native-incremental-pcm",
+            "X-TTS-Decoder-Mode": "native-incremental-pcm",
+            **_reference_headers(reference_stats, delivery_mode),
         },
     )
+
+
+async def _run_native_load_warmup(model_id: str) -> dict[str, Any]:
+    """Consume one private native utterance so explicit Load absorbs lazy GPU work."""
+    guard = gpu_guard(model_id, operation="synthesis")
+    if not guard["ok"]:
+        reason = "Native load warmup skipped because the synthesis GPU guard is not satisfied."
+        _record_event("model-warmup-skipped", model_id=model_id, reason=reason, gpu=guard)
+        return {"status": "skipped", "reason": reason, "profileId": None, "elapsedSeconds": None}
+    inventory = _candidate_profile_response()
+    voices = inventory.get("voices") or []
+    if not isinstance(voices, list) or not voices:
+        reason = "Native load warmup skipped because no live Base clone profile is available."
+        _record_event("model-warmup-skipped", model_id=model_id, reason=reason)
+        return {"status": "skipped", "reason": reason, "profileId": None, "elapsedSeconds": None}
+    voice_ids = [str(item.get("id") or "") for item in voices if isinstance(item, dict)]
+    preferred = str(inventory.get("selectedVoice") or inventory.get("defaultVoice") or "")
+    if preferred.startswith("clone:"):
+        preferred = preferred.removeprefix("clone:")
+    profile_id = preferred if preferred in voice_ids else next((item for item in voice_ids if item), "")
+    if not profile_id:
+        reason = "Native load warmup skipped because the live clone inventory has no valid profile ID."
+        _record_event("model-warmup-skipped", model_id=model_id, reason=reason)
+        return {"status": "skipped", "reason": reason, "profileId": None, "elapsedSeconds": None}
+    profile = _candidate_profile_payload(profile_id, include_audio=True)
+    payload: dict[str, Any] = {
+        "input": "Ready.",
+        "task_type": "Base",
+        "ref_audio": profile["ref_audio"],
+        "ref_text": profile["ref_text"],
+        "response_format": "pcm",
+        "stream": True,
+        "_internal_warmup": True,
+        "_engine_epoch": int(state.get("engineEpoch") or 0),
+        "tuning": {
+            "provider": TUNING_PROVIDER,
+            "profile_id": "balanced",
+            "scope": "realtime",
+            "overrides": {"seed": 321},
+        },
+    }
+    payload["_tuning_snapshot"] = _resolve_request_tuning(payload)
+    response = _native_clone_pcm_response(payload, model_id)
+    started = time.monotonic()
+    chunks = 0
+    byte_count = 0
+    async for chunk in response.body_iterator:
+        if chunk:
+            chunks += 1
+            byte_count += len(chunk)
+    if chunks == 0 or byte_count == 0:
+        raise RuntimeError("native warmup returned no PCM")
+    elapsed = round(time.monotonic() - started, 3)
+    _record_event(
+        "model-warmup-complete",
+        model_id=model_id,
+        profileId=profile_id,
+        elapsedSeconds=elapsed,
+        chunks=chunks,
+        bytes=byte_count,
+    )
+    return {
+        "status": "complete",
+        "reason": None,
+        "profileId": profile_id,
+        "elapsedSeconds": elapsed,
+    }
 
 
 @app.post("/v1/voice-studio/llamacpp-audio-turn/stream")

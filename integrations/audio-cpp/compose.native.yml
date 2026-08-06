@@ -1,0 +1,11 @@
+# Candidate-only opt-in for the development native PCM engine. Combine this
+# with compose.candidate.yml; never use it for Faster or Groxaxo services.
+services:
+  audio-cpp-candidate:
+    environment:
+      AUDIO_CPP_NATIVE_INCREMENTAL_PCM: "true"
+      AUDIO_CPP_NATIVE_LOAD_WARMUP: "true"
+      AUDIO_CPP_NATIVE_LOAD_WARMUP_TIMEOUT_SECONDS: "180"
+      # Native conversational prompts continually change graph shape.  Disable
+      # per-shape CUDA capture so an unseen turn does not pay a ~10 s warmup.
+      GGML_CUDA_DISABLE_GRAPHS: "1"
