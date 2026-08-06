@@ -20,7 +20,9 @@ import json
 import mimetypes
 import os
 import shutil
+import sys
 import tempfile
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -30,6 +32,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
 import httpx
+
+MODULE_DIR = Path(__file__).resolve().parent
+if str(MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(MODULE_DIR))
+from profile_library import PROFILE_PROVIDER, canonical_profile, live_profiles, valid_profile_id
 
 
 # -----------------------------------------------------------------------------
@@ -50,6 +57,27 @@ DEFAULT_TTS_BASE_URL = os.environ.get("TTS_BASE_URL", "http://localhost:8880").r
 # TTS_TIMEOUT_S environment variable or overridden at runtime.
 DEFAULT_TIMEOUT_S = float(os.environ.get("TTS_TIMEOUT_S", "300"))
 
+# This flag configures both the copied Studio and the supervised engine child.
+# Keeping one explicit opt-in prevents the UI from offering native PCM while
+# the candidate API is still running its rollback-safe buffered mode.
+NATIVE_INCREMENTAL_PCM_ENABLED = (
+    os.environ.get("AUDIO_CPP_NATIVE_INCREMENTAL_PCM", "false").lower() == "true"
+)
+NATIVE_PLAYBACK_MODE = "Native incremental PCM (experimental)"
+BUFFERED_PLAYBACK_MODE = "Buffered phrase PCM (rollback fallback)"
+FULL_WAV_PLAYBACK_MODE = "Non-streaming (Full Quality)"
+FULL_WAV_QUALITY_PROFILE_ID = "quality"
+FULL_QUALITY_OUTPUT_FORMATS = ("wav", "pcm", "flac", "mp3", "aac", "opus")
+STUDIO_PLAYBACK_WORKLET_URL = "/worklets/studio-playback.js?v=20260805-1"
+
+
+def default_playback_mode() -> str:
+    """Prefer true native PCM whenever this candidate process enables it."""
+    return NATIVE_PLAYBACK_MODE if NATIVE_INCREMENTAL_PCM_ENABLED else BUFFERED_PLAYBACK_MODE
+
+
+DEFAULT_PLAYBACK_MODE = default_playback_mode()
+
 # Supported task types defined by the Qwen3-TTS API.  These values map to
 # endpoint parameters used when creating and managing profiles.
 SUPPORTED_TASK_TYPES = ["CustomVoice", "VoiceDesign", "Base"]
@@ -64,10 +92,6 @@ DEFAULT_REFERENCE_LINE = (
 # Fallback voices list used when the server does not provide a voices
 # endpoint or fails to return names.
 FALLBACK_VOICES = ["Vivian", "Ryan", "Serena", "Dylan", "Eric", "Aiden"]
-
-
-def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
-    """Retained as a no-op compatibility hook for the recovered Studio."""
 
 
 @dataclass
@@ -99,6 +123,7 @@ class VoiceProfile:
     x_vector_only_mode: bool = False
     ref_audio_filename: str = ""
     origin: str = ""
+    provider: str = PROFILE_PROVIDER
 
 
 def ensure_dirs(library_dir: Path) -> Dict[str, Path]:
@@ -135,9 +160,10 @@ def meta_path(library_dir: Path, profile_id: str) -> Path:
 
 def load_profile(library_dir: Path, profile_id: str) -> VoiceProfile:
     """Load a profile from disk into a VoiceProfile instance."""
-    p = meta_path(library_dir, profile_id)
-    data = json.loads(p.read_text(encoding="utf-8"))
-    return VoiceProfile(**data)
+    data = canonical_profile(library_dir, profile_id, normalize=True)
+    if data is None:
+        raise FileNotFoundError(f"Profile `{profile_id}` has no usable metadata and reference audio.")
+    return VoiceProfile(**{key: data[key] for key in VoiceProfile.__dataclass_fields__})
 
 
 def save_profile(library_dir: Path, vp: VoiceProfile) -> None:
@@ -152,27 +178,19 @@ def save_profile(library_dir: Path, vp: VoiceProfile) -> None:
 
 def delete_profile(library_dir: Path, profile_id: str) -> None:
     """Remove a profile directory and all its contents."""
+    if not valid_profile_id(profile_id):
+        raise ValueError("Invalid profile id.")
     d = profile_dir(library_dir, profile_id)
     if d.exists():
         shutil.rmtree(d)
 
 
 def list_profiles(library_dir: Path) -> List[VoiceProfile]:
-    """Return all profiles stored in the library sorted by creation time."""
-    dirs = ensure_dirs(library_dir)["profiles"]
-    out: List[VoiceProfile] = []
-    for child in sorted(dirs.iterdir(), key=lambda p: p.name):
-        if child.is_dir():
-            mp = child / "meta.json"
-            if mp.exists():
-                try:
-                    data = json.loads(mp.read_text(encoding="utf-8"))
-                    out.append(VoiceProfile(**data))
-                except Exception:
-                    pass  # skip corrupted entries
-    # Sort newest first
-    out.sort(key=lambda x: x.created_at, reverse=True)
-    return out
+    """Return the supervisor's uncached canonical live Base inventory."""
+    return [
+        VoiceProfile(**{key: data[key] for key in VoiceProfile.__dataclass_fields__})
+        for data in live_profiles(library_dir, normalize=True)
+    ]
 
 
 def profiles_table_rows(profiles: List[VoiceProfile]) -> List[List[Any]]:
@@ -287,77 +305,120 @@ def request_tts_voice_clone(
     return r.content, ext, headers
 
 
+def apply_session_tuning(
+    payload: Dict[str, Any],
+    session_tuning: Any,
+    selected_profile_id: str | None = None,
+) -> Dict[str, Any]:
+    """Attach the Studio selection plus only candidate-scoped temporary overrides."""
+    tuning = session_tuning if isinstance(session_tuning, dict) else {}
+    if tuning and tuning.get("provider") != PROFILE_PROVIDER:
+        return payload
+    profile_id = tuning.get("profile_id") or selected_profile_id
+    overrides = tuning.get("overrides") if isinstance(tuning.get("overrides"), dict) else {}
+    if isinstance(profile_id, str) and profile_id:
+        payload["tuning"] = {
+            "provider": PROFILE_PROVIDER,
+            "scope": "voice-studio",
+            "profile_id": profile_id,
+            "overrides": dict(overrides),
+        }
+    return payload
+
+
+def apply_full_wav_quality_policy(
+    payload: Dict[str, Any], response_format: str = "wav"
+) -> Dict[str, Any]:
+    """Make Full Quality an offline path independent of streaming state.
+
+    The backend always completes one offline PCM16/WAV master before it
+    returns or post-encodes the caller-selected format.  Rejecting an unknown
+    format here prevents this UI from silently falling back to a streaming
+    transport.
+    """
+    selected_format = str(response_format or "wav").strip().lower()
+    if selected_format not in FULL_QUALITY_OUTPUT_FORMATS:
+        raise ValueError(
+            f"Unsupported Full Quality format: {selected_format or '<empty>'}."
+        )
+    payload["response_format"] = selected_format
+    payload["stream"] = False
+    payload["tuning"] = {
+        "provider": PROFILE_PROVIDER,
+        "scope": "voice-studio",
+        "profile_id": FULL_WAV_QUALITY_PROFILE_ID,
+        "overrides": {},
+    }
+    return payload
+
+
+class NativeStreamingCancelled(RuntimeError):
+    """Raised after a caller cancels an in-flight native PCM request."""
+
+
 def request_tts_streaming(
-    base_url: str, 
-    payload: Dict[str, Any], 
-    timeout_s: float
+    base_url: str,
+    payload: Dict[str, Any],
+    timeout_s: float,
+    *,
+    cancel_event: Any = None,
+    on_chunk: Any = None,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
+    """Consume raw native PCM blocks and return one completed WAV artifact.
+
+    ``on_chunk`` receives each raw PCM16 block immediately. ``cancel_event``
+    may be any object exposing ``is_set()``. Cancelling exits the httpx stream
+    context, closing the upstream socket so the engine session resets without
+    flushing stale tail audio. The returned WAV is solely for Gradio's completed
+    preview/download widgets; it is not emitted beside the live PCM blocks.
     """
-    Call the /v1/audio/voice-clone/stream endpoint and return audio bytes, extension, and timing info.
-    
-    Returns:
-        Tuple of (audio_bytes, extension, timing_info)
-    """
-    raise RuntimeError(
-        "audio.cpp Qwen3-TTS has no native incremental PCM endpoint; use buffered streaming scaffolding instead."
-    )
-    import struct
-    import json as json_module
-    
-    url = normalize_base_url(base_url) + "/v1/audio/voice-clone/stream"
-    
-    with httpx.Client(timeout=timeout_s) as client:
-        with client.stream("POST", url, json=payload) as response:
+    if not NATIVE_INCREMENTAL_PCM_ENABLED:
+        raise RuntimeError(
+            "Native incremental PCM is disabled. Use buffered phrase PCM or enable the candidate-only native compose override."
+        )
+    url = normalize_base_url(base_url) + "/v1/audio/speech"
+    request_payload = dict(payload)
+    request_payload.update(response_format="pcm", stream=True)
+    started = time.monotonic()
+    first_chunk_time: float | None = None
+    chunks: List[bytes] = []
+    response_headers: Dict[str, str] = {}
+
+    with httpx.Client(timeout=httpx.Timeout(timeout_s, read=None)) as client:
+        with client.stream("POST", url, json=request_payload) as response:
             response.raise_for_status()
-            
-            chunks = []
-            timing_info = {}
-            buffer = b""
-            
-            for chunk in response.iter_bytes():
-                buffer += chunk
-                
-                # Process complete chunks
-                # Format: [4 bytes JSON length][JSON metadata][4 bytes audio length][audio bytes]
-                while len(buffer) >= 4:
-                    json_len = struct.unpack('<I', buffer[:4])[0]
-                    if len(buffer) < 4 + json_len + 4:
-                        break  # Need more data for JSON + audio length
-                    
-                    json_bytes = buffer[4:4 + json_len]
-                    metadata = json_module.loads(json_bytes.decode('utf-8'))
-                    audio_len = struct.unpack('<I', buffer[4 + json_len:4 + json_len + 4])[0]
-                    
-                    if len(buffer) < 4 + json_len + 4 + audio_len:
-                        break  # Need more data for audio bytes
-                    
-                    audio_bytes = buffer[4 + json_len + 4:4 + json_len + 4 + audio_len]
-                    buffer = buffer[4 + json_len + 4 + audio_len:]  # Keep remaining data
-                    
-                    if metadata.get("error"):
-                        raise RuntimeError(metadata["error"])
-                    
-                    if metadata.get("done"):
-                        timing_info = {
-                            "first_chunk_time": metadata.get("first_chunk_time"),
-                            "total_time": metadata.get("total_time"),
-                            "audio_duration": metadata.get("audio_duration"),
-                            "rtf": metadata.get("rtf"),
-                            "chunk_count": metadata.get("chunk_count"),
-                            "seed_used": metadata.get("seed_used"),
-                        }
-                    elif len(audio_bytes) > 0:
-                        chunks.append(audio_bytes)
-            
-            # Combine all audio chunks (raw PCM data)
-            total_length = sum(len(c) for c in chunks)
-            combined_pcm = b"".join(chunks)
-            
-            # Convert raw PCM to WAV format with proper header
-            # PCM is 16-bit signed integers at 24000 Hz
-            wav_bytes = pcm_to_wav(combined_pcm, sample_rate=24000)
-            
-            return wav_bytes, "wav", timing_info
+            response_headers = dict(response.headers)
+            for chunk in response.iter_raw():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise NativeStreamingCancelled("Native PCM generation was cancelled.")
+                if not chunk:
+                    continue
+                if first_chunk_time is None:
+                    first_chunk_time = time.monotonic() - started
+                block = bytes(chunk)
+                chunks.append(block)
+                if on_chunk is not None:
+                    on_chunk(block)
+
+    pcm = b"".join(chunks)
+    if not pcm:
+        raise RuntimeError("Native PCM request completed without audio bytes.")
+    if len(pcm) % 2:
+        raise RuntimeError("Native PCM request ended on an incomplete PCM16 sample.")
+    total_time = time.monotonic() - started
+    sample_rate = int(response_headers.get("x-tts-sample-rate", "24000"))
+    audio_duration = len(pcm) / float(sample_rate * 2)
+    timing_info: Dict[str, Any] = {
+        "first_chunk_time": first_chunk_time,
+        "total_time": total_time,
+        "audio_duration": audio_duration,
+        "rtf": total_time / audio_duration if audio_duration else None,
+        "chunk_count": len(chunks),
+        "pcm_bytes": len(pcm),
+        "sample_rate": sample_rate,
+        "streaming_mode": response_headers.get("x-tts-streaming-mode", "native-incremental-pcm"),
+    }
+    return pcm_to_wav(pcm, sample_rate=sample_rate), "wav", timing_info
 
 
 def try_fetch_voices(base_url: str, timeout_s: float) -> List[str]:
@@ -434,31 +495,42 @@ def import_profiles_zip(library_dir: Path, zip_path: Path) -> Dict[str, Any]:
                 errors.append(f"{root}: invalid meta.json ({exc})")
                 continue
 
-            try:
-                vp = VoiceProfile(**meta)
-            except Exception as exc:
+            if not isinstance(meta, dict) or str(meta.get("task_type") or "Base").lower() != "base":
                 skipped += 1
-                errors.append(f"{root}: invalid profile fields ({exc})")
+                errors.append(f"{root}: only Base clone profiles are supported")
+                continue
+
+            old_ref_filename = str(meta.get("ref_audio_filename") or "ref_audio.wav").strip()
+            ref_member = f"{root}/{old_ref_filename}"
+            if Path(old_ref_filename).name != old_ref_filename or ref_member not in names:
+                skipped += 1
+                errors.append(f"{root}: referenced audio '{old_ref_filename}' missing or unsafe")
                 continue
 
             # Always allocate a fresh profile_id to avoid collisions/overwrites.
             new_id = safe_profile_id()
             while profile_dir(library_dir, new_id).exists():
                 new_id = safe_profile_id()
-            old_ref_filename = vp.ref_audio_filename
-            vp.profile_id = new_id
+            vp = VoiceProfile(
+                profile_id=new_id,
+                name=str(meta.get("name") or root),
+                task_type="Base",
+                created_at=str(meta.get("created_at") or now_iso()),
+                language=str(meta.get("language") or "Auto"),
+                voice=f"clone:{new_id}",
+                instructions=str(meta.get("instructions") or ""),
+                ref_text=str(meta.get("ref_text") or ""),
+                x_vector_only_mode=False,
+                ref_audio_filename=old_ref_filename,
+                origin=str(meta.get("origin") or "Imported Base clone"),
+                provider=PROFILE_PROVIDER,
+            )
 
             dest_dir = profile_dir(library_dir, vp.profile_id)
             dest_dir.mkdir(parents=True, exist_ok=True)
 
-            # Copy referenced audio if present in archive.
-            if old_ref_filename:
-                ref_member = f"{root}/{old_ref_filename}"
-                if ref_member in names:
-                    (dest_dir / old_ref_filename).write_bytes(z.read(ref_member))
-                else:
-                    vp.ref_audio_filename = ""
-                    errors.append(f"{root}: referenced audio '{old_ref_filename}' missing in ZIP")
+            # Copy the required reference audio before exposing the profile.
+            (dest_dir / old_ref_filename).write_bytes(z.read(ref_member))
 
             save_profile(library_dir, vp)
             imported += 1
@@ -607,6 +679,140 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
     initial_profile_ids = [profile.profile_id for profile in initial_profiles]
     initial_profile_value = initial_profile_ids[0] if initial_profile_ids else None
     initial_profile_rows = profiles_table_rows(initial_profiles)
+
+    def tuning_profile_form(base_url: str, profile_id: str | None = None) -> tuple[Any, ...]:
+        """Hydrate the selector and every revision-aware editor field together."""
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(f"{base_url.rstrip('/')}/v1/tuning/profiles")
+                response.raise_for_status(); payload = response.json()
+            profiles = list((payload.get("profiles") or {}).values())
+            choices = [(f"{p.get('name', p.get('id'))} — {p.get('first_block_frames', 0) * 80}/{p.get('steady_block_frames', 0) * 80} ms", p.get("id")) for p in profiles]
+            studio_selections = (payload.get("selections") or {}).get("voice-studio") or {}
+            selected = profile_id or studio_selections.get(PROFILE_PROVIDER, "balanced")
+            profile = (payload.get("profiles") or {}).get(selected) or (profiles[0] if profiles else {})
+            selected = profile.get("id") if isinstance(profile, dict) else None
+            status = (
+                f"**Named profile:** {profile.get('name', selected or 'none')} "
+                f"(revision {profile.get('revision', 1)}) · **Temporary overrides:** none · "
+                "**Effective runtime:** named values after validation. Fixed PCM16 / 24 kHz; "
+                "full-ICL only; x-vector and crossfade are inactive."
+            )
+            if not NATIVE_INCREMENTAL_PCM_ENABLED:
+                status += " Native block/context controls are inactive until a validated native build is enabled."
+            return (
+                gr.update(choices=choices, value=selected), status,
+                gr.update(value=profile.get("name", "")), gr.update(value=profile.get("revision", 1)),
+                gr.update(value=profile.get("first_block_frames", 4)), gr.update(value=profile.get("steady_block_frames", 12)),
+                gr.update(value=profile.get("left_context_frames", 72)), gr.update(value=profile.get("max_reference_seconds", 20)),
+                gr.update(value=profile.get("model") or ""), gr.update(value=profile.get("text_lookahead", 64)),
+                gr.update(value=profile.get("phrase_flush_ms", 500)), gr.update(value=profile.get("temperature", 1.0)),
+                gr.update(value=profile.get("top_k", 50)), gr.update(value=profile.get("top_p", 0.95)),
+                gr.update(value=profile.get("repetition_penalty", 1.05)),
+                gr.update(value="" if profile.get("seed") is None else str(profile.get("seed"))),
+            )
+        except Exception as exc:
+            return (gr.update(choices=[], value=None), f"Tuning profiles unavailable: {exc}", *[gr.update() for _ in range(15)])
+
+    def save_tuning_selection(base_url: str, profile_id: str) -> str:
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.put(f"{base_url.rstrip('/')}/v1/tuning/selection", json={"provider": PROFILE_PROVIDER, "scope": "voice-studio", "profile_id": profile_id})
+                response.raise_for_status()
+            return f"Voice Studio tuning profile: `{profile_id}`. Applies to new Studio requests only."
+        except Exception as exc:
+            return f"Could not save tuning profile: {exc}"
+
+    def tuning_lifecycle(base_url: str, profile_id: str, action: str) -> str:
+        """Run a protected profile lifecycle action and surface HTTP conflicts."""
+        try:
+            method = "DELETE" if action == "delete" else "POST"
+            suffix = "" if action == "delete" else f"/{action}"
+            with httpx.Client(timeout=15.0) as client:
+                response = client.request(method, f"{base_url.rstrip('/')}/v1/tuning/profiles/{profile_id}{suffix}", json={} if method == "POST" else None)
+            if response.status_code == 409:
+                return f"Profile action blocked: {response.text}"
+            response.raise_for_status()
+            return f"Profile `{profile_id}`: {action} completed. Refresh to view current revisions."
+        except Exception as exc:
+            return f"Profile action failed: {exc}"
+
+    def edit_tuning_profile(base_url: str, profile_id: str, revision: int, name: str, first: int, steady: int, context: int, reference_s: int, lookahead: int, flush_ms: int, temperature: float, top_k: int, top_p: float, repetition: float, seed: str) -> str:
+        try:
+            payload = {"revision": int(revision), "name": name, "first_block_frames": int(first), "steady_block_frames": int(steady), "left_context_frames": int(context), "max_reference_seconds": int(reference_s), "text_lookahead": int(lookahead), "phrase_flush_ms": int(flush_ms), "temperature": float(temperature), "top_k": int(top_k), "top_p": float(top_p), "repetition_penalty": float(repetition), "seed": int(seed) if str(seed).strip() else None}
+            with httpx.Client(timeout=15.0) as client:
+                response = client.patch(f"{base_url.rstrip('/')}/v1/tuning/profiles/{profile_id}", json=payload)
+            if response.status_code == 409:
+                return "Revision conflict: refresh profiles before saving; the server copy changed."
+            response.raise_for_status()
+            return f"Saved `{profile_id}` revision {int(revision) + 1}. Blocks are 80 ms each."
+        except Exception as exc:
+            return f"Profile edit failed: {exc}"
+
+    def resolve_tuning_override(
+        base_url: str,
+        profile_id: str,
+        model: str,
+        first: int,
+        steady: int,
+        context: int,
+        reference_s: int,
+        lookahead: int,
+        flush_ms: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition: float,
+        seed: str,
+        current: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Validate and retain a temporary override for Playground requests only."""
+        overrides = {
+            "first_block_frames": int(first),
+            "steady_block_frames": int(steady),
+            "left_context_frames": int(context),
+            "max_reference_seconds": int(reference_s),
+            "text_lookahead": int(lookahead),
+            "phrase_flush_ms": int(flush_ms),
+            "temperature": float(temperature),
+            "top_k": int(top_k),
+            "top_p": float(top_p),
+            "repetition_penalty": float(repetition),
+            "seed": int(seed) if str(seed).strip() else None,
+        }
+        if model:
+            overrides["model"] = model
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                response = client.post(f"{base_url.rstrip('/')}/v1/tuning/resolve", json={"provider": PROFILE_PROVIDER, "scope": "voice-studio", "profile_id": profile_id, "overrides": overrides})
+            if response.status_code == 409: return f"Resident model mismatch: {response.text}", current or {}
+            response.raise_for_status()
+            return (
+                f"**Named profile:** `{profile_id}` · **Temporary overrides:** {len(overrides)} active · "
+                "**Effective runtime:** validated by the candidate for this Studio page session only. "
+                "Use Clear overrides to return to named values.",
+                {"provider": PROFILE_PROVIDER, "scope": "voice-studio", "profile_id": profile_id, "overrides": overrides},
+            )
+        except Exception as exc:
+            return f"Temporary override rejected: {exc}", current or {}
+
+    def clear_tuning_override() -> tuple[str, dict[str, Any]]:
+        return (
+            "**Temporary overrides:** none · **Effective runtime:** persisted Voice Studio named profile.",
+            {},
+        )
+
+    def export_tuning_json(base_url: str) -> str:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get(f"{base_url.rstrip('/')}/v1/tuning/export"); response.raise_for_status()
+        return json.dumps(response.json(), indent=2)
+
+    def import_tuning_json(base_url: str, document: str) -> str:
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                response = client.post(f"{base_url.rstrip('/')}/v1/tuning/import", json=json.loads(document))
+            response.raise_for_status(); return "Tuning profiles imported safely; built-ins preserved."
+        except Exception as exc: return f"Import rejected: {exc}"
     with gr.Blocks(title="Qwen3 Voice Studio", css=CSS, theme=orange_theme()) as demo:
         # Shared state variables
         state_base_url = gr.State(initial_base_url)
@@ -648,6 +854,56 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                 voices_status = gr.Markdown("", elem_classes=["small"])
             with gr.Row():
                 backend_status_md = gr.Markdown("", elem_classes=["small"])
+            with gr.Accordion("Realtime Audio tuning profiles", open=False):
+                tuning_profile_dropdown = gr.Dropdown(label="Named profile (80 ms codec frames)", choices=[], interactive=True)
+                tuning_profile_status = gr.Markdown(
+                    "**Named profile:** loading · **Temporary overrides:** none · **Effective runtime:** pending",
+                    elem_classes=["small"],
+                )
+                with gr.Row():
+                    refresh_tuning_btn = gr.Button("Refresh profiles", variant="secondary")
+                    save_tuning_btn = gr.Button("Use selected profile", variant="secondary")
+                    clone_tuning_btn = gr.Button("Clone selected", variant="secondary")
+                    reset_tuning_btn = gr.Button("Reset built-in", variant="secondary")
+                    delete_tuning_btn = gr.Button("Delete custom", variant="stop")
+                gr.Markdown("#### Named profile definition\nEditing changes a reusable profile. Built-ins are immutable; clone one before editing.")
+                with gr.Row():
+                    tuning_name = gr.Textbox(label="Editable name", info="Built-in names are protected; clone before renaming.")
+                    tuning_revision = gr.Number(label="Revision", value=1, precision=0, info="Refresh before saving if another editor changed this profile.")
+                with gr.Group():
+                    gr.Markdown("#### Latency and phrase dispatch\n`audio.cpp engine` controls PCM block cadence; `phrase queue` controls when stable text is dispatched.")
+                    with gr.Row():
+                        tuning_first = gr.Number(label="[audio.cpp engine] First block (frames × 80 ms)", value=4, precision=0, interactive=NATIVE_INCREMENTAL_PCM_ENABLED, info="Smaller starts sooner; Full Quality ignores this streaming-only value.")
+                        tuning_steady = gr.Number(label="[audio.cpp engine] Steady block (frames × 80 ms)", value=12, precision=0, interactive=NATIVE_INCREMENTAL_PCM_ENABLED, info="Controls native PCM cadence after startup; Full Quality ignores it.")
+                        tuning_lookahead = gr.Number(label="[phrase queue] Text look-ahead (characters)", value=64, precision=0)
+                        tuning_flush_ms = gr.Number(label="[phrase queue] Safe-clause idle flush (ms)", value=500, precision=0)
+                with gr.Group():
+                    gr.Markdown("#### Conditioning and TTS sampling\nThese sampler controls generate Qwen3-TTS speech tokens; they do not change the chat LLM.")
+                    with gr.Row():
+                        tuning_reference_s = gr.Number(label="[conditional] Matched reference limit (seconds)", value=20, precision=0, info="Effective only when the clone stores an exact cropped-audio/transcript pair.")
+                        tuning_temperature = gr.Number(label="[audio.cpp engine] Temperature", value=1.0, minimum=0.05, maximum=2.0)
+                        tuning_top_k = gr.Number(label="[audio.cpp engine] Top-k", value=50, precision=0)
+                        tuning_top_p = gr.Number(label="[audio.cpp engine] Top-p", value=0.95)
+                        tuning_repetition = gr.Number(label="[audio.cpp engine] Repetition penalty", value=1.05)
+                        tuning_seed = gr.Textbox(label="[audio.cpp engine] Seed", info="Blank means random; otherwise enter an unsigned 32-bit integer.")
+                with gr.Group():
+                    gr.Markdown("#### Expert safety\nThe model requires 72 decoder-context frames for stable quality. Lower values are an unsafe experiment.")
+                    with gr.Row():
+                        tuning_model = gr.Textbox(label="[safety] Required resident model", placeholder="Leave blank for current resident model")
+                        tuning_context = gr.Number(label="[experimental] Decoder context (frames × 80 ms)", value=72, precision=0, interactive=False, info="Unlock explicitly to test below the required 72-frame context.")
+                        tuning_context_unlock = gr.Checkbox(label="Unlock unsafe decoder-context editing", value=False, interactive=NATIVE_INCREMENTAL_PCM_ENABLED)
+                    gr.Markdown("**Fixed/inactive capabilities:** PCM16 at 24 kHz · full-ICL clone mode · x-vector-only unavailable · overlap/crossfade fixed at 0.", elem_classes=["small"])
+                with gr.Accordion("Advanced request overrides (session-only)", open=False):
+                    gr.Markdown("`Named profile` is the saved baseline. `Temporary overrides` are the editable values above and last only for this Studio page session. `Effective runtime` is returned by candidate validation; a model mismatch is rejected and never switches residency.")
+                save_tuning_edit_btn = gr.Button("Save editable values", variant="secondary")
+                tuning_override_state = gr.State(value={})
+                resolve_tuning_btn = gr.Button("Apply temporary override for this session", variant="secondary")
+                clear_tuning_override_btn = gr.Button("Clear overrides", variant="secondary")
+                tuning_json = gr.Textbox(label="Tuning profile JSON import/export", lines=6)
+                with gr.Row():
+                    export_tuning_btn = gr.Button("Export JSON", variant="secondary")
+                    import_tuning_btn = gr.Button("Import JSON", variant="secondary")
+                gr.Markdown("Advanced editable profile lifecycle is candidate-private. Built-ins are protected; clone a profile before destructive edits.", elem_classes=["small"])
             # Backend model (optimized backend only): show when GET /v1/backend/models returns list
             backend_model_column = gr.Column(visible=False)
             with backend_model_column:
@@ -668,17 +924,18 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                 backend_models_status_md = gr.Markdown("", elem_classes=["small"])
                 with gr.Accordion("GPU admission guard (candidate only)", open=False):
                     gr.Markdown(
-                        "Use **Custom** to lower the free-VRAM reserve for coexistence tests. "
+                        "**Enforced** uses evidence-backed per-model thresholds: measured residency plus the unchanged synthesis floor "
+                        "where measured, otherwise the existing total threshold. Use **Custom** for an explicit absolute load threshold. "
                         "**Disabled** bypasses this candidate's admission check only; CUDA can still return out-of-memory."
                     )
                     gpu_guard_mode = gr.Radio(
                         ["enforced", "custom", "disabled"],
                         label="Guard mode",
-                        value="enforced",
-                        info="Enforced uses model-safe defaults. Custom uses the values below.",
+                        value="disabled",
+                        info="Disabled is the default. Enforced uses model-safe defaults; Custom uses the values below.",
                     )
                     with gr.Row():
-                        gpu_load_headroom = gr.Number(label="Custom load free-VRAM reserve (MiB)", value=10500, precision=0, minimum=0, maximum=16384)
+                        gpu_load_headroom = gr.Number(label="Custom absolute load free-VRAM threshold (MiB)", value=10500, precision=0, minimum=0, maximum=16384)
                         gpu_synthesis_headroom = gr.Number(label="Custom synthesis free-VRAM reserve (MiB)", value=2048, precision=0, minimum=0, maximum=16384)
                     with gr.Row():
                         gpu_load_utilization = gr.Number(label="Load max GPU utilization (%)", value=85, precision=0, minimum=1, maximum=100)
@@ -802,8 +1059,10 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                                     type="filepath",
                                 )
                                 clone_xvec_only = gr.Checkbox(
-                                    label="x_vector_only_mode (no transcript needed, usually lower quality)",
+                                    label="x_vector_only_mode (unsupported by this candidate)",
                                     value=False,
+                                    interactive=False,
+                                    info="The pinned audio.cpp Qwen3 Base path supports full ICL reference cloning only.",
                                 )
                                 clone_ref_text = gr.Textbox(
                                     label="Reference transcript (recommended)",
@@ -859,16 +1118,24 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
             # Playground tab
             with gr.Tab("Playground"):
                 gr.Markdown(
-                    "**Candidate capabilities:** audio.cpp Qwen3 Base supports buffered/offline clone synthesis. "
-                    "The live surface below exercises microphone, VAD, cancellation, LLM turn flow, and playback scaffolding, "
-                    "but it is not native incremental model PCM. Compare 0.6B vs 1.7B by switching the single resident model "
+                    "**Candidate capabilities:** audio.cpp Qwen3 Base supports native incremental PCM when the native runtime is enabled, "
+                    "plus buffered phrase PCM and complete WAV rollback paths. Compare 0.6B vs 1.7B by switching the single resident model "
                     "under **Settings & candidate model controls**.",
                     elem_classes=["small"],
                 )
                 play_mode = gr.Radio(
-                    ["Non-streaming (Full Quality)", "Streaming scaffolding (Buffered audio.cpp TTS)"],
+                    [
+                        FULL_WAV_PLAYBACK_MODE,
+                        BUFFERED_PLAYBACK_MODE,
+                        *([NATIVE_PLAYBACK_MODE] if NATIVE_INCREMENTAL_PCM_ENABLED else []),
+                    ],
                     label="Mode",
-                    value="Streaming scaffolding (Buffered audio.cpp TTS)",
+                    value=DEFAULT_PLAYBACK_MODE,
+                    info=(
+                        "Native is candidate-only and experimental; buffered phrase PCM remains available for rollback."
+                        if NATIVE_INCREMENTAL_PCM_ENABLED
+                        else "Native PCM is not enabled in this candidate. Buffered phrase PCM remains the streaming scaffold."
+                    ),
                 )
                 # --- Non-streaming mode ---
                 with gr.Column(visible=False) as ns_group:
@@ -885,17 +1152,28 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                             )
                             play_text = gr.Textbox(label="Text to synthesize", value="Hello from the playground!", lines=4)
                             play_response_format = gr.Dropdown(
-                                label="Audio format",
-                                choices=["wav", "mp3", "flac", "aac", "opus", "pcm"],
+                                label="Output format (post-generation)",
+                                choices=[
+                                    ("WAV — lossless PCM16 master", "wav"),
+                                    ("PCM — raw PCM16", "pcm"),
+                                    ("FLAC — lossless", "flac"),
+                                    ("MP3 — high quality", "mp3"),
+                                    ("AAC — high quality", "aac"),
+                                    ("Opus — high quality", "opus"),
+                                ],
                                 value="wav",
+                                interactive=True,
+                                info="The backend completes one offline 24 kHz PCM16 master first, then converts only the finished audio when needed.",
                             )
                             play_speed = gr.Slider(label="Speed", minimum=0.25, maximum=4.0, value=1.0, step=0.05)
                             play_seed = gr.Number(
-                                label="Seed (-1 = random)",
+                                label="Seed (locked by Full Quality policy)",
                                 value=-1,
                                 precision=0,
                                 minimum=-1,
                                 maximum=2147483647,
+                                interactive=False,
+                                info="Full Quality uses the dedicated Quality sampler policy. Seed tuning belongs to streaming profiles and temporary overrides.",
                             )
                             play_generate_btn = gr.Button("🎙️ Generate (Full Quality)", variant="primary")
                         with gr.Column(scale=1, min_width=360):
@@ -919,7 +1197,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                             )
                         with gr.Column(scale=2, min_width=480):
                             s_streaming_widget = gr.HTML(
-                                value="<div class='svwidget'><p style='color:#999;text-align:center;padding:24px;'>Select a voice profile and switch to Streaming mode to enable the live voice widget.</p></div>"
+                                value="<div class='svwidget'><p style='color:#999;text-align:center;padding:24px;'>Select a voice profile and choose buffered phrase PCM or native incremental PCM to enable the live voice widget.</p></div>"
                             )
 
         # ------------------------------------------------------------------
@@ -1408,9 +1686,41 @@ if (typeof Alpine === 'undefined') {
             tts_voice: str,
             profile_label: str,
             language: str = "Auto",
+            text_lookahead: int = 24,
+            phrase_flush_ms: int = 450,
+            first_block_frames: int = 4,
+            steady_block_frames: int = 12,
+            tuning_profile_id: str = "balanced",
+            playback_mode: str = DEFAULT_PLAYBACK_MODE,
+            session_tuning: dict[str, Any] | None = None,
         ) -> str:
             """Return a self-contained streaming live-voice widget."""
             uid = "svw" + uuid.uuid4().hex[:6]
+            native_requested = playback_mode.startswith("Native incremental PCM")
+            native_streaming = bool(native_requested and NATIVE_INCREMENTAL_PCM_ENABLED)
+            request_tuning: dict[str, Any] = {
+                "provider": PROFILE_PROVIDER,
+                "scope": "voice-studio",
+                "profile_id": tuning_profile_id,
+            }
+            if (
+                isinstance(session_tuning, dict)
+                and session_tuning.get("provider") == PROFILE_PROVIDER
+                and session_tuning.get("profile_id") == tuning_profile_id
+                and isinstance(session_tuning.get("overrides"), dict)
+            ):
+                request_tuning["overrides"] = dict(session_tuning["overrides"])
+            effective_overrides = request_tuning.get("overrides") or {}
+            text_lookahead = int(effective_overrides.get("text_lookahead", text_lookahead))
+            phrase_flush_ms = int(effective_overrides.get("phrase_flush_ms", phrase_flush_ms))
+            first_block_frames = int(effective_overrides.get("first_block_frames", first_block_frames))
+            steady_block_frames = int(effective_overrides.get("steady_block_frames", steady_block_frames))
+            phrase_hard_cap = max(96, min(512, int(text_lookahead) * 4))
+            startup_ms = (
+                max(1, first_block_frames + steady_block_frames) * 80
+                if native_streaming
+                else 0
+            )
             config = json.dumps(
                 {
                     "ttsBaseUrl": normalize_base_url(tts_base_url),
@@ -1423,6 +1733,15 @@ if (typeof Alpine === 'undefined') {
                     "profileLabel": profile_label or voice_name or "Selected profile",
                     "language": language or "Auto",
                     "sampleRate": 24000,
+                    "textLookahead": max(8, min(512, int(text_lookahead))),
+                    "phraseFlushMs": max(100, min(3000, int(phrase_flush_ms))),
+                    "phraseHardCap": phrase_hard_cap,
+                    "playbackStartupMs": startup_ms,
+                    "playbackWorkletUrl": STUDIO_PLAYBACK_WORKLET_URL,
+                    "tuningProfileId": tuning_profile_id,
+                    "nativeStreaming": native_streaming,
+                    "streamingMode": "native-incremental-pcm" if native_streaming else "buffered-fallback",
+                    "tuning": request_tuning,
                 }
             )
             tmpl = r'''<div class="svwidget" id="__UID__">
@@ -1761,7 +2080,7 @@ if (typeof Alpine === 'undefined') {
 </details>
 
 <details class="sv-settings">
-  <summary>Diagnostics &amp; tuning (buffered audio.cpp TTS)</summary>
+  <summary>Diagnostics &amp; tuning (__DIAGNOSTICS_MODE__)</summary>
   <div class="sv-settings-grid">
     <div class="sv-settings-title">Microphone transport</div>
     <div class="sv-settings-row">
@@ -1800,20 +2119,10 @@ if (typeof Alpine === 'undefined') {
       </label>
     </div>
     <div class="sv-settings-title">Progressive PCM diagnostics</div>
-    <div class="sv-settings-row">
-      <label class="sv-field"><span class="sv-field-label">Phrase minimum characters <span class="sv-help" tabindex="0" title="Shortest stable LLM phrase eligible for buffered audio.cpp TTS. Lower can improve start latency but may split prosody.">i</span></span>
-        <input class="sv-input" data-role="phrase-min" type="number" min="8" max="240" step="1">
-      </label>
-      <label class="sv-field"><span class="sv-field-label">Phrase maximum characters <span class="sv-help" tabindex="0" title="Longest phrase sent as one completed audio.cpp request. Higher can improve continuity but increases wait time.">i</span></span>
-        <input class="sv-input" data-role="phrase-max" type="number" min="24" max="400" step="1">
-      </label>
-      <label class="sv-field"><span class="sv-field-label">Idle flush ms <span class="sv-help" tabindex="0" title="How long to wait for additional LLM text before speaking a partial stable phrase.">i</span></span>
-        <input class="sv-input" data-role="phrase-idle" type="number" min="100" max="3000" step="25">
-      </label>
-    </div>
+    <p class="sv-status" data-role="phrase-policy"></p>
     <p class="sv-status" data-role="capture-diagnostics">Mic transport: WAV PCM16 at 16 kHz. Waiting for a turn.</p>
     <p class="sv-status"><b>Output transport:</b> model-native PCM16 at 24 kHz. Phrase sizing affects latency and prosody only; it does not change model resolution or bitrate.</p>
-    <p class="sv-status"><span class="sv-help" tabindex="0" title="Stop cancels the active microphone, LLM, or phrase TTS request. A new turn increments cancellation identity so late audio is ignored.">i</span> Buffered phrase PCM: each phrase completes in audio.cpp before playback. Native model-level incremental PCM is unavailable in this build.</p>
+    <p class="sv-status"><span class="sv-help" tabindex="0" title="Stop cancels the active microphone, LLM, or phrase TTS request. A new turn increments cancellation identity so late audio is ignored.">i</span> __STREAMING_DISCLOSURE__</p>
   </div>
 </details>
 
@@ -1850,6 +2159,7 @@ if (typeof Alpine === 'undefined') {
     </div>
     <div class="sv-panel-body">
       <div class="sv-status" data-role="voice-name"></div>
+      <div class="sv-status"><b>TTS transport:</b> <span data-role="tts-mode"></span></div>
       <div class="sv-wave" data-role="voice-wave"><span></span><span></span><span></span><span></span><span></span><span></span></div>
       <div class="sv-metrics">
         <span>LLM TTFB: <b data-role="ttf">--</b></span>
@@ -1888,8 +2198,8 @@ if (typeof Alpine === 'undefined') {
     'toggle-record', 'refresh-mics', 'mic-meter', 'status', 'user-audio',
     'user-empty', 'voice-badge', 'voice-name', 'voice-wave', 'ttf', 'tts',
     'ai-audio', 'ai-empty', 'transcript', 'clear', 'speech-threshold',
-    'start-hold', 'silence-delay', 'min-utterance', 'max-utterance', 'pre-roll', 'phrase-min', 'phrase-max', 'phrase-idle',
-    'llm-input-format', 'llm-input-rate', 'capture-diagnostics'
+    'start-hold', 'silence-delay', 'min-utterance', 'max-utterance', 'pre-roll', 'phrase-policy',
+    'llm-input-format', 'llm-input-rate', 'capture-diagnostics', 'tts-mode'
   ].forEach(function(name) {
     refs[name] = root.querySelector('[data-role="' + name + '"], [data-action="' + name + '"]');
   });
@@ -1903,7 +2213,8 @@ if (typeof Alpine === 'undefined') {
     analyser: null,
     vadFrame: null,
     vadData: null,
-    activeRequest: null,
+    activeLlmRequest: null,
+    activeTtsRequest: null,
     rollingChunks: [],
     segmentChunks: [],
     inputSampleRate: 0,
@@ -1921,11 +2232,17 @@ if (typeof Alpine === 'undefined') {
     aiAudioUrl: null,
     ttfMs: null,
     ttsMs: null,
+    ttsFirstPcmMs: null,
     phraseText: '',
     phraseQueue: [],
     phrasePumping: false,
     llmFinished: false,
-    playbackAt: 0,
+    playbackNode: null,
+    playbackModulePromise: null,
+    playbackReadyPromise: null,
+    playbackEndSent: false,
+    playbackQueuedMs: 0,
+    playbackUnderruns: 0,
     pcmChunks: [],
     turnId: 0,
     phraseIdleTimer: null
@@ -1959,13 +2276,6 @@ if (typeof Alpine === 'undefined') {
     };
   }
 
-  function getPhraseSettings() {
-    var minimum = numberFromInput('phrase-min', 24, 8, 240);
-    var maximum = Math.max(minimum, numberFromInput('phrase-max', 180, 24, 400));
-    refs['phrase-max'].value = String(maximum);
-    return { minimum: minimum, maximum: maximum, idleMs: numberFromInput('phrase-idle', 450, 100, 3000) };
-  }
-
   function saveVadSettings() {
     ['speech-threshold', 'start-hold', 'silence-delay', 'min-utterance', 'max-utterance', 'pre-roll'].forEach(function(name) {
       localSet('sv_vad_' + name, refs[name].value);
@@ -1979,9 +2289,6 @@ if (typeof Alpine === 'undefined') {
     refs['min-utterance'].value = localGet('sv_vad_min-utterance', '400');
     refs['max-utterance'].value = localGet('sv_vad_max-utterance', '30');
     refs['pre-roll'].value = localGet('sv_vad_pre-roll', '250');
-    refs['phrase-min'].value = localGet('sv_phrase-min', '24');
-    refs['phrase-max'].value = localGet('sv_phrase-max', '180');
-    refs['phrase-idle'].value = localGet('sv_phrase-idle', '450');
     refs['llm-input-format'].value = localGet('sv_llm_input_format', 'wav');
     refs['llm-input-rate'].value = localGet('sv_llm_input_rate', '16000');
   }
@@ -2388,10 +2695,9 @@ if (typeof Alpine === 'undefined') {
     state.phraseQueue = [];
     state.phraseText = '';
     state.llmFinished = false;
-    if (state.activeRequest) {
-      state.activeRequest.abort();
-      state.activeRequest = null;
-    }
+    if (state.activeLlmRequest) { state.activeLlmRequest.abort(); state.activeLlmRequest = null; }
+    if (state.activeTtsRequest) { state.activeTtsRequest.abort(); state.activeTtsRequest = null; }
+    cancelScheduledPlayback();
     setLive(false);
     discardSpeechSegment('');
     if (state.captureNode) { try { state.captureNode.disconnect(); } catch (err) {} state.captureNode = null; }
@@ -2410,21 +2716,30 @@ if (typeof Alpine === 'undefined') {
   }
 
   function sendToLLM(audioBlob) {
+    if (state.activeLlmRequest) { state.activeLlmRequest.abort(); state.activeLlmRequest = null; }
+    if (state.activeTtsRequest) { state.activeTtsRequest.abort(); state.activeTtsRequest = null; }
+    cancelScheduledPlayback();
     state.turnId += 1;
+    var llmTurn = state.turnId;
+    beginPlaybackTurn(llmTurn).catch(function(error) {
+      if (llmTurn === state.turnId) setStatus('PCM playback setup failed: ' + error.message);
+    });
     state.phraseText = '';
     state.phraseQueue = [];
     state.phrasePumping = false;
     state.llmFinished = false;
-    state.playbackAt = 0;
     state.pcmChunks = [];
     state.ttsStartedAt = 0;
     if (state.phraseIdleTimer) { clearTimeout(state.phraseIdleTimer); state.phraseIdleTimer = null; }
     state.ttfMs = null;
     state.ttsMs = null;
+    state.ttsFirstPcmMs = null;
     refs.ttf.textContent = '--';
     refs.tts.textContent = '--';
     var reader = new FileReader();
     reader.onload = function() {
+      var llmController = new AbortController();
+      state.activeLlmRequest = llmController;
       var audioDataUri = reader.result;
       var userMsg = addTranscript('user', '[Voice message]');
       var systemPrompt = (refs['system-prompt'].value || '').trim();
@@ -2432,6 +2747,7 @@ if (typeof Alpine === 'undefined') {
       fetch(config.proxyBaseUrl + '/llamacpp-audio-turn/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: llmController.signal,
         body: JSON.stringify({
           endpoint: refs.endpoint.value,
           model: refs.model.value,
@@ -2460,7 +2776,11 @@ if (typeof Alpine === 'undefined') {
 
         function readStream() {
           streamReader.read().then(function(result) {
+            if (llmTurn !== state.turnId) {
+              return streamReader.cancel().catch(function() {});
+            }
             if (result.done) {
+              if (state.activeLlmRequest === llmController) state.activeLlmRequest = null;
               if (streamError) throw streamError;
               if (content.trim()) {
                 if (state.ttfMs !== null) {
@@ -2510,14 +2830,26 @@ if (typeof Alpine === 'undefined') {
             if (streamError) throw streamError;
             readStream();
           }).catch(function(err) {
+            if (state.activeLlmRequest === llmController) state.activeLlmRequest = null;
+            if (llmTurn !== state.turnId) return;
             setProcessing(false);
+            if (err.name === 'AbortError') {
+              setStatus(state.isLive ? 'LLM turn cancelled. Listening.' : 'LLM turn cancelled.');
+              return;
+            }
             addTranscript('assistant', 'Error: ' + err.message);
             setStatus(state.isLive ? 'LLM stream error: ' + err.message + ' Listening.' : 'LLM stream error: ' + err.message);
           });
         }
         readStream();
       }).catch(function(err) {
+        if (state.activeLlmRequest === llmController) state.activeLlmRequest = null;
+        if (llmTurn !== state.turnId) return;
         setProcessing(false);
+        if (err.name === 'AbortError') {
+          setStatus(state.isLive ? 'LLM turn cancelled. Listening.' : 'LLM turn cancelled.');
+          return;
+        }
         addTranscript('assistant', 'Error: ' + err.message);
         setStatus(state.isLive ? 'LLM error: ' + err.message + ' Listening.' : 'LLM error: ' + err.message);
       });
@@ -2525,22 +2857,107 @@ if (typeof Alpine === 'undefined') {
     reader.readAsDataURL(audioBlob);
   }
 
-  function playPcm(pcmData, sampleRate) {
+  function pcm16ToFloat32(pcmData) {
     var float32Data = new Float32Array(Math.floor(pcmData.length / 2));
     for (var i = 0; i < float32Data.length; i += 1) {
       var sample = pcmData[i * 2] | (pcmData[i * 2 + 1] << 8);
       if (sample >= 32768) sample -= 65536;
       float32Data[i] = sample / 32768.0;
     }
-    var audioBuffer = getAudioContext().createBuffer(1, float32Data.length, sampleRate);
-    audioBuffer.getChannelData(0).set(float32Data);
-    var source = getAudioContext().createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(getAudioContext().destination);
-    var startAt = Math.max(getAudioContext().currentTime + 0.025, state.playbackAt || 0);
-    source.start(startAt);
-    state.playbackAt = startAt + audioBuffer.duration;
-    return audioBuffer.duration;
+    return float32Data;
+  }
+
+  function onPlaybackEvent(message) {
+    if (!message || Number(message.turnId) !== state.turnId) return;
+    if (message.kind === 'queued') {
+      state.playbackQueuedMs = Math.max(0, Math.round(Number(message.queuedMs) || 0));
+      refs.tts.textContent = (state.ttsFirstPcmMs === null ? '' : state.ttsFirstPcmMs + 'ms first PCM / ') + state.playbackQueuedMs + 'ms queued';
+      return;
+    }
+    if (message.kind === 'started') {
+      setSpeaking(true);
+      setStatus(message.resumed ? 'PCM playback resumed after queue refill.' : 'PCM playback started from the continuous turn queue.');
+      return;
+    }
+    if (message.kind === 'underrun') {
+      state.playbackUnderruns += 1;
+      setSpeaking(false);
+      setStatus('PCM queue underrun detected; refilling before playback resumes.');
+      return;
+    }
+    if (message.kind === 'drained') {
+      setSpeaking(false);
+      setProcessing(false);
+      refs.tts.textContent = (state.ttsFirstPcmMs === null ? '' : state.ttsFirstPcmMs + 'ms first PCM / ') + state.ttsMs + 'ms synthesis / ' + state.playbackUnderruns + ' underruns';
+      setStatus(state.isLive ? 'Playback drained. Listening.' : 'Playback drained.');
+      return;
+    }
+    if (message.kind === 'clear') {
+      setSpeaking(false);
+      state.playbackQueuedMs = 0;
+    }
+  }
+
+  function ensurePlaybackQueue() {
+    if (state.playbackNode) return Promise.resolve(state.playbackNode);
+    if (state.playbackModulePromise) return state.playbackModulePromise;
+    var ctx = getAudioContext();
+    if (!ctx.audioWorklet || !window.AudioWorkletNode) {
+      return Promise.reject(new Error('This browser does not support AudioWorklet PCM playback.'));
+    }
+    state.playbackModulePromise = ctx.audioWorklet.addModule(config.playbackWorkletUrl).then(function() {
+      var node = new AudioWorkletNode(ctx, 'studio-playback', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
+      node.connect(ctx.destination);
+      node.port.onmessage = function(event) { onPlaybackEvent(event.data); };
+      state.playbackNode = node;
+      return node;
+    }).catch(function(error) {
+      state.playbackModulePromise = null;
+      throw error;
+    });
+    return state.playbackModulePromise;
+  }
+
+  function beginPlaybackTurn(turnId) {
+    state.playbackEndSent = false;
+    state.playbackQueuedMs = 0;
+    state.playbackUnderruns = 0;
+    state.playbackReadyPromise = ensurePlaybackQueue().then(function(node) {
+      if (turnId !== state.turnId) return null;
+      node.port.postMessage({
+        kind: 'begin', turnId: turnId, inputRate: config.sampleRate,
+        startupMs: config.nativeStreaming ? config.playbackStartupMs : 0
+      });
+      return node;
+    });
+    return state.playbackReadyPromise;
+  }
+
+  function enqueuePcmForTurn(pcmData, sampleRate, turnId) {
+    var samples = pcm16ToFloat32(pcmData);
+    var ready = state.playbackReadyPromise || beginPlaybackTurn(turnId);
+    return ready.then(function(node) {
+      if (!node || turnId !== state.turnId) return;
+      node.port.postMessage({ kind: 'audio', turnId: turnId, samples: samples }, [samples.buffer]);
+    });
+  }
+
+  function finishPlaybackTurn(turnId) {
+    if (state.playbackEndSent) return Promise.resolve();
+    state.playbackEndSent = true;
+    var ready = state.playbackReadyPromise || beginPlaybackTurn(turnId);
+    return ready.then(function(node) {
+      if (!node || turnId !== state.turnId) return;
+      node.port.postMessage({ kind: 'end', turnId: turnId });
+    });
+  }
+
+  function cancelScheduledPlayback() {
+    state.playbackEndSent = true;
+    state.playbackQueuedMs = 0;
+    if (state.playbackNode) {
+      state.playbackNode.port.postMessage({ kind: 'clear', turnId: state.turnId });
+    }
   }
 
   function pcmChunksToWav(chunks, sampleRate) {
@@ -2571,33 +2988,63 @@ if (typeof Alpine === 'undefined') {
     return new Blob([wav], { type: 'audio/wav' });
   }
 
+  function findImmediateBoundary(text) {
+    var match = /[.!?;:]+(?:["'’”\)\]]+)?(?=\s|$)/.exec(text);
+    return match ? match.index + match[0].length : -1;
+  }
+
+  function findSafePhraseCut(text, limit) {
+    var bounded = text.slice(0, Math.min(text.length, limit));
+    var clause = -1;
+    var clausePattern = /[,;:](?:\s|$)/g;
+    var match;
+    while ((match = clausePattern.exec(bounded)) !== null) clause = match.index + match[0].length;
+    if (clause > 0) return clause;
+    var whitespace = bounded.search(/\s+\S*$/);
+    if (whitespace > 0) return whitespace + 1;
+    return -1;
+  }
+
+  function enqueueStablePhrase(cut) {
+    if (cut <= 0) return false;
+    var phrase = state.phraseText.slice(0, cut).trim();
+    state.phraseText = state.phraseText.slice(cut);
+    if (phrase) state.phraseQueue.push(phrase);
+    return !!phrase;
+  }
+
+  function drainImmediateAndCappedPhrases() {
+    while (state.phraseText) {
+      var immediate = findImmediateBoundary(state.phraseText);
+      if (immediate > 0) {
+        enqueueStablePhrase(immediate);
+        continue;
+      }
+      if (state.phraseText.length < config.phraseHardCap) break;
+      var safeCut = findSafePhraseCut(state.phraseText, config.phraseHardCap);
+      if (safeCut <= 0) break;
+      enqueueStablePhrase(safeCut);
+    }
+  }
+
   function queueProgressiveSpeech(delta, final) {
     if (delta) state.phraseText += delta;
-    var phraseSettings = getPhraseSettings();
-    while (state.phraseText) {
-      var boundary = /[.!?;:](?:\s|$)/.exec(state.phraseText);
-      var cut = boundary && boundary.index + boundary[0].length >= phraseSettings.minimum
-        ? boundary.index + boundary[0].length
-        : (state.phraseText.length >= phraseSettings.maximum ? state.phraseText.lastIndexOf(' ', phraseSettings.maximum) : -1);
-      if (cut <= 0) break;
-      state.phraseQueue.push(state.phraseText.slice(0, cut).trim());
-      state.phraseText = state.phraseText.slice(cut);
-    }
+    drainImmediateAndCappedPhrases();
+    if (state.phraseIdleTimer) { clearTimeout(state.phraseIdleTimer); state.phraseIdleTimer = null; }
     if (final) {
-      if (state.phraseIdleTimer) { clearTimeout(state.phraseIdleTimer); state.phraseIdleTimer = null; }
       if (state.phraseText.trim()) state.phraseQueue.push(state.phraseText.trim());
       state.phraseText = '';
       state.llmFinished = true;
-    } else if (state.phraseText.length >= phraseSettings.minimum) {
-      if (state.phraseIdleTimer) clearTimeout(state.phraseIdleTimer);
+    } else if (state.phraseText.length >= config.textLookahead) {
       state.phraseIdleTimer = setTimeout(function() {
         state.phraseIdleTimer = null;
-        if (state.phraseText.trim()) {
-          state.phraseQueue.push(state.phraseText.trim());
-          state.phraseText = '';
+        var safeCut = findSafePhraseCut(state.phraseText, Math.min(state.phraseText.length, config.phraseHardCap));
+        if (safeCut > 0) {
+          enqueueStablePhrase(safeCut);
+          drainImmediateAndCappedPhrases();
           pumpProgressiveSpeech();
         }
-      }, phraseSettings.idleMs);
+      }, config.phraseFlushMs);
     }
     pumpProgressiveSpeech();
   }
@@ -2608,25 +3055,38 @@ if (typeof Alpine === 'undefined') {
     if (!phrase) {
       if (state.llmFinished) {
         state.ttsMs = Math.round(performance.now() - state.ttsStartedAt);
-        refs.tts.textContent = state.ttsMs + 'ms progressive PCM';
+        refs.tts.textContent = config.nativeStreaming && state.ttsFirstPcmMs !== null
+          ? state.ttsFirstPcmMs + 'ms first PCM / ' + state.ttsMs + 'ms total'
+          : state.ttsMs + 'ms buffered phrase PCM';
         if (state.pcmChunks.length) {
           if (state.aiAudioUrl) URL.revokeObjectURL(state.aiAudioUrl);
           state.aiAudioUrl = URL.createObjectURL(pcmChunksToWav(state.pcmChunks, config.sampleRate));
           showAudio(refs['ai-audio'], refs['ai-empty'], state.aiAudioUrl);
         }
-        setSpeaking(false); setProcessing(false);
-        setStatus(state.isLive ? 'Progressive buffered PCM playback scheduled. Listening resumes after playback.' : 'Progressive buffered PCM complete.');
+        finishPlaybackTurn(state.turnId).catch(function(error) {
+          setSpeaking(false); setProcessing(false);
+          setStatus('PCM playback finalization failed: ' + error.message);
+        });
+        setStatus(config.nativeStreaming
+          ? 'Native synthesis complete; the continuous PCM queue is draining.'
+          : 'Buffered phrase synthesis complete; the continuous PCM queue is draining.');
       }
       return;
     }
     state.phrasePumping = true;
-    setSpeaking(true);
     if (!state.ttsStartedAt) state.ttsStartedAt = performance.now();
-    state.activeRequest = new AbortController();
+    state.activeTtsRequest = new AbortController();
     var currentTurn = state.turnId;
     fetch(config.proxyBaseUrl + '/audio/speech', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: state.activeRequest.signal,
-      body: JSON.stringify({ input: phrase, voice: config.ttsVoice, language: config.language || 'Auto', response_format: 'pcm', stream: false })
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: state.activeTtsRequest.signal,
+      body: JSON.stringify({
+        input: phrase,
+        voice: config.ttsVoice,
+        language: config.language || 'Auto',
+        response_format: 'pcm',
+        stream: !!config.nativeStreaming,
+        tuning: config.tuning
+      })
     }).then(function(response) {
       if (!response.ok) return response.text().then(function(body) {
         if (response.status === 409 && body.indexOf('No candidate model is loaded') >= 0) {
@@ -2634,16 +3094,47 @@ if (typeof Alpine === 'undefined') {
         }
         throw new Error(response.status + ': ' + body);
       });
-      return response.arrayBuffer();
+      if (!config.nativeStreaming) return response.arrayBuffer();
+      if (!response.body || !response.body.getReader) throw new Error('This browser cannot consume streamed PCM. Select buffered phrase PCM.');
+      var reader = response.body.getReader();
+      var carry = new Uint8Array(0);
+      function consume() {
+        return reader.read().then(function(result) {
+          if (currentTurn !== state.turnId) {
+            return reader.cancel().catch(function() {});
+          }
+          if (result.done) {
+            if (carry.length) throw new Error('Native PCM ended on an incomplete PCM16 sample.');
+            return null;
+          }
+          var incoming = result.value || new Uint8Array(0);
+          var joined = new Uint8Array(carry.length + incoming.length);
+          joined.set(carry, 0); joined.set(incoming, carry.length);
+          var playableLength = joined.length - (joined.length % 2);
+          carry = joined.slice(playableLength);
+          if (playableLength) {
+            var pcm = joined.slice(0, playableLength);
+            if (state.ttsFirstPcmMs === null) {
+              state.ttsFirstPcmMs = Math.round(performance.now() - state.ttsStartedAt);
+              refs.tts.textContent = state.ttsFirstPcmMs + 'ms first PCM';
+              setStatus('Native PCM is arriving and playing before synthesis completes.');
+            }
+            state.pcmChunks.push(pcm);
+            return enqueuePcmForTurn(pcm, config.sampleRate, currentTurn).then(consume);
+          }
+          return consume();
+        });
+      }
+      return consume();
     }).then(function(buffer) {
-      if (currentTurn !== state.turnId) return;
+      if (config.nativeStreaming || currentTurn !== state.turnId || !buffer) return;
       var pcm = new Uint8Array(buffer);
       state.pcmChunks.push(pcm);
-      playPcm(pcm, config.sampleRate);
+      return enqueuePcmForTurn(pcm, config.sampleRate, currentTurn);
     }).catch(function(err) {
-      if (err.name !== 'AbortError') setStatus('Progressive PCM error: ' + err.message);
+      if (err.name !== 'AbortError') setStatus((config.nativeStreaming ? 'Native' : 'Buffered') + ' PCM error: ' + err.message);
     }).finally(function() {
-      if (currentTurn === state.turnId) { state.phrasePumping = false; state.activeRequest = null; pumpProgressiveSpeech(); }
+      if (currentTurn === state.turnId) { state.phrasePumping = false; state.activeTtsRequest = null; pumpProgressiveSpeech(); }
     });
   }
 
@@ -2651,11 +3142,11 @@ if (typeof Alpine === 'undefined') {
     setSpeaking(true);
     setStatus('Generating buffered audio.cpp TTS. Playback begins after the complete WAV is ready.');
     var ttsStartedAt = performance.now();
-    state.activeRequest = new AbortController();
+    state.activeTtsRequest = new AbortController();
     fetch(config.proxyBaseUrl + '/audio/speech', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      signal: state.activeRequest.signal,
+      signal: state.activeTtsRequest.signal,
       body: JSON.stringify({
         input: text,
         voice: config.ttsVoice,
@@ -2681,12 +3172,12 @@ if (typeof Alpine === 'undefined') {
       state.aiAudioUrl = URL.createObjectURL(wavBlob);
       showAudio(refs['ai-audio'], refs['ai-empty'], state.aiAudioUrl);
       refs['ai-audio'].play();
-      state.activeRequest = null;
+      state.activeTtsRequest = null;
       setSpeaking(false);
       setProcessing(false);
       setStatus(state.isLive ? 'Buffered playback started. Listening resumes after playback.' : 'Buffered audio ready.');
     }).catch(function(err) {
-      state.activeRequest = null;
+      state.activeTtsRequest = null;
       setSpeaking(false);
       setProcessing(false);
       var message = err.name === 'AbortError' ? 'Buffered TTS cancelled.' : 'Buffered TTS error: ' + err.message;
@@ -2695,6 +3186,17 @@ if (typeof Alpine === 'undefined') {
   }
 
   function clearConversation() {
+    state.turnId += 1;
+    if (state.activeLlmRequest) { state.activeLlmRequest.abort(); state.activeLlmRequest = null; }
+    if (state.activeTtsRequest) { state.activeTtsRequest.abort(); state.activeTtsRequest = null; }
+    if (state.phraseIdleTimer) { clearTimeout(state.phraseIdleTimer); state.phraseIdleTimer = null; }
+    state.phraseText = '';
+    state.phraseQueue = [];
+    state.phrasePumping = false;
+    state.llmFinished = false;
+    cancelScheduledPlayback();
+    setSpeaking(false);
+    setProcessing(false);
     state.historyMessages = [];
     state.transcript = [];
     state.ttfMs = null;
@@ -2717,6 +3219,12 @@ if (typeof Alpine === 'undefined') {
   refs['system-prompt'].value = savedSystemPrompt;
   loadVadSettings();
   refs['voice-name'].textContent = config.profileLabel + ' -> ' + config.ttsVoice;
+  refs['tts-mode'].textContent = config.nativeStreaming
+    ? 'native-incremental-pcm — PCM16 / 24 kHz'
+    : 'buffered-fallback — phrase PCM16 / 24 kHz';
+  refs['phrase-policy'].textContent = 'Selected profile policy: punctuation dispatches immediately; incomplete text waits for ' +
+    config.textLookahead + ' characters and a safe word/clause boundary, idle flush ' + config.phraseFlushMs +
+    ' ms, hard cap ' + config.phraseHardCap + ' characters. Browser-local legacy phrase overrides are ignored.';
 
   function studioSettingsPayload() {
     return {
@@ -2734,11 +3242,7 @@ if (typeof Alpine === 'undefined') {
         'max-utterance': refs['max-utterance'].value,
         'pre-roll': refs['pre-roll'].value
       },
-      phrase: {
-        'phrase-min': refs['phrase-min'].value,
-        'phrase-max': refs['phrase-max'].value,
-        'phrase-idle': refs['phrase-idle'].value
-      }
+      tuning_profile: config.tuningProfileId
     };
   }
 
@@ -2751,9 +3255,6 @@ if (typeof Alpine === 'undefined') {
     if (['16000', '24000', '48000'].indexOf(String(settings.llm_input_rate)) >= 0) refs['llm-input-rate'].value = String(settings.llm_input_rate);
     if (settings.vad && typeof settings.vad === 'object') {
       Object.keys(settings.vad).forEach(function(name) { if (refs[name]) refs[name].value = settings.vad[name]; });
-    }
-    if (settings.phrase && typeof settings.phrase === 'object') {
-      Object.keys(settings.phrase).forEach(function(name) { if (refs[name]) refs[name].value = settings.phrase[name]; });
     }
     if (typeof settings.mic_id === 'string' && settings.mic_id) localSet('sv_mic_id', settings.mic_id);
   }
@@ -2794,9 +3295,6 @@ if (typeof Alpine === 'undefined') {
   ['speech-threshold', 'start-hold', 'silence-delay', 'min-utterance', 'max-utterance', 'pre-roll'].forEach(function(name) {
     refs[name].addEventListener('change', function() { saveVadSettings(); savePersistentStudioSettings(false); });
   });
-  ['phrase-min', 'phrase-max', 'phrase-idle'].forEach(function(name) {
-    refs[name].addEventListener('change', function() { localSet('sv_' + name, refs[name].value); savePersistentStudioSettings(false); });
-  });
   ['llm-input-format', 'llm-input-rate'].forEach(function(name) {
     refs[name].addEventListener('change', function() {
       localSet(name === 'llm-input-format' ? 'sv_llm_input_format' : 'sv_llm_input_rate', refs[name].value);
@@ -2819,7 +3317,18 @@ if (typeof Alpine === 'undefined') {
 </script>
 <img alt="" class="sv-hidden" src="x" onerror="this.onerror=null;var boot=document.getElementById('__UID__-boot');if(boot){var script=document.createElement('script');script.textContent=boot.textContent;document.body.appendChild(script);}this.remove();">
 </div>'''
-            return tmpl.replace("__CONFIG__", config).replace("__UID__", uid)
+            disclosure = (
+                "Native model-incremental PCM is selected: PCM16 blocks are played as they arrive; cancellation closes the active stream. Buffered phrase PCM remains selectable for rollback."
+                if native_streaming
+                else "Buffered phrase PCM is selected: each phrase completes before playback. This is not native model-incremental streaming."
+            )
+            diagnostics_mode = "native-incremental-pcm" if native_streaming else "buffered-fallback"
+            return (
+                tmpl.replace("__CONFIG__", config)
+                .replace("__UID__", uid)
+                .replace("__DIAGNOSTICS_MODE__", diagnostics_mode)
+                .replace("__STREAMING_DISCLOSURE__", disclosure)
+            )
 
         # ------------------------------------------------------------------
         # Callback implementations
@@ -2862,16 +3371,9 @@ if (typeof Alpine === 'undefined') {
         def load_backend_models(base_url: str):
             """Fetch backend model list; show column and dropdown; display loading/error state; enable/disable Generate buttons."""
             try:
-                run_id = f"ui-models-{int(datetime.utcnow().timestamp() * 1000)}"
-                # region agent log
-                _debug_log(run_id, "H1", "gradio_voice_studio.py:load_backend_models:entry", "load_backend_models entry", {"base_url": base_url})
-                # endregion
                 url = f"{base_url.rstrip('/')}/v1/backend/models"
                 r = httpx.get(url, timeout=10.0)
                 if r.status_code != 200:
-                    # region agent log
-                    _debug_log(run_id, "H2", "gradio_voice_studio.py:load_backend_models:non200", "backend models non-200", {"status_code": r.status_code, "url": url})
-                    # endregion
                     return (
                         gr.update(visible=False),
                         gr.update(choices=[], value=None),
@@ -2882,9 +3384,6 @@ if (typeof Alpine === 'undefined') {
                 data = r.json()
                 available = [m for m in (data.get("available") or []) if "base" in m.lower()]
                 if not available:
-                    # region agent log
-                    _debug_log(run_id, "H3", "gradio_voice_studio.py:load_backend_models:no_base", "no Base models returned", {"available_raw": data.get("available"), "state": data.get("state")})
-                    # endregion
                     return (
                         gr.update(visible=False),
                         gr.update(choices=[], value=None),
@@ -2922,6 +3421,7 @@ if (typeof Alpine === 'undefined') {
                     )
                 status_parts.append(
                     f"**Memory saver:** `{'enabled' if runtime.get('mem_saver') else 'disabled'}` "
+                    f"| **Load admission:** `{runtime.get('load_headroom_mib', 'n/a')} MiB` "
                     f"| **Synthesis reserve:** `{runtime.get('synthesis_headroom_mib', 'n/a')} MiB`"
                 )
                 if data.get("last_action"):
@@ -2937,15 +3437,6 @@ if (typeof Alpine === 'undefined') {
                     status_parts.append(f"**Last error:** `{err}`")
 
                 model_ready = state == "loaded"
-                # region agent log
-                _debug_log(
-                    run_id,
-                    "H4",
-                    "gradio_voice_studio.py:load_backend_models:success",
-                    "backend models loaded",
-                    {"state": state, "current": current, "loaded_models": loaded, "model_ready": model_ready, "last_error": err},
-                )
-                # endregion
                 return (
                     gr.update(visible=True),
                     gr.update(choices=available, value=current or available[0]),
@@ -2962,14 +3453,31 @@ if (typeof Alpine === 'undefined') {
                     gr.update(interactive=False),
                 )
 
-        def gpu_guard_status(settings: Dict[str, Any], warning: str = "") -> str:
+        def gpu_guard_status(settings: Dict[str, Any], warning: str = "", enforced_policy: Dict[str, Any] | None = None) -> str:
             mode = settings.get("mode", "enforced")
             text = (
-                f"**Mode:** `{mode}` | **Load reserve:** `{settings.get('load_min_free_mib', 'n/a')} MiB` "
-                f"| **Synthesis reserve:** `{settings.get('synthesis_min_free_mib', 'n/a')} MiB`\n\n"
+                f"**Mode:** `{mode}` | **Custom absolute load threshold:** `{settings.get('load_min_free_mib', 'n/a')} MiB` "
+                f"| **Custom synthesis reserve:** `{settings.get('synthesis_min_free_mib', 'n/a')} MiB`\n\n"
                 f"**Utilization limits:** load `{settings.get('load_max_utilization_percent', 'n/a')}%`, "
                 f"synthesis `{settings.get('synthesis_max_utilization_percent', 'n/a')}%`."
             )
+            models = (enforced_policy or {}).get("models") or {}
+            if models:
+                threshold_parts = []
+                for model_id, values in models.items():
+                    if values.get("admissionKind") == "measured-residency-plus-synthesis-floor":
+                        detail = (
+                            f"`{values.get('residencyReserveMiB')} + "
+                            f"{values.get('postLoadSynthesisReserveMiB')} MiB`"
+                        )
+                    else:
+                        detail = "existing total threshold; residency delta unmeasured"
+                    threshold_parts.append(
+                        f"`{model_id}`: `{values.get('loadMinimumFreeMiB')} MiB` ({detail})"
+                    )
+                text += f"\n\n**Enforced load policy:** {', '.join(threshold_parts)}."
+                if mode != "enforced":
+                    text += " These enforced thresholds are informational while Custom or Disabled mode is selected."
             if mode == "disabled":
                 text += "\n\nWARNING: admission bypass is active; a CUDA out-of-memory failure remains possible."
             if warning:
@@ -2980,14 +3488,15 @@ if (typeof Alpine === 'undefined') {
             try:
                 response = httpx.get(f"{base_url.rstrip('/')}/control/gpu-guard", timeout=10.0)
                 response.raise_for_status()
-                settings = response.json().get("gpu_guard") or {}
+                document = response.json()
+                settings = document.get("gpu_guard") or {}
                 return (
                     gr.update(value=settings.get("mode", "enforced")),
                     gr.update(value=settings.get("load_min_free_mib", 0)),
                     gr.update(value=settings.get("synthesis_min_free_mib", 2048)),
                     gr.update(value=settings.get("load_max_utilization_percent", 85)),
                     gr.update(value=settings.get("synthesis_max_utilization_percent", 95)),
-                    gpu_guard_status(settings),
+                    gpu_guard_status(settings, enforced_policy=document.get("enforced_gpu_policy")),
                 )
             except Exception as exc:
                 return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), f"Could not load GPU guard settings: `{exc}`")
@@ -3005,8 +3514,13 @@ if (typeof Alpine === 'undefined') {
                 if response.status_code != 200:
                     detail = response.json().get("detail", response.text)
                     raise gr.Error(str(detail))
-                settings = response.json().get("gpu_guard") or payload
-                return gpu_guard_status(settings, "Saved to the candidate's private persistent storage.")
+                document = response.json()
+                settings = document.get("gpu_guard") or payload
+                return gpu_guard_status(
+                    settings,
+                    "Saved to the candidate's private persistent storage.",
+                    document.get("enforced_gpu_policy"),
+                )
             except gr.Error:
                 raise
             except Exception as exc:
@@ -3017,15 +3531,8 @@ if (typeof Alpine === 'undefined') {
             if not model_key:
                 return gr.update(), "Select a model first.", gr.update(), gr.update()
             try:
-                run_id = f"ui-switch-{int(datetime.utcnow().timestamp() * 1000)}"
-                # region agent log
-                _debug_log(run_id, "H5", "gradio_voice_studio.py:do_switch_backend_model:entry", "switch requested", {"base_url": base_url, "model_key": model_key})
-                # endregion
                 url = f"{base_url.rstrip('/')}/v1/backend/models/switch"
                 r = httpx.post(url, json={"model_key": model_key}, timeout=600.0)
-                # region agent log
-                _debug_log(run_id, "H5", "gradio_voice_studio.py:do_switch_backend_model:switch_response", "switch response received", {"status_code": r.status_code})
-                # endregion
                 if r.status_code != 200:
                     err = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
                     msg = err.get("detail", {}).get("message", "Switch failed") if isinstance(err.get("detail"), dict) else str(err.get("detail", "Switch failed"))
@@ -3039,9 +3546,6 @@ if (typeof Alpine === 'undefined') {
                 state = data.get("state", "loaded")
                 model_ready = state == "loaded"
                 msg = f"✅ Loaded: `{data.get('current', model_key)}` | In memory: `{', '.join(loaded) if loaded else 'none'}`"
-                # region agent log
-                _debug_log(run_id, "H4", "gradio_voice_studio.py:do_switch_backend_model:post_status", "post-switch models status", {"state": state, "current": data.get("current", model_key), "loaded_models": loaded})
-                # endregion
                 return (
                     gr.update(choices=available, value=data.get("current", model_key)),
                     msg,
@@ -3214,36 +3718,36 @@ if (typeof Alpine === 'undefined') {
                 "ref_audio": ref_b64,
                 "ref_text": ref_text.strip(),
                 "x_vector_only_mode": bool(xvec_only),
-                "response_format": "wav",
             }
-            # Use streaming endpoint for better timing info
+            # Base Clone preview uses the same dedicated offline path as the
+            # Playground's Full Quality mode. Never attempt native PCM first.
+            apply_full_wav_quality_policy(payload, "wav")
             try:
-                audio_bytes, ext, timing_info = request_tts_streaming(base_url, payload, float(timeout_s))
+                started = time.perf_counter()
+                audio_bytes, ext, headers = request_tts_voice_clone(
+                    base_url, payload, float(timeout_s)
+                )
+                timing_info = {
+                    "total_time": time.perf_counter() - started,
+                    "delivery_mode": headers.get("x-tts-delivery-mode", "offline-full-decoder"),
+                    "format": headers.get("x-tts-format", ext),
+                }
                 out_path = write_bytes_to_temp_audio(audio_bytes, ext)
                 
                 # Format timing info as readable markdown
-                first_chunk = timing_info.get('first_chunk_time')
                 total_time = timing_info.get('total_time')
-                audio_duration = timing_info.get('audio_duration')
-                rtf = timing_info.get('rtf')
-                chunk_count = timing_info.get('chunk_count', 0)
                 
                 timing_md = f"""### ⏱️ Generation Timing
 | Metric | Value |
 |--------|-------|
-| **First chunk** | {first_chunk:.2f}s |
 | **Total time** | {total_time:.2f}s |
-| **Audio duration** | {audio_duration:.2f}s |
-| **RTF** | {rtf:.2f}x |
-| **Chunks** | {chunk_count} |
 | **Model** | {active_model or "current"} |
+| **Delivery** | {timing_info['delivery_mode']} |
+| **Format** | {str(timing_info['format']).upper()} |
 """
                 return out_path, out_path, timing_md
             except Exception as e:
-                # Fallback to non-streaming
-                audio_bytes, ext, _headers = request_tts_voice_clone(base_url, payload, float(timeout_s))
-                out_path = write_bytes_to_temp_audio(audio_bytes, ext)
-                return out_path, out_path, f"⚠️ Used non-streaming fallback: {e}"
+                raise gr.Error(f"Base Clone full-quality generation failed: {e}")
 
         def on_save_clone_profile(
             library_dir_str: str,
@@ -3375,7 +3879,7 @@ if (typeof Alpine === 'undefined') {
             library_dir_str: str,
             pid: str,
             text: str,
-            fmt: str,
+            response_format: str,
             speed: float,
             seed: float,
         ):
@@ -3385,10 +3889,12 @@ if (typeof Alpine === 'undefined') {
             vp = load_profile(Path(library_dir_str), pid)
             payload: Dict[str, Any] = {
                 "input": text,
-                "response_format": fmt,
                 "speed": float(speed),
                 "language": vp.language,
             }
+            # Full Quality is a dedicated offline path. It never inherits the
+            # Studio's selected streaming profile or temporary overrides.
+            apply_full_wav_quality_policy(payload, response_format)
             if vp.task_type == "CustomVoice":
                 payload.update({
                     "task_type": "CustomVoice",
@@ -3404,7 +3910,6 @@ if (typeof Alpine === 'undefined') {
                     "task_type": "Base",
                     "voice": vp.voice or "Vivian",
                     "x_vector_only_mode": bool(vp.x_vector_only_mode),
-                    "seed": int(seed) if seed is not None else -1,
                     "cache_key": vp.profile_id,
                 })
                 if vp.ref_audio_filename:
@@ -3419,7 +3924,7 @@ if (typeof Alpine === 'undefined') {
                         raise gr.Error("This profile needs ref_text unless x_vector_only_mode is enabled.")
                     payload["ref_text"] = vp.ref_text.strip()
                 
-                # Use non-streaming voice clone for full quality (avoids windowing degradation)
+                # Use one complete offline decode for the full-quality master.
                 try:
                     audio_bytes, ext, headers = request_tts_voice_clone(base_url, payload, float(timeout_s))
                     out_path = write_bytes_to_temp_audio(audio_bytes, ext)
@@ -3436,6 +3941,8 @@ if (typeof Alpine === 'undefined') {
 |--------|-------|
 | **Size** | {len(audio_bytes)} bytes |
 | **Model** | {active_model or "current"} |
+| **Delivery** | offline-full-decoder |
+| **Sampler policy** | Quality (dedicated Full Quality) |
 {format_line}
 {seed_line}"""
                     return out_path, out_path, timing_md
@@ -3444,31 +3951,6 @@ if (typeof Alpine === 'undefined') {
                     # offline synthesis error by attempting the unsupported
                     # incremental-PCM compatibility fallback.
                     raise gr.Error(f"Non-streaming generation failed: {e}")
-                    # Retained legacy parser below is unreachable until a
-                    # backend with native incremental PCM is introduced.
-                    try:
-                        audio_bytes, ext, timing_info = request_tts_streaming(base_url, payload, float(timeout_s))
-                        out_path = write_bytes_to_temp_audio(audio_bytes, ext)
-                        first_chunk = timing_info.get('first_chunk_time') or 0.0
-                        total_time = timing_info.get('total_time') or 0.0
-                        audio_duration = timing_info.get('audio_duration') or 0.0
-                        rtf = timing_info.get('rtf') or 0.0
-                        chunk_count = timing_info.get('chunk_count', 0)
-                        seed_used = timing_info.get('seed_used')
-                        seed_line = f"| **Seed used** | {seed_used} |\n" if seed_used is not None else ""
-                        timing_md = f"""### ⏱️ Generation Timing (Streaming fallback)
-| Metric | Value |
-|--------|-------|
-| **First chunk** | {first_chunk:.2f}s |
-| **Total time** | {total_time:.2f}s |
-| **Audio duration** | {audio_duration:.2f}s |
-| **RTF** | {rtf:.2f}x |
-| **Chunks** | {chunk_count} |
-| **Model** | {active_model or "current"} |
-{seed_line}"""
-                        return out_path, out_path, timing_md
-                    except Exception as e2:
-                        raise gr.Error(f"Both non-streaming and streaming failed: {e}; {e2}")
             else:
                 payload.update({
                     "task_type": "VoiceDesign",
@@ -3483,8 +3965,17 @@ if (typeof Alpine === 'undefined') {
         # Streaming mode callbacks
         # ------------------------------------------------------------------
 
-        def on_update_streaming_widget(base_url: str, pid: str, library_dir_str: str) -> str:
+        def on_update_streaming_widget(
+            base_url: str,
+            pid: str,
+            library_dir_str: str,
+            tuning_profile_id: str | None = None,
+            playback_mode: str = DEFAULT_PLAYBACK_MODE,
+            session_tuning: dict[str, Any] | None = None,
+        ) -> str:
             """Render the streaming widget HTML with current TTS base URL and selected voice."""
+            if playback_mode == FULL_WAV_PLAYBACK_MODE:
+                return "<div class='svwidget'><p style='color:#666;text-align:center;padding:24px;'>Full Quality uses one offline full-quality decode. Select Native incremental PCM or Buffered phrase PCM to open the realtime widget.</p></div>"
             if not pid:
                 return "<div class='svwidget'><p style='color:#999;text-align:center;padding:24px;'>Select a TTS voice profile above.</p></div>"
             try:
@@ -3498,19 +3989,85 @@ if (typeof Alpine === 'undefined') {
                 tts_voice = voice_name
                 profile_label = pid or voice_name
                 language = "Auto"
-            return _build_streaming_widget_html(base_url, voice_name, tts_voice, profile_label, language)
+            lookahead, flush_ms = 24, 450
+            first_frames, steady_frames = 4, 12
+            selected = tuning_profile_id or "balanced"
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    tuning_document = client.get(f"{base_url.rstrip('/')}/v1/tuning/profiles").json()
+                studio_selections = (tuning_document.get("selections") or {}).get("voice-studio") or {}
+                selected = tuning_profile_id or studio_selections.get(PROFILE_PROVIDER) or "balanced"
+                tuning = tuning_document.get("profiles", {}).get(selected, {})
+                lookahead = int(tuning.get("text_lookahead", lookahead))
+                flush_ms = int(tuning.get("phrase_flush_ms", flush_ms))
+                first_frames = int(tuning.get("first_block_frames", first_frames))
+                steady_frames = int(tuning.get("steady_block_frames", steady_frames))
+            except Exception:
+                pass
+            return _build_streaming_widget_html(
+                base_url,
+                voice_name,
+                tts_voice,
+                profile_label,
+                language,
+                lookahead,
+                flush_ms,
+                first_frames,
+                steady_frames,
+                selected,
+                playback_mode,
+                session_tuning,
+            )
 
-        def on_play_mode_change(mode: str):
-            """Toggle visibility of non-streaming vs streaming columns."""
-            is_streaming = "Streaming" in mode
+        def on_play_mode_change(mode: str, context_unlocked: bool = False):
+            """Separate offline Full Quality from buffered/native streaming controls."""
+            is_streaming = mode != FULL_WAV_PLAYBACK_MODE
+            is_native = mode == NATIVE_PLAYBACK_MODE and NATIVE_INCREMENTAL_PCM_ENABLED
+            status = (
+                "Full Quality is independent: one offline full decoder pass with the dedicated Quality sampler policy. All streaming and tuning-profile controls are locked; output format and speed remain available."
+                if not is_streaming
+                else (
+                    "Native profile controls are active. Output remains fixed PCM16 / 24 kHz; startup waits for the selected first-plus-steady block duration."
+                    if is_native
+                    else "Buffered fallback uses the selected phrase look-ahead and flush policy. Native block/context controls are inactive."
+                )
+            )
             return (
                 gr.update(visible=not is_streaming),
                 gr.update(visible=is_streaming),
+                gr.update(value=status),
+                gr.update(interactive=is_native),
+                gr.update(interactive=is_native),
+                gr.update(interactive=is_native and bool(context_unlocked)),
+                gr.update(interactive=is_streaming),
+                gr.update(interactive=is_streaming),
+                gr.update(interactive=is_streaming),  # named profile
+                gr.update(interactive=is_streaming),  # refresh
+                gr.update(interactive=is_streaming),  # use selected
+                gr.update(interactive=is_streaming),  # clone
+                gr.update(interactive=is_streaming),  # reset
+                gr.update(interactive=is_streaming),  # delete
+                gr.update(interactive=is_streaming),  # name
+                gr.update(interactive=is_streaming),  # revision
+                gr.update(interactive=is_streaming),  # matched reference
+                gr.update(interactive=is_streaming),  # temperature
+                gr.update(interactive=is_streaming),  # top-k
+                gr.update(interactive=is_streaming),  # top-p
+                gr.update(interactive=is_streaming),  # repetition
+                gr.update(interactive=is_streaming),  # seed
+                gr.update(interactive=is_streaming),  # model
+                gr.update(interactive=is_native),     # unsafe context unlock
+                gr.update(interactive=is_streaming),  # save profile
+                gr.update(interactive=is_streaming),  # apply overrides
+                gr.update(interactive=is_streaming),  # clear overrides
+                gr.update(interactive=is_streaming),  # import/export JSON
+                gr.update(interactive=is_streaming),  # export
+                gr.update(interactive=is_streaming),  # import
             )
 
-        def on_s_voice_change(pid: str, base_url: str, library_dir_str: str):
+        def on_s_voice_change(pid: str, base_url: str, library_dir_str: str, tuning_profile_id: str | None, playback_mode: str, session_tuning: dict[str, Any] | None):
             """Update the streaming widget HTML when the voice profile changes."""
-            html = on_update_streaming_widget(base_url, pid, library_dir_str)
+            html = on_update_streaming_widget(base_url, pid, library_dir_str, tuning_profile_id, playback_mode, session_tuning)
             return gr.update(value=html)
 
         # ------------------------------------------------------------------
@@ -3627,26 +4184,46 @@ if (typeof Alpine === 'undefined') {
         # Streaming mode wiring
         play_mode.change(
             fn=on_play_mode_change,
-            inputs=[play_mode],
-            outputs=[ns_group, s_group],
+            inputs=[play_mode, tuning_context_unlock],
+            outputs=[
+                ns_group, s_group, tuning_profile_status,
+                tuning_first, tuning_steady, tuning_context, tuning_lookahead, tuning_flush_ms,
+                tuning_profile_dropdown, refresh_tuning_btn, save_tuning_btn,
+                clone_tuning_btn, reset_tuning_btn, delete_tuning_btn,
+                tuning_name, tuning_revision, tuning_reference_s, tuning_temperature,
+                tuning_top_k, tuning_top_p, tuning_repetition, tuning_seed, tuning_model,
+                tuning_context_unlock, save_tuning_edit_btn, resolve_tuning_btn,
+                clear_tuning_override_btn, tuning_json, export_tuning_btn, import_tuning_btn,
+            ],
         )
         play_mode.change(
             fn=on_update_streaming_widget,
-            inputs=[base_url_in, s_voice_profile_id, library_dir_in],
+            inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state],
             outputs=[s_streaming_widget],
+        )
+        tuning_context_unlock.change(
+            fn=lambda mode, unlocked: gr.update(
+                interactive=bool(
+                    unlocked
+                    and mode == NATIVE_PLAYBACK_MODE
+                    and NATIVE_INCREMENTAL_PCM_ENABLED
+                )
+            ),
+            inputs=[play_mode, tuning_context_unlock],
+            outputs=[tuning_context],
         )
         s_voice_profile_id.change(
             fn=on_s_voice_change,
-            inputs=[s_voice_profile_id, base_url_in, library_dir_in],
+            inputs=[s_voice_profile_id, base_url_in, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state],
             outputs=[s_streaming_widget],
         )
 
-        # The Playground defaults to streaming scaffolding.  Render the same
+        # Render the active native-or-buffered default on first load. Render the same
         # profile-bound widget on initial load that profile changes render later;
         # do not leave the first visit on the legacy placeholder.
         demo.load(fn=on_library_refresh, inputs=[library_dir_in], outputs=[library_table, play_profile_id, s_voice_profile_id]).then(
             fn=on_update_streaming_widget,
-            inputs=[base_url_in, s_voice_profile_id, library_dir_in],
+            inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state],
             outputs=[s_streaming_widget],
         )
         demo.load(
@@ -3666,6 +4243,35 @@ if (typeof Alpine === 'undefined') {
                 gpu_guard_status_md,
             ],
         )
+        tuning_form_outputs = [tuning_profile_dropdown, tuning_profile_status, tuning_name, tuning_revision, tuning_first, tuning_steady, tuning_context, tuning_reference_s, tuning_model, tuning_lookahead, tuning_flush_ms, tuning_temperature, tuning_top_k, tuning_top_p, tuning_repetition, tuning_seed]
+        demo.load(fn=tuning_profile_form, inputs=[base_url_in], outputs=tuning_form_outputs)
+        tuning_profile_dropdown.change(fn=tuning_profile_form, inputs=[base_url_in, tuning_profile_dropdown], outputs=tuning_form_outputs).then(
+            fn=on_update_streaming_widget, inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state], outputs=[s_streaming_widget]
+        )
+        refresh_tuning_btn.click(fn=tuning_profile_form, inputs=[base_url_in, tuning_profile_dropdown], outputs=tuning_form_outputs)
+        save_tuning_btn.click(fn=save_tuning_selection, inputs=[base_url_in, tuning_profile_dropdown], outputs=[tuning_profile_status]).then(
+            fn=tuning_profile_form, inputs=[base_url_in, tuning_profile_dropdown], outputs=tuning_form_outputs
+        )
+        clone_tuning_btn.click(fn=lambda url, profile: tuning_lifecycle(url, profile, "clone"), inputs=[base_url_in, tuning_profile_dropdown], outputs=[tuning_profile_status]).then(
+            fn=tuning_profile_form, inputs=[base_url_in, tuning_profile_dropdown], outputs=tuning_form_outputs
+        )
+        reset_tuning_btn.click(fn=lambda url, profile: tuning_lifecycle(url, profile, "reset"), inputs=[base_url_in, tuning_profile_dropdown], outputs=[tuning_profile_status]).then(
+            fn=tuning_profile_form, inputs=[base_url_in, tuning_profile_dropdown], outputs=tuning_form_outputs
+        )
+        delete_tuning_btn.click(fn=lambda url, profile: tuning_lifecycle(url, profile, "delete"), inputs=[base_url_in, tuning_profile_dropdown], outputs=[tuning_profile_status]).then(
+            fn=tuning_profile_form, inputs=[base_url_in], outputs=tuning_form_outputs
+        )
+        save_tuning_edit_btn.click(fn=edit_tuning_profile, inputs=[base_url_in, tuning_profile_dropdown, tuning_revision, tuning_name, tuning_first, tuning_steady, tuning_context, tuning_reference_s, tuning_lookahead, tuning_flush_ms, tuning_temperature, tuning_top_k, tuning_top_p, tuning_repetition, tuning_seed], outputs=[tuning_profile_status]).then(
+            fn=tuning_profile_form, inputs=[base_url_in, tuning_profile_dropdown], outputs=tuning_form_outputs
+        )
+        resolve_tuning_btn.click(fn=resolve_tuning_override, inputs=[base_url_in, tuning_profile_dropdown, tuning_model, tuning_first, tuning_steady, tuning_context, tuning_reference_s, tuning_lookahead, tuning_flush_ms, tuning_temperature, tuning_top_k, tuning_top_p, tuning_repetition, tuning_seed, tuning_override_state], outputs=[tuning_profile_status, tuning_override_state]).then(
+            fn=on_update_streaming_widget, inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state], outputs=[s_streaming_widget]
+        )
+        clear_tuning_override_btn.click(fn=clear_tuning_override, outputs=[tuning_profile_status, tuning_override_state]).then(
+            fn=on_update_streaming_widget, inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state], outputs=[s_streaming_widget]
+        )
+        export_tuning_btn.click(fn=export_tuning_json, inputs=[base_url_in], outputs=[tuning_json])
+        import_tuning_btn.click(fn=import_tuning_json, inputs=[base_url_in, tuning_json], outputs=[tuning_profile_status])
         gpu_guard_save_btn.click(
             fn=save_gpu_guard_settings,
             inputs=[

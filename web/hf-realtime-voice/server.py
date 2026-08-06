@@ -75,7 +75,7 @@ LIMITER_ENABLED = bool(LOAD_BALANCER_URL) and bool(SPACE_ID)
 SERPER_URL = "https://google.serper.dev/search"
 # Cap results so the tool output stays small enough to feed back to the model.
 MAX_RESULTS = 5
-LOCAL_UI_API_VERSION = 14
+LOCAL_UI_API_VERSION = 20
 HERE = os.path.dirname(os.path.abspath(__file__))
 _repo_runtime_dir = Path(HERE).parents[1] / ".runtime"
 # In the repository the legacy shared runtime is two levels above the UI.
@@ -100,6 +100,7 @@ PUBLIC_UI_SETTING_KEYS = {
     "instructions",
     "noiseGate",
     "echoGuard",
+    "echoCalibrations",
     "fullBufferTts",
     "liveTranscript",
     "maxResponseTokens",
@@ -108,6 +109,7 @@ PUBLIC_UI_SETTING_KEYS = {
     "modelUrl",
     "modelName",
     "voiceByBackend",
+    "ttsProfileByBackend",
 }
 DEFAULT_QWEN3_VOICE_ID = "16d9bb336799"
 DEFAULT_QWEN3_VOICE = f"clone:{DEFAULT_QWEN3_VOICE_ID}"
@@ -128,6 +130,27 @@ TTS_BACKENDS = {
         "displayName": "Qwen3TTS audio.cpp", "profileMode": "remote", "explicitValidation": True,
     },
 }
+
+
+def _canonical_tts_provider(provider: Any) -> Any:
+    return "qwen3tts-audiocpp" if provider == "audio-cpp" else provider
+
+
+def _normalize_tts_provider_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    normalized["ttsBackend"] = _canonical_tts_provider(normalized.get("ttsBackend"))
+    for key in ("voiceByBackend", "ttsProfileByBackend"):
+        value = normalized.get(key)
+        if not isinstance(value, dict):
+            continue
+        providers = dict(value)
+        if "audio-cpp" in providers and "qwen3tts-audiocpp" not in providers:
+            providers["qwen3tts-audiocpp"] = providers["audio-cpp"]
+        providers.pop("audio-cpp", None)
+        normalized[key] = providers
+    return normalized
+
+
 DEFAULT_VOICE_LIBRARY_DIR = Path(
     os.environ.get(
         "VOICE_LIBRARY_DIR",
@@ -147,12 +170,13 @@ def _read_public_ui_settings() -> dict[str, Any]:
         except (OSError, ValueError):
             continue
         if isinstance(saved, dict):
-            return saved
+            return _normalize_tts_provider_settings(saved)
     return {}
 
 
 def _write_public_ui_settings(payload: dict[str, Any]) -> dict[str, Any]:
     """Atomically save frontend preferences without ever retaining API keys."""
+    payload = _normalize_tts_provider_settings(payload)
     existing = _read_public_ui_settings()
     for key in PUBLIC_UI_SETTING_KEYS:
         value = payload.get(key)
@@ -162,6 +186,35 @@ def _write_public_ui_settings(payload: dict[str, Any]) -> dict[str, Any]:
                 for provider, voice in value.items()
                 if provider in TTS_BACKENDS and isinstance(voice, str) and voice.startswith("clone:")
             }
+        elif key == "ttsProfileByBackend" and isinstance(value, dict):
+            existing[key] = {
+                str(provider): str(profile_id)
+                for provider, profile_id in value.items()
+                if provider in TTS_BACKENDS
+                and isinstance(profile_id, str)
+                and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", profile_id)
+            }
+        elif key == "echoCalibrations" and isinstance(value, dict):
+            limits = {
+                "delayMs": (0.0, 500.0),
+                "suppressionStrength": (0.0, 1.0),
+                "leakageThreshold": (0.05, 1.0),
+                "doubleTalkSensitivity": (0.0, 1.0),
+                "echoTailMs": (0.0, 1000.0),
+            }
+            calibrations: dict[str, dict[str, float]] = {}
+            for pair, calibration in list(value.items())[:16]:
+                if not isinstance(pair, str) or not isinstance(calibration, dict):
+                    continue
+                cleaned: dict[str, float] = {}
+                for field, (minimum, maximum) in limits.items():
+                    candidate = calibration.get(field)
+                    if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+                        continue
+                    cleaned[field] = max(minimum, min(maximum, float(candidate)))
+                if cleaned:
+                    calibrations[pair[:512]] = cleaned
+            existing[key] = calibrations
         elif isinstance(value, (str, int, float, bool)):
             existing[key] = value
     UI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -222,22 +275,77 @@ def _read_tts_validations() -> dict[str, Any]:
             continue
     if not isinstance(saved, dict):
         saved = {}
+    records = saved.get("_records")
+    if not isinstance(records, dict):
+        records = {}
+        saved["_records"] = records
+    # Migrate the original one-entry-per-backend shape without discarding it.
+    # Keeping individual model+clone records means validating one candidate
+    # clone no longer makes another already-validated clone unusable.
+    for backend in TTS_BACKENDS:
+        entry = saved.get(backend)
+        if not isinstance(entry, dict) or not entry.get("speech"):
+            continue
+        backend_records = records.setdefault(backend, {})
+        if isinstance(backend_records, dict):
+            backend_records.setdefault(_tts_validation_key(entry.get("model"), str(entry.get("voice") or "")), entry)
     legacy = _read_audio_cpp_validation()
     if legacy and "qwen3tts-audiocpp" not in saved:
-        saved["qwen3tts-audiocpp"] = {
+        entry = {
             "model": legacy.get("model_id"), "voice": f"clone:{legacy.get('profile_id')}",
             "validatedAt": legacy.get("validated_at", ""), "speech": True,
         }
+        saved["qwen3tts-audiocpp"] = entry
+        records.setdefault("qwen3tts-audiocpp", {})[
+            _tts_validation_key(entry.get("model"), str(entry.get("voice") or ""))
+        ] = entry
     return saved
 
 
-def _write_tts_validation(backend: str, model: str | None, voice: str) -> dict[str, Any]:
+def _tts_validation_key(model: Any, voice: str) -> str:
+    return f"{str(model or '')}|{voice}"
+
+
+def _find_tts_validation(backend: str, model: str | None, voice: str) -> dict[str, Any]:
+    saved = _read_tts_validations()
+    records = saved.get("_records") or {}
+    backend_records = records.get(backend) if isinstance(records, dict) else None
+    if isinstance(backend_records, dict):
+        entry = backend_records.get(_tts_validation_key(model, voice))
+        if isinstance(entry, dict) and entry.get("speech"):
+            return entry
+    latest = saved.get(backend)
+    if (
+        isinstance(latest, dict)
+        and latest.get("speech")
+        and latest.get("model") == model
+        and latest.get("voice") == voice
+    ):
+        return latest
+    return {}
+
+
+def _write_tts_validation(
+    backend: str,
+    model: str | None,
+    voice: str,
+    *,
+    delivery_mode: str | None = None,
+    native_streaming: bool | None = None,
+) -> dict[str, Any]:
     saved = _read_tts_validations()
     entry = {
         "model": model, "voice": voice, "speech": True,
         "validatedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
+    if delivery_mode:
+        entry["deliveryMode"] = delivery_mode
+    if native_streaming is not None:
+        entry["nativeStreaming"] = bool(native_streaming)
     saved[backend] = entry
+    records = saved.setdefault("_records", {})
+    backend_records = records.setdefault(backend, {})
+    backend_records[_tts_validation_key(model, voice)] = entry
     TTS_VALIDATION_PATH.parent.mkdir(parents=True, exist_ok=True)
     temporary = TTS_VALIDATION_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -536,10 +644,10 @@ async def _backend_voice_inventory(backend: str) -> dict[str, Any]:
             if backend == "qwen3tts-audiocpp":
                 response = await http.get(f"{endpoint}/voices/profiles")
                 response.raise_for_status()
-                remote = response.json()
+                remote = _scope_audio_cpp_profile_response(response.json())
                 base.update(
                     reachable=True,
-                    voices=_normalize_remote_voices(remote),
+                    voices=remote["voices"],
                     defaultVoice=remote.get("defaultVoice"),
                     selectedVoice=remote.get("selectedVoice"),
                 )
@@ -569,8 +677,24 @@ async def _backend_voice_inventory(backend: str) -> dict[str, Any]:
     return base
 
 
+def _scope_audio_cpp_profile_response(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize only the candidate's live inventory without cross-provider filtering."""
+    result = dict(payload)
+    voices = _normalize_remote_voices(payload)
+    available = {str(profile["voice"]) for profile in voices}
+    default_voice = str(payload.get("defaultVoice") or "")
+    selected_voice = str(payload.get("selectedVoice") or "")
+    fallback = str(voices[0]["voice"]) if voices else None
+    result["voices"] = voices
+    result["defaultVoice"] = default_voice if default_voice in available else fallback
+    result["selectedVoice"] = selected_voice if selected_voice in available else result["defaultVoice"]
+    return result
+
+
 @app.get("/api/tts/backends/{backend}/voices")
-async def backend_voices(backend: str):
+async def backend_voices(backend: str, response: Response):
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Pragma"] = "no-cache"
     return await _backend_voice_inventory(backend)
 
 
@@ -584,7 +708,8 @@ async def _remote_profile_request(backend: str, method: str, suffix: str, payloa
             except Exception:
                 detail = response.text
             raise HTTPException(status_code=response.status_code, detail=detail or "Backend profile operation failed.")
-        return response.json()
+        result = response.json()
+        return _scope_audio_cpp_profile_response(result) if backend == "qwen3tts-audiocpp" else result
 
 
 @app.post("/api/tts/backends/{backend}/profiles")
@@ -880,12 +1005,10 @@ async def _probe_audio_cpp_candidate(
 ) -> dict[str, Any]:
     """Validate audio.cpp strictly before it can be selected as a realtime TTS.
 
-    audio.cpp's OpenAI endpoint is useful for candidate evaluation, but Qwen3-TTS
-    is currently an offline-only model family in audio.cpp. Native PCM chunk
-    streaming and this app's clone-profile contract must both be proven before it
-    can be selected for realtime. No lifecycle action is performed here; an
-    explicit probe only issues a short buffered speech request to an already-
-    running candidate.
+    Native PCM is accepted only when the running candidate advertises it and a
+    direct chunked speech probe succeeds.  A completed-phrase request remains an
+    explicit, truthfully labelled fallback.  No lifecycle action is performed;
+    probes use only the already-resident model.
     """
     config = TTS_BACKENDS["qwen3tts-audiocpp"]
     endpoint = str(config["endpoint"]).rstrip("/")
@@ -907,9 +1030,7 @@ async def _probe_audio_cpp_candidate(
         "requiredModel": requested_model,
         "ready": False,
         "capabilityChecked": run_speech_probe,
-        "limitations": [
-            "audio.cpp Qwen3-TTS returns completed phrase PCM; it is not native model-level incremental streaming."
-        ],
+        "limitations": [],
     }
     try:
         # Health/model polling should stay quick, but the one-time Base-clone
@@ -931,6 +1052,16 @@ async def _probe_audio_cpp_candidate(
             result["currentModel"] = current_model
             result["progressivePcm"] = bool(runtime.get("progressive_phrase_pcm"))
             result["nativeIncrementalPcm"] = bool(runtime.get("native_incremental_pcm"))
+            result["deliveryMode"] = (
+                "native-incremental-pcm"
+                if result["nativeIncrementalPcm"]
+                else "progressive-buffered-pcm"
+            )
+            result["bufferedFallback"] = not result["nativeIncrementalPcm"]
+            if not result["nativeIncrementalPcm"]:
+                result["limitations"].append(
+                    "This candidate uses completed phrase PCM; native model-level PCM is unavailable."
+                )
             if requested_model and current_model != requested_model:
                 result["error"] = f"Load {requested_model!r} in the isolated audio.cpp Voice Studio before selecting this provider."
                 result["state"] = runtime.get("state") or "unloaded"
@@ -941,7 +1072,20 @@ async def _probe_audio_cpp_candidate(
                 return result
             result["requiredModel"] = current_model
             if not run_speech_probe:
-                validation = _read_tts_validations().get("qwen3tts-audiocpp") or {}
+                public_settings = _read_public_ui_settings()
+                voice_by_backend = public_settings.get("voiceByBackend") or {}
+                selected_voice = str(
+                    voice_by_backend.get("qwen3tts-audiocpp")
+                    or (
+                        public_settings.get("voice")
+                        if public_settings.get("ttsBackend") == "qwen3tts-audiocpp"
+                        else ""
+                    )
+                    or ""
+                )
+                validation = _find_tts_validation(
+                    "qwen3tts-audiocpp", current_model, selected_voice
+                )
                 validation_voice = str(validation.get("voice") or "")
                 validation_profile = validation_voice.removeprefix("clone:")
                 if validation.get("model") == current_model and validation.get("speech"):
@@ -951,12 +1095,28 @@ async def _probe_audio_cpp_candidate(
                         str(item.get("id")) for item in voices_response.json().get("data") or [] if isinstance(item, dict)
                     }
                     if validation_profile in candidate_voice_ids:
+                        validated_native = bool(validation.get("nativeStreaming"))
+                        validated_mode = str(
+                            validation.get("deliveryMode")
+                            or (
+                                "native-incremental-pcm"
+                                if validated_native
+                                else "progressive-buffered-pcm"
+                            )
+                        )
+                        if result["nativeIncrementalPcm"] and not validated_native:
+                            result["limitations"].append(
+                                "The stored speech validation proves buffered fallback only; revalidate to prove native chunks."
+                            )
                         result.update(
                             capabilityChecked=True,
                             cloneCompatible=True,
                             ready=True,
-                            streaming=bool(result["progressivePcm"]),
-                            mode="progressive-phrase-pcm",
+                            streaming=validated_native,
+                            nativeStreaming=validated_native,
+                            bufferedFallback=not validated_native,
+                            deliveryMode=validated_mode,
+                            mode=validated_mode,
                             validation=validation,
                         )
                         return result
@@ -974,32 +1134,101 @@ async def _probe_audio_cpp_candidate(
                 "input": "Capability check.",
                 "voice": f"clone:{profile_id}" if profile_id else "default",
                 "response_format": "pcm",
-                # The Qwen3-TTS model specification advertises only offline mode.
-                # A false stream flag proves buffered speech without claiming
-                # server scaffolding as native model-level incremental PCM.
-                "stream": False,
+                "stream": bool(result["nativeIncrementalPcm"]),
             }
             if not profile_id:
                 result["limitations"].append("Import and select a Base clone profile before validating audio.cpp voice cloning.")
-            async with http.stream(
-                "POST",
-                f"{endpoint}/audio/speech",
-                json=payload,
-            ) as speech:
-                speech.raise_for_status()
-                content_type = speech.headers.get("content-type", "").lower()
-                chunks = [chunk async for chunk in speech.aiter_bytes() if chunk]
-            result["bufferedSpeech"] = bool(chunks)
+            probe_started = asyncio.get_running_loop().time()
+            first_chunk_ms: float | None = None
+            chunks: list[bytes] = []
+            streaming_mode_header = ""
+            try:
+                async with http.stream(
+                    "POST",
+                    f"{endpoint}/audio/speech",
+                    json=payload,
+                ) as speech:
+                    speech.raise_for_status()
+                    content_type = speech.headers.get("content-type", "").lower()
+                    streaming_mode_header = str(
+                        speech.headers.get("x-tts-streaming-mode", "")
+                    )
+                    async for chunk in speech.aiter_bytes():
+                        if not chunk:
+                            continue
+                        if first_chunk_ms is None:
+                            first_chunk_ms = (asyncio.get_running_loop().time() - probe_started) * 1000
+                        chunks.append(chunk)
+            except httpx.HTTPError as native_exc:
+                if not result["nativeIncrementalPcm"]:
+                    raise
+                result["nativeProbeError"] = str(native_exc)
+                payload["stream"] = False
+                probe_started = asyncio.get_running_loop().time()
+                async with http.stream(
+                    "POST",
+                    f"{endpoint}/audio/speech",
+                    json=payload,
+                ) as speech:
+                    speech.raise_for_status()
+                    content_type = speech.headers.get("content-type", "").lower()
+                    chunks = []
+                    async for chunk in speech.aiter_bytes():
+                        if not chunk:
+                            continue
+                        if first_chunk_ms is None:
+                            first_chunk_ms = (asyncio.get_running_loop().time() - probe_started) * 1000
+                        chunks.append(chunk)
+                result.update(
+                    bufferedFallback=True,
+                    deliveryMode="buffered-fallback",
+                    nativeStreaming=False,
+                )
+                result["limitations"].append(
+                    "Native PCM probe failed; validation succeeded through the completed-phrase fallback."
+                )
+            native_header_valid = streaming_mode_header == "native-incremental-pcm"
+            native_chunk_evidence = len(chunks) >= 2
+            result["nativeStreaming"] = bool(
+                result["nativeIncrementalPcm"]
+                and not result.get("nativeProbeError")
+                and native_header_valid
+                and native_chunk_evidence
+            )
+            if result["nativeIncrementalPcm"] and not result["nativeStreaming"] and not result.get("nativeProbeError"):
+                failures = []
+                if not native_header_valid:
+                    failures.append("the exact X-TTS-Streaming-Mode: native-incremental-pcm header was absent")
+                if not native_chunk_evidence:
+                    failures.append("fewer than two nonempty PCM chunks were observed")
+                result["nativeProbeError"] = "; ".join(failures)
+                result.update(
+                    bufferedFallback=True,
+                    deliveryMode="buffered-fallback",
+                )
+                result["limitations"].append(
+                    "Native PCM validation failed: " + result["nativeProbeError"] + ". "
+                    "Returned speech is reported only as buffered capability."
+                )
+            result["bufferedSpeech"] = bool(chunks) and not result["nativeStreaming"]
+            result["speechProbe"] = {
+                "chunks": len(chunks),
+                "bytes": sum(len(chunk) for chunk in chunks),
+                "firstChunkMs": round(first_chunk_ms, 3) if first_chunk_ms is not None else None,
+                "streamingModeHeader": streaming_mode_header or None,
+                "nativeHeaderValid": native_header_valid,
+                "incrementalEvidence": native_chunk_evidence,
+            }
             result["contentType"] = content_type
-            result["streaming"] = bool(result["progressivePcm"])
+            result["streaming"] = bool(result["nativeStreaming"])
             result["cloneCompatible"] = bool(profile_id and profile_id in candidate_voice_ids)
-            if not result["bufferedSpeech"]:
-                result["error"] = "Candidate returned no buffered speech bytes."
+            if not chunks:
+                result["error"] = "Candidate returned no speech bytes."
             elif profile_id:
                 result["ready"] = True
-                result["mode"] = "progressive-phrase-pcm"
+                result["mode"] = result["deliveryMode"]
             else:
-                result["error"] = "Candidate buffered speech works; select a Base clone profile to test its direct audio.cpp clone request."
+                result["error"] = "Candidate speech works; select a Base clone profile to test its direct audio.cpp clone request."
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result
@@ -1049,17 +1278,66 @@ async def save_proxy_audio_cpp_settings(request: Request) -> Response:
     return Response(content=upstream.content, status_code=upstream.status_code, media_type="application/json")
 
 
+@app.api_route("/api/audio-cpp/tuning/{path:path}", methods=["GET", "POST", "PATCH", "PUT", "DELETE"])
+async def proxy_audio_cpp_tuning(path: str, request: Request) -> Response:
+    """Same-origin proxy only: candidate-private supervisor owns tuning state."""
+    allowed = {"profiles", "selection", "resolve", "export", "import"}
+    if not path or path.split("/", 1)[0] not in allowed or ".." in path:
+        raise HTTPException(status_code=404, detail="Unknown tuning endpoint.")
+    kwargs: dict[str, Any] = {}
+    if request.method in {"POST", "PATCH", "PUT"}:
+        kwargs["json"] = await request.json()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as http:
+        upstream = await http.request(request.method, f"{_audio_cpp_proxy_base()}/tuning/{path}", **kwargs)
+    return Response(content=upstream.content, status_code=upstream.status_code, media_type="application/json")
+
+
 @app.post("/api/audio-cpp/audio/speech")
 async def proxy_audio_cpp_speech(request: Request) -> Response:
-    """Same-origin browser proxy for buffered audio.cpp speech requests."""
+    """Relay native PCM incrementally while retaining complete buffered replies."""
     payload = await request.json()
-    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=5.0)) as http:
-        upstream = await http.post(f"{_audio_cpp_proxy_base()}/audio/speech", json=payload)
-    return Response(
-        content=upstream.content,
+    http = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=5.0, read=None))
+    try:
+        upstream_request = http.build_request(
+            "POST", f"{_audio_cpp_proxy_base()}/audio/speech", json=payload
+        )
+        upstream = await http.send(upstream_request, stream=True)
+    except BaseException:
+        await http.aclose()
+        raise
+    headers = {
+        key: value for key, value in upstream.headers.items() if key.lower().startswith("x-tts-")
+    }
+    media_type = upstream.headers.get("content-type", "application/octet-stream")
+    if upstream.is_error:
+        content = await upstream.aread()
+        await upstream.aclose()
+        await http.aclose()
+        return Response(
+            content=content,
+            status_code=upstream.status_code,
+            media_type=media_type,
+            headers=headers,
+        )
+
+    async def relay():
+        try:
+            async for chunk in upstream.aiter_raw():
+                if await request.is_disconnected():
+                    break
+                if chunk:
+                    yield chunk
+        except asyncio.CancelledError:
+            raise
+        finally:
+            await upstream.aclose()
+            await http.aclose()
+
+    return StreamingResponse(
+        relay(),
         status_code=upstream.status_code,
-        media_type=upstream.headers.get("content-type", "application/octet-stream"),
-        headers={key: value for key, value in upstream.headers.items() if key.lower().startswith("x-tts-")},
+        media_type=media_type,
+        headers=headers,
     )
 
 
@@ -1100,16 +1378,18 @@ async def proxy_audio_cpp_llamacpp_turn(request: Request) -> StreamingResponse:
 
 @app.post("/api/voice-studio/test")
 async def voice_studio_test(req: VoiceStudioSynthesisRequest):
-    """Buffered candidate test generation using an already-resident model only."""
+    """Candidate test generation using the public supervisor/runtime contract."""
     if req.model_id not in _audio_cpp_model_ids():
         raise HTTPException(status_code=400, detail="Unknown candidate model.")
     profile = _read_profile(DEFAULT_VOICE_LIBRARY_DIR, req.profile_id)
     endpoint = str(TTS_BACKENDS["qwen3tts-audiocpp"]["endpoint"]).rstrip("/")
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=5.0)) as http:
-        health = await http.get(f"{endpoint}/health")
+        health = await http.get(f"{endpoint.removesuffix('/v1')}/health")
         health.raise_for_status()
-        runtime = health.json().get("backend", {}).get("runtime", {})
-        if runtime.get("state") != "loaded" or runtime.get("current") != req.model_id:
+        backend = health.json().get("backend", {})
+        runtime = backend.get("runtime", {})
+        current_model = backend.get("model_id") or backend.get("current_model_key")
+        if runtime.get("state") != "loaded" or current_model != req.model_id:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -1118,19 +1398,23 @@ async def voice_studio_test(req: VoiceStudioSynthesisRequest):
                 ),
             )
         await _sync_audio_cpp_profile(req.profile_id)
-        reference_name = str(profile.get("ref_audio_filename") or "ref_audio.wav")
         response = await http.post(
             f"{endpoint}/audio/speech",
             json={
                 "model": req.model_id,
                 "input": req.text.strip(),
-                "voice_ref": f"/voices/profiles/{req.profile_id}/{reference_name}",
-                "reference_text": str(profile.get("ref_text") or ""),
+                "voice": f"clone:{req.profile_id}",
+                "response_format": "wav",
+                "language": str(profile.get("language") or "Auto"),
                 "stream": False,
             },
         )
         response.raise_for_status()
-    return Response(content=response.content, media_type=response.headers.get("content-type", "audio/wav"))
+    return Response(
+        content=response.content,
+        media_type=response.headers.get("content-type", "audio/wav"),
+        headers={key: value for key, value in response.headers.items() if key.lower().startswith("x-tts-")},
+    )
 
 
 async def _probe_tts_backend(name: str, config: dict) -> dict:
@@ -1224,7 +1508,13 @@ async def validate_tts_backend(backend: str, request: Request):
         result = await _probe_audio_cpp_candidate(run_speech_probe=True, profile_id=profile_id)
         if not result.get("ready"):
             return result
-        validation = _write_tts_validation(backend, str(result.get("currentModel") or ""), voice)
+        validation = _write_tts_validation(
+            backend,
+            str(result.get("currentModel") or ""),
+            voice,
+            delivery_mode=str(result.get("deliveryMode") or result.get("mode") or ""),
+            native_streaming=bool(result.get("nativeStreaming")),
+        )
         _write_audio_cpp_validation(str(result.get("currentModel") or ""), profile_id)
         result["validation"] = validation
         return result
