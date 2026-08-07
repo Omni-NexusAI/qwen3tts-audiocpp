@@ -1,0 +1,58 @@
+ARG AUDIO_CPP_BUILD_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu22.04
+ARG AUDIO_CPP_BASE_IMAGE=local/audio-cpp-qwen3-tts-voice-studio:rollback-pre-native-profile-fix-20260805
+
+FROM ${AUDIO_CPP_BUILD_IMAGE} AS engine-build
+
+ARG AUDIO_CPP_REPOSITORY=https://github.com/0xShug0/audio.cpp.git
+ARG AUDIO_CPP_REF=238ab6a9e321c17de8e120559f57efeedaeb1345
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates cmake git ninja-build build-essential python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --no-checkout "${AUDIO_CPP_REPOSITORY}" /opt/audio.cpp \
+    && cd /opt/audio.cpp \
+    && git fetch --depth 1 origin "${AUDIO_CPP_REF}" \
+    && git checkout --detach "${AUDIO_CPP_REF}"
+COPY integrations/audio-cpp/patches/qwen3-native-pcm-streaming.patch /tmp/qwen3-native-pcm-streaming.patch
+WORKDIR /opt/audio.cpp
+RUN git apply --check /tmp/qwen3-native-pcm-streaming.patch \
+    && git apply /tmp/qwen3-native-pcm-streaming.patch
+RUN bash scripts/build_linux.sh --backend cuda --deployment-build \
+    --model-set custom --models qwen3_tts --target audiocpp_server
+
+# Recovery/export target: materialize only the validated engine binary when
+# Docker Desktop cannot load the large model-bearing final image in one pass.
+# The normal final image below remains the canonical reproducible build.
+FROM scratch AS engine-export
+COPY --from=engine-build /opt/audio.cpp/build/linux-cuda-release/bin/audiocpp_server /audiocpp_server
+
+FROM ${AUDIO_CPP_BASE_IMAGE}
+
+# Keep the CUDA runtime and BF16 model layers from the validated base image.
+# Rebuild the pinned engine in the disposable stage above, then add only that
+# binary and the candidate control-plane/browser sources to the final image.
+# This avoids re-downloading or re-exporting either model checkpoint.
+ARG AUDIO_CPP_OVERLAY_REV=offline-full-and-tuning-runtime-20260805
+RUN test -n "$AUDIO_CPP_OVERLAY_REV"
+
+COPY --from=engine-build /opt/audio.cpp/build/linux-cuda-release/bin/audiocpp_server /usr/local/bin/audiocpp_server
+
+WORKDIR /opt/voice-studio
+COPY web/hf-realtime-voice/ /opt/voice-studio/
+COPY integrations/audio-cpp/gradio_voice_studio.py /opt/voice-studio/gradio_voice_studio.py
+COPY integrations/audio-cpp/supervisor.py /opt/audio-cpp-supervisor.py
+COPY integrations/audio-cpp/profile_library.py /opt/profile_library.py
+COPY integrations/audio-cpp/profile_library.py /opt/voice-studio/profile_library.py
+
+# Reuse the known-good LF entrypoint already present in the validated base
+# image. Copying the Windows worktree file can otherwise introduce a `sh\r`
+# shebang failure even though the Python sources compile successfully.
+RUN python3 -m py_compile \
+        /opt/audio-cpp-supervisor.py \
+        /opt/profile_library.py \
+        /opt/voice-studio/profile_library.py \
+        /opt/voice-studio/gradio_voice_studio.py \
+        /opt/voice-studio/server.py
+
+ENTRYPOINT ["/usr/local/bin/audio-cpp-candidate"]

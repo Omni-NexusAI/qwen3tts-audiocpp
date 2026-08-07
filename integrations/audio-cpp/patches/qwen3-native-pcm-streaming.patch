@@ -1,0 +1,601 @@
+diff --git a/app/server/runtime.cpp b/app/server/runtime.cpp
+index 33027e9..e1c58ac 100644
+--- a/app/server/runtime.cpp
++++ b/app/server/runtime.cpp
+@@ -404,6 +404,27 @@ std::unordered_map<std::string, std::string> timing_headers(
+     };
+ }
+ 
++std::optional<std::string> qwen3_decode_mode_header(const engine::runtime::TaskResult & result) {
++    for (const auto & artifact : result.output_artifacts) {
++        if (artifact.id != "qwen3_tts.decode_mode") {
++            continue;
++        }
++        const auto mode = artifact.meta.find("mode");
++        if (mode != artifact.meta.end() && !mode->second.empty()) {
++            return mode->second;
++        }
++    }
++    return std::nullopt;
++}
++
++void attach_qwen3_decode_mode_header(
++    HttpResponse & response,
++    const engine::runtime::TaskResult & result) {
++    if (const auto mode = qwen3_decode_mode_header(result)) {
++        response.headers.emplace("X-AudioCPP-Qwen3-Decode-Mode", *mode);
++    }
++}
++
+ std::string task_result_json_with_timing(
+     const engine::runtime::TaskResult & result,
+     const std::string & timing) {
+@@ -1017,15 +1038,18 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
+     const auto wav = encode_pcm16_wav(audio);
+     const auto response_format = engine::io::json::optional_string(body, "response_format", "wav");
+     if (response_format == "json" || response_format == "b64_json") {
+-        return json_response(
++        auto response = json_response(
+             "{\"audio\":" + json_quote(base64_encode(wav)) +
+             ",\"format\":\"wav\",\"timing\":" + timing_json(timed_result.wall_ms, audio) + "}");
++        attach_qwen3_decode_mode_header(response, timed_result.result);
++        return response;
+     }
+     HttpResponse response;
+     response.status = 200;
+     response.content_type = "audio/wav";
+     response.body = std::string(reinterpret_cast<const char *>(wav.data()), wav.size());
+     response.headers = timing_headers(timed_result.wall_ms, audio);
++    attach_qwen3_decode_mode_header(response, timed_result.result);
+     return response;
+ }
+ 
+diff --git a/include/engine/models/qwen3_tts/session.h b/include/engine/models/qwen3_tts/session.h
+index be6213c..4fbdc33 100644
+--- a/include/engine/models/qwen3_tts/session.h
++++ b/include/engine/models/qwen3_tts/session.h
+@@ -20,7 +20,8 @@ namespace engine::models::qwen3_tts {
+ 
+ class Qwen3TTSSession final
+     : public runtime::RuntimeSessionBase
+-    , public runtime::IOfflineVoiceTaskSession {
++    , public runtime::IOfflineVoiceTaskSession
++    , public runtime::IStreamingVoiceTaskSession {
+ public:
+     Qwen3TTSSession(
+         runtime::TaskSpec task,
+@@ -32,6 +33,14 @@ public:
+     runtime::RunMode run_mode() const override;
+     void prepare(const runtime::SessionPreparationRequest & request) override;
+     runtime::TaskResult run(const runtime::TaskRequest & request) override;
++    runtime::StreamingPolicy streaming_policy() const override;
++    void start_stream(const runtime::TaskRequest & request) override;
++    std::optional<runtime::StreamEvent> next_stream_event() override;
++    void set_stream_event_sink(runtime::StreamEventCallback sink) override;
++    runtime::TaskResult finish_stream() override;
++    void reset() override;
++    runtime::StreamEvent process_audio_chunk(const runtime::AudioChunk & chunk) override;
++    runtime::TaskResult finalize() override;
+ 
+ private:
+     struct VoicePromptCacheKey {
+@@ -52,6 +61,8 @@ private:
+     };
+ 
+     Qwen3TTSRequest make_request(const runtime::TaskRequest & request) const;
++    runtime::TaskResult run_offline_request(const runtime::TaskRequest & request);
++    runtime::TaskResult run_streaming_base_request(const runtime::TaskRequest & request);
+     const Qwen3VoiceClonePrompt & resolve_voice_prompt(
+         const Qwen3VoiceCloneInput & input,
+         const Qwen3TTSVoiceClonePromptBuilder & prompt_builder);
+@@ -84,6 +95,9 @@ private:
+     std::unique_ptr<Qwen3SpeakerEncoderRuntime> speaker_encoder_;
+     runtime::CacheSlots<VoicePromptCacheKey, VoicePromptCacheEntry, VoicePromptCacheKeyEqual> voice_prompt_cache_;
+     std::optional<VoicePromptCacheEntry> uncached_voice_prompt_;
++    runtime::StreamEventCallback stream_event_sink_;
++    std::optional<runtime::TaskResult> streaming_result_;
++    bool streaming_started_ = false;
+ };
+ 
+ }  // namespace engine::models::qwen3_tts
+diff --git a/include/engine/models/qwen3_tts/talker.h b/include/engine/models/qwen3_tts/talker.h
+index 70ca372..a311746 100644
+--- a/include/engine/models/qwen3_tts/talker.h
++++ b/include/engine/models/qwen3_tts/talker.h
+@@ -6,6 +6,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -42,6 +43,12 @@ class Qwen3TalkerStepRuntime;
+ 
+ class Qwen3TalkerStepRuntime {
+ public:
++    // The talker produces one 12 Hz multi-codebook frame per autoregressive
++    // step.  A streaming owner receives that frame before the next step so it
++    // can hand a stable prefix to the causal speech decoder without waiting
++    // for EOS.  The callback must not retain references into the runtime.
++    using GeneratedFrameCallback = std::function<void(const Qwen3SpeechCodes &)>;
++
+     class Impl;
+     explicit Qwen3TalkerStepRuntime(std::unique_ptr<Impl> impl);
+     ~Qwen3TalkerStepRuntime();
+@@ -49,7 +56,8 @@ public:
+     Qwen3TalkerCodes generate(
+         const Qwen3TalkerPrefill & prefill,
+         const Qwen3TTSGenerationOptions & options,
+-        float repetition_penalty = 1.05F);
++        float repetition_penalty = 1.05F,
++        GeneratedFrameCallback on_generated_frame = {});
+     int64_t release_cached_step_graph();
+ 
+ private:
+diff --git a/include/engine/models/qwen3_tts/tokenizer_speech_decoder.h b/include/engine/models/qwen3_tts/tokenizer_speech_decoder.h
+index 3515ba6..ba58356 100644
+--- a/include/engine/models/qwen3_tts/tokenizer_speech_decoder.h
++++ b/include/engine/models/qwen3_tts/tokenizer_speech_decoder.h
+@@ -33,6 +33,11 @@ public:
+     ~Qwen3SpeechTokenizerDecoderRuntime();
+ 
+     runtime::AudioBuffer decode(const Qwen3SpeechCodes & codec_codes) const;
++    // Decode a short causal block through a fixed-capacity graph.  Codes after
++    // codec_codes.frames are zero padded; callers retain only valid frames.
++    runtime::AudioBuffer decode_padded(
++        const Qwen3SpeechCodes & codec_codes,
++        int64_t graph_capacity_frames) const;
+     runtime::AudioBuffer decode_and_trim_reference(
+         const Qwen3SpeechCodes & reference_codes,
+         const Qwen3SpeechCodes & generated_codes) const;
+diff --git a/src/models/qwen3_tts/loader.cpp b/src/models/qwen3_tts/loader.cpp
+index 8077210..6c2e2c9 100644
+--- a/src/models/qwen3_tts/loader.cpp
++++ b/src/models/qwen3_tts/loader.cpp
+@@ -34,7 +34,7 @@ runtime::CapabilitySet capabilities(const Qwen3TTSAssets & assets) {
+     runtime::CapabilitySet out;
+     if (assets.config.variant == Qwen3TTSVariant::Base) {
+         out.supported_tasks = {
+-            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline}},
++            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline, runtime::RunMode::Streaming}},
+         };
+         out.supports_speaker_reference = true;
+     } else if (assets.config.variant == Qwen3TTSVariant::VoiceDesign) {
+@@ -71,7 +71,7 @@ public:
+     runtime::CapabilitySet advertised_capabilities() const override {
+         runtime::CapabilitySet out;
+         out.supported_tasks = {
+-            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline}},
++            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline, runtime::RunMode::Streaming}},
+             {runtime::VoiceTaskKind::VoiceDesign, {runtime::RunMode::Offline}},
+         };
+         out.supports_speaker_reference = true;
+@@ -134,12 +134,15 @@ const runtime::CapabilitySet & Qwen3TTSLoadedModel::capabilities() const noexcep
+ std::unique_ptr<runtime::IVoiceTaskSession> Qwen3TTSLoadedModel::create_task_session(
+     const runtime::TaskSpec & task,
+     const runtime::SessionOptions & options) const {
+-    if (task.mode != runtime::RunMode::Offline) {
+-        throw std::runtime_error("Qwen3 TTS only supports offline sessions");
++    if (task.mode != runtime::RunMode::Offline && task.mode != runtime::RunMode::Streaming) {
++        throw std::runtime_error("Qwen3 TTS has an unsupported run mode");
+     }
+     if (assets_->config.variant == Qwen3TTSVariant::Base && task.task != runtime::VoiceTaskKind::Tts) {
+         throw std::runtime_error("Qwen3 base TTS model only supports the Tts task");
+     }
++    if (task.mode == runtime::RunMode::Streaming && assets_->config.variant != Qwen3TTSVariant::Base) {
++        throw std::runtime_error("Qwen3 TTS native PCM streaming currently supports Base clone models only");
++    }
+     if (assets_->config.variant == Qwen3TTSVariant::VoiceDesign && task.task != runtime::VoiceTaskKind::VoiceDesign) {
+         throw std::runtime_error("Qwen3 voice design model only supports the VoiceDesign task");
+     }
+diff --git a/src/models/qwen3_tts/session.cpp b/src/models/qwen3_tts/session.cpp
+index 970aed6..bc263d0 100644
+--- a/src/models/qwen3_tts/session.cpp
++++ b/src/models/qwen3_tts/session.cpp
+@@ -18,6 +18,35 @@ namespace {
+ 
+ using Clock = std::chrono::steady_clock;
+ constexpr int64_t kDefaultTextChunkSize = 8192;
++constexpr const char * kDecodeModeOption = "qwen3_tts.decode_mode";
++constexpr const char * kNativeIncrementalMode = "native_incremental";
++constexpr const char * kOfflineFullMode = "offline_full";
++constexpr const char * kDecodeModeArtifactId = "qwen3_tts.decode_mode";
++
++enum class Qwen3RequestDecodeMode {
++    NativeIncremental,
++    OfflineFull,
++};
++
++Qwen3RequestDecodeMode streaming_decode_mode_from_request(const runtime::TaskRequest & request) {
++    const auto value = runtime::find_option(request.options, {kDecodeModeOption});
++    if (!value.has_value() || *value == kNativeIncrementalMode) {
++        return Qwen3RequestDecodeMode::NativeIncremental;
++    }
++    if (*value == kOfflineFullMode) {
++        return Qwen3RequestDecodeMode::OfflineFull;
++    }
++    throw std::runtime_error(
++        "qwen3_tts.decode_mode must be native_incremental or offline_full");
++}
++
++void attach_decode_mode(runtime::TaskResult & result, const char * mode) {
++    runtime::VoiceArtifact artifact;
++    artifact.kind = runtime::ArtifactKind::Custom;
++    artifact.id = kDecodeModeArtifactId;
++    artifact.meta.emplace("mode", mode);
++    result.output_artifacts.push_back(std::move(artifact));
++}
+ 
+ std::shared_ptr<const Qwen3TTSAssets> require_assets(std::shared_ptr<const Qwen3TTSAssets> assets) {
+     if (assets == nullptr) {
+@@ -288,8 +317,8 @@ Qwen3TTSSession::Qwen3TTSSession(
+         speech_decoder_weight_storage_type_,
+         conv_weight_storage_type_,
+         perf_mode_);
+-    if (task_.mode != runtime::RunMode::Offline) {
+-        throw std::runtime_error("Qwen3 TTS currently supports offline sessions");
++    if (task_.mode != runtime::RunMode::Offline && task_.mode != runtime::RunMode::Streaming) {
++        throw std::runtime_error("Qwen3 TTS has an unsupported run mode");
+     }
+     if (assets_->config.variant == Qwen3TTSVariant::Base && task_.task != runtime::VoiceTaskKind::Tts) {
+         throw std::runtime_error("Qwen3 base TTS model only supports the Tts task");
+@@ -300,6 +329,9 @@ Qwen3TTSSession::Qwen3TTSSession(
+     if (assets_->config.variant == Qwen3TTSVariant::CustomVoice && task_.task != runtime::VoiceTaskKind::Tts) {
+         throw std::runtime_error("Qwen3 custom voice model only supports the Tts task");
+     }
++    if (task_.mode == runtime::RunMode::Streaming && assets_->config.variant != Qwen3TTSVariant::Base) {
++        throw std::runtime_error("Qwen3 TTS native PCM streaming currently supports Base clone models only");
++    }
+     if (assets_->config.variant == Qwen3TTSVariant::Base) {
+         speech_encoder_ = std::make_unique<Qwen3SpeechTokenizerEncoderRuntime>(
+             assets_,
+@@ -333,8 +365,259 @@ void Qwen3TTSSession::prepare(const runtime::SessionPreparationRequest & request
+     mark_prepared();
+ }
+ 
++runtime::StreamingPolicy Qwen3TTSSession::streaming_policy() const {
++    runtime::StreamingPolicy policy;
++    // TTS receives complete text but emits output as the autoregressive talker
++    // produces codec frames.  There is no live-audio input for this task.
++    policy.input = runtime::StreamingInputKind::None;
++    policy.output = runtime::StreamingOutputKind::FinalResult;
++    return policy;
++}
++
++void Qwen3TTSSession::set_stream_event_sink(runtime::StreamEventCallback sink) {
++    stream_event_sink_ = std::move(sink);
++}
++
++void Qwen3TTSSession::reset() {
++    streaming_result_.reset();
++    streaming_started_ = false;
++}
++
++void Qwen3TTSSession::start_stream(const runtime::TaskRequest & request) {
++    require_prepared("Qwen3 TTS start_stream");
++    if (task_.mode != runtime::RunMode::Streaming) {
++        throw std::runtime_error("Qwen3 TTS start_stream called for an offline session");
++    }
++    reset();
++    streaming_started_ = true;
++    try {
++        const auto decode_mode = streaming_decode_mode_from_request(request);
++        if (decode_mode == Qwen3RequestDecodeMode::OfflineFull) {
++            // The model weights and streaming-capable session stay resident,
++            // but this request uses the original complete offline algorithm.
++            // No stream event is emitted; finish_stream returns one master.
++            streaming_result_ = run_offline_request(request);
++            attach_decode_mode(*streaming_result_, "offline-full-decoder");
++            debug::timing_log_scalar("qwen3_tts.offline_full", 1.0);
++        } else {
++            streaming_result_ = run_streaming_base_request(request);
++            attach_decode_mode(*streaming_result_, "native-incremental-pcm");
++        }
++    } catch (...) {
++        // Validation, prompt construction, decoder, and callback failures all
++        // leave this session reusable; never expose a stale final result.
++        reset();
++        if (mem_saver_) {
++            (void) talker_step_->release_cached_step_graph();
++        }
++        throw;
++    }
++}
++
++std::optional<runtime::StreamEvent> Qwen3TTSSession::next_stream_event() {
++    // Events are delivered synchronously from the talker callback so the HTTP
++    // writer can flush each PCM block before the next autoregressive step.
++    return std::nullopt;
++}
++
++runtime::TaskResult Qwen3TTSSession::finish_stream() {
++    if (!streaming_started_ || !streaming_result_.has_value()) {
++        throw std::runtime_error("Qwen3 TTS streaming has not been started");
++    }
++    runtime::TaskResult result = std::move(*streaming_result_);
++    streaming_result_.reset();
++    streaming_started_ = false;
++    return result;
++}
++
++runtime::StreamEvent Qwen3TTSSession::process_audio_chunk(const runtime::AudioChunk & chunk) {
++    (void) chunk;
++    throw std::runtime_error("Qwen3 TTS native PCM streaming does not consume microphone audio chunks");
++}
++
++runtime::TaskResult Qwen3TTSSession::finalize() {
++    return finish_stream();
++}
++
++runtime::TaskResult Qwen3TTSSession::run_streaming_base_request(const runtime::TaskRequest & request) {
++    if (assets_->config.variant != Qwen3TTSVariant::Base) {
++        throw std::runtime_error("Qwen3 TTS native PCM streaming is available for Base clone models only");
++    }
++    if (speech_encoder_ == nullptr || speaker_encoder_ == nullptr) {
++        throw std::runtime_error("Qwen3 base TTS session is missing voice clone runtimes");
++    }
++    const auto wall_start = Clock::now();
++    const int64_t text_chunk_size =
++        engine::text::parse_text_chunk_size_override(request.options).value_or(kDefaultTextChunkSize);
++    const auto chunk_requests = runtime::chunk_text_request(request, text_chunk_size);
++    if (chunk_requests.size() != 1) {
++        throw std::runtime_error("Qwen3 native PCM streaming requires one stable text phrase per request");
++    }
++    const Qwen3TTSRequest qwen_request = make_request(chunk_requests.front());
++    if (!qwen_request.voice_clone.has_value()) {
++        throw std::runtime_error("Qwen3 native PCM streaming requires Base clone reference audio");
++    }
++    Qwen3TTSVoiceClonePromptBuilder prompt_builder(
++        text_tokenizer_,
++        *speech_encoder_,
++        *speaker_encoder_,
++        assets_->config.talker.max_position_embeddings);
++    const auto prompt_start = Clock::now();
++    const auto & voice_prompt = resolve_voice_prompt(*qwen_request.voice_clone, prompt_builder);
++    const double prompt_ms = engine::debug::elapsed_ms(prompt_start, Clock::now());
++    if (!voice_prompt.reference_codes.has_value()) {
++        throw std::runtime_error("Qwen3 native PCM streaming currently requires full ICL clone conditioning");
++    }
++    const auto prefill_start = Clock::now();
++    const auto prefill = prompt_builder.build_prefill(qwen_request, voice_prompt);
++    const double prefill_ms = engine::debug::elapsed_ms(prefill_start, Clock::now());
++
++    const auto parse_block_frames = [&](const char * key, int64_t fallback) {
++        const auto value = runtime::parse_i64_option(request.options, {key});
++        const int64_t frames = value.value_or(fallback);
++        if (frames <= 0 || frames > 300) {
++            throw std::runtime_error(std::string(key) + " must be between 1 and 300 codec frames");
++        }
++        return frames;
++    };
++    const int64_t first_block_frames = parse_block_frames("qwen3_tts.stream_first_block_frames", 4);
++    const int64_t steady_block_frames = parse_block_frames("qwen3_tts.stream_steady_block_frames", 12);
++    const int64_t left_context_frames = parse_block_frames("qwen3_tts.stream_left_context_frames", 72);
++    if (left_context_frames + steady_block_frames > 300) {
++        throw std::runtime_error("qwen3_tts.stream_left_context_frames + stream_steady_block_frames must not exceed 300 codec frames");
++    }
++    if (runtime::parse_i64_option(request.options, {"qwen3_tts.stream_crossfade_samples"}).value_or(0) != 0) {
++        throw std::runtime_error(
++            "qwen3_tts.stream_crossfade_samples is not applicable: the causal decoder emits contiguous PCM using retained left context");
++    }
++
++    Qwen3SpeechCodes accumulated = *voice_prompt.reference_codes;
++    Qwen3SpeechCodes pending;
++    pending.code_groups = accumulated.code_groups;
++    runtime::AudioBuffer merged_audio;
++    merged_audio.sample_rate = 24000;
++    merged_audio.channels = 1;
++    bool emitted_first_block = false;
++    int64_t emitted_blocks = 0;
++    double decoder_ms = 0.0;
++
++    const auto append_codes = [](Qwen3SpeechCodes & dst, const Qwen3SpeechCodes & src) {
++        if (src.frames <= 0) {
++            return;
++        }
++        if (dst.code_groups == 0) {
++            dst.code_groups = src.code_groups;
++        }
++        if (dst.code_groups != src.code_groups) {
++            throw std::runtime_error("Qwen3 native PCM stream codec group mismatch");
++        }
++        dst.codes.insert(dst.codes.end(), src.codes.begin(), src.codes.end());
++        dst.frames += src.frames;
++    };
++    const auto emit_pending = [&]() {
++        if (pending.frames == 0) {
++            return;
++        }
++        runtime::AudioBuffer audio;
++        const auto decoder_start = Clock::now();
++        if (!emitted_first_block) {
++            audio = speech_decoder_->decode_and_trim_reference(*voice_prompt.reference_codes, pending);
++            emitted_first_block = true;
++        } else {
++            const int64_t context_frames = std::min<int64_t>(
++                left_context_frames,
++                accumulated.frames - pending.frames);
++            Qwen3SpeechCodes decoder_input;
++            decoder_input.code_groups = accumulated.code_groups;
++            decoder_input.frames = context_frames + pending.frames;
++            const size_t context_offset = static_cast<size_t>(
++                (accumulated.frames - pending.frames - context_frames) * accumulated.code_groups);
++            decoder_input.codes.insert(
++                decoder_input.codes.end(),
++                accumulated.codes.begin() + static_cast<std::ptrdiff_t>(context_offset),
++                accumulated.codes.end());
++            // Keep a single 72+steady-frame decoder graph after the first
++            // block.  The final short tail is zero-padded by the causal graph
++            // runner and only its valid samples are retained.
++            audio = speech_decoder_->decode_padded(
++                decoder_input,
++                left_context_frames + steady_block_frames);
++            const int64_t drop_samples = context_frames * 1920;
++            if (drop_samples > static_cast<int64_t>(audio.samples.size())) {
++                throw std::runtime_error("Qwen3 native PCM stream decoder context exceeds output");
++            }
++            audio.samples.erase(audio.samples.begin(), audio.samples.begin() + static_cast<std::ptrdiff_t>(drop_samples));
++        }
++        decoder_ms += engine::debug::elapsed_ms(decoder_start, Clock::now());
++        runtime::append_audio_buffer(merged_audio, audio);
++        if (stream_event_sink_) {
++            runtime::StreamEvent event;
++            event.audio_output = std::move(audio);
++            stream_event_sink_(event);
++        }
++        pending.codes.clear();
++        pending.frames = 0;
++        ++emitted_blocks;
++    };
++
++    const auto talker_start = Clock::now();
++    try {
++        (void)talker_step_->generate(
++            prefill,
++            qwen_request.generation,
++            qwen_request.generation.repetition_penalty,
++            [&](const Qwen3SpeechCodes & frame) {
++                append_codes(accumulated, frame);
++                append_codes(pending, frame);
++                const int64_t target = emitted_first_block ? steady_block_frames : first_block_frames;
++                if (pending.frames >= target) {
++                    emit_pending();
++                }
++            });
++    } catch (...) {
++        // Socket callbacks are permitted to abort the monolithic generate
++        // call.  Do not decode/emit an EOS tail after that abort, and leave
++        // the session reusable for the next independent request.
++        reset();
++        throw;
++    }
++    const double talker_ms = engine::debug::elapsed_ms(talker_start, Clock::now());
++    // EOS can leave fewer than a block's worth of codec frames.  Flush that
++    // final causal tail rather than losing the last syllable.
++    emit_pending();
++    if (mem_saver_) {
++        (void)talker_step_->release_cached_step_graph();
++    }
++    runtime::TaskResult result;
++    result.audio_output = std::move(merged_audio);
++    debug::timing_log_scalar("qwen3_tts.native_streaming", 1.0);
++    debug::timing_log_scalar("qwen3_tts.stream_blocks", static_cast<double>(emitted_blocks));
++    debug::timing_log_scalar("qwen3_tts.stream_first_block_frames", static_cast<double>(first_block_frames));
++    debug::timing_log_scalar("qwen3_tts.stream_steady_block_frames", static_cast<double>(steady_block_frames));
++    debug::timing_log_scalar("qwen3_tts.stream_left_context_frames", static_cast<double>(left_context_frames));
++    debug::timing_log_scalar("qwen3_tts.voice_prompt_ms", prompt_ms);
++    debug::timing_log_scalar("qwen3_tts.prefill_build_ms", prefill_ms);
++    debug::timing_log_scalar("qwen3_tts.talker_ms", talker_ms);
++    debug::timing_log_scalar("qwen3_tts.speech_decoder_ms", decoder_ms);
++    debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start, Clock::now()));
++    return result;
++}
++
+ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
+     require_prepared("Qwen3 TTS run");
++    if (task_.mode != runtime::RunMode::Offline) {
++        throw std::runtime_error("Qwen3 TTS offline run called for a streaming session");
++    }
++    if (const auto mode = runtime::find_option(request.options, {kDecodeModeOption});
++        mode.has_value() && *mode != kOfflineFullMode) {
++        throw std::runtime_error("Qwen3 TTS offline sessions only support qwen3_tts.decode_mode=offline_full");
++    }
++    auto result = run_offline_request(request);
++    attach_decode_mode(result, "offline-full-decoder");
++    return result;
++}
++
++runtime::TaskResult Qwen3TTSSession::run_offline_request(const runtime::TaskRequest & request) {
+     const auto wall_start = Clock::now();
+     auto release_talker_cached_step_graph = [&]() {
+         if (mem_saver_) {
+diff --git a/src/models/qwen3_tts/talker.cpp b/src/models/qwen3_tts/talker.cpp
+index 5bad35c..8438556 100644
+--- a/src/models/qwen3_tts/talker.cpp
++++ b/src/models/qwen3_tts/talker.cpp
+@@ -1656,7 +1656,8 @@ public:
+     Qwen3TalkerCodes generate(
+         const Qwen3TalkerPrefill & request,
+         const Qwen3TTSGenerationOptions & options,
+-        float repetition_penalty) {
++        float repetition_penalty,
++        Qwen3TalkerStepRuntime::GeneratedFrameCallback on_generated_frame) {
+         const auto total_start = Clock::now();
+         const int64_t max_new_tokens = options.max_new_tokens;
+         if (max_new_tokens <= 0 || max_new_tokens > generation_capacity_) {
+@@ -1778,6 +1779,13 @@ public:
+             code_predictor_timing.output_read_ms += predictor_timing.output_read_ms;
+             out.generated_codes.codes.insert(out.generated_codes.codes.end(), frame.codes.begin(), frame.codes.end());
+             ++out.generated_codes.frames;
++            if (on_generated_frame) {
++                Qwen3SpeechCodes generated_frame;
++                generated_frame.code_groups = out.generated_codes.code_groups;
++                generated_frame.frames = 1;
++                generated_frame.codes = frame.codes;
++                on_generated_frame(generated_frame);
++            }
+ 
+             const auto frame_embed_start = Clock::now();
+             const auto text_hidden = step < trailing_rows
+@@ -1876,8 +1884,9 @@ Qwen3TalkerStepRuntime::~Qwen3TalkerStepRuntime() = default;
+ Qwen3TalkerCodes Qwen3TalkerStepRuntime::generate(
+     const Qwen3TalkerPrefill & prefill,
+     const Qwen3TTSGenerationOptions & options,
+-    float repetition_penalty) {
+-    return impl_->generate(prefill, options, repetition_penalty);
++    float repetition_penalty,
++    GeneratedFrameCallback on_generated_frame) {
++    return impl_->generate(prefill, options, repetition_penalty, std::move(on_generated_frame));
+ }
+ 
+ int64_t Qwen3TalkerStepRuntime::release_cached_step_graph() {
+diff --git a/src/models/qwen3_tts/tokenizer_speech_decoder.cpp b/src/models/qwen3_tts/tokenizer_speech_decoder.cpp
+index 4101dd2..b1d2d52 100644
+--- a/src/models/qwen3_tts/tokenizer_speech_decoder.cpp
++++ b/src/models/qwen3_tts/tokenizer_speech_decoder.cpp
+@@ -1144,6 +1144,29 @@ Qwen3SpeechTokenizerDecoderRuntime::Qwen3SpeechTokenizerDecoderRuntime(
+ 
+ Qwen3SpeechTokenizerDecoderRuntime::~Qwen3SpeechTokenizerDecoderRuntime() = default;
+ 
++runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode_padded(
++    const Qwen3SpeechCodes & codec_codes,
++    int64_t graph_capacity_frames) const {
++    if (codec_codes.frames <= 0 || graph_capacity_frames < codec_codes.frames ||
++        graph_capacity_frames > kChunkCodes || codec_codes.code_groups != weights_->config.num_quantizers ||
++        static_cast<int64_t>(codec_codes.codes.size()) != codec_codes.frames * codec_codes.code_groups) {
++        throw std::runtime_error("Qwen3 speech decoder received invalid padded codec shape");
++    }
++    const int threads = std::max(1, execution_context_->config().threads);
++    if (graph_ == nullptr || !graph_->matches(*weights_, graph_capacity_frames, execution_context_->backend(), threads)) {
++        graph_.reset();
++        graph_ = std::make_unique<Qwen3SpeechTokenizerDecoderGraph>(
++            weights_, graph_capacity_frames, *execution_context_, *constants_, graph_arena_bytes_, perf_mode_);
++    }
++    auto decoded = graph_->run(codec_codes.codes.data(), codec_codes.codes.size());
++    const size_t valid_samples = static_cast<size_t>(codec_codes.frames * kDecodeSamplesPerCode);
++    if (decoded.size() < valid_samples) {
++        throw std::runtime_error("Qwen3 padded decoder output is shorter than valid input");
++    }
++    decoded.resize(valid_samples);
++    return runtime::AudioBuffer{kSampleRate, 1, std::move(decoded)};
++}
++
+ runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode(const Qwen3SpeechCodes & codec_codes) const {
+     const auto total_start = Clock::now();
+     if (codec_codes.frames <= 0 || codec_codes.code_groups != weights_->config.num_quantizers) {
+@@ -1228,11 +1251,9 @@ runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode_and_trim_referen
+     combined.codes.insert(combined.codes.end(), reference_codes.codes.begin(), reference_codes.codes.end());
+     combined.codes.insert(combined.codes.end(), generated_codes.codes.begin(), generated_codes.codes.end());
+     auto audio = decode(combined);
+-    const int64_t cut = combined.frames > 0
+-        ? static_cast<int64_t>(
+-              static_cast<double>(reference_codes.frames) / static_cast<double>(combined.frames) *
+-              static_cast<double>(audio.samples.size()))
+-        : 0;
++    // Codec frames have an exact 1920-sample cadence.  Do not use a floating
++    // proportional trim here: it can leak or remove one reference sample.
++    const int64_t cut = reference_codes.frames * kDecodeSamplesPerCode;
+     if (cut < 0 || cut > static_cast<int64_t>(audio.samples.size())) {
+         throw std::runtime_error("Qwen3 speech decoder reference trim is out of range");
+     }
