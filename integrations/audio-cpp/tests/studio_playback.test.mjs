@@ -91,6 +91,20 @@ function messages(instance, kind) {
   assert.ok(render(instance, 4).every((sample) => sample === 0), "clear leaves no stale tail in the output");
 }
 
+{
+  const instance = processor();
+  send(instance, { kind: "begin", turnId: 4, inputRate: 1000, startupMs: 100, reprimeMs: 20 });
+  send(instance, { kind: "audio", turnId: 4, samples: new Float32Array(100).fill(0.2) });
+  render(instance, 140); // Drain the cold block and the fixed fade-out.
+  assert.equal(messages(instance, "underrun").length, 1, "a true starvation enters recovery priming");
+  send(instance, { kind: "audio", turnId: 4, samples: new Float32Array(19).fill(0.3) });
+  render(instance, 1);
+  assert.equal(messages(instance, "started").length, 1, "recovery must not wait for the original cold 100ms reservoir");
+  send(instance, { kind: "audio", turnId: 4, samples: new Float32Array(1).fill(0.3) });
+  render(instance, 1);
+  assert.equal(messages(instance, "started").at(-1).resumed, true, "recovery starts at its explicit steady-state re-prime target");
+}
+
 console.log("studio playback worklet tests passed");
 
 const uiPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../gradio_voice_studio.py");

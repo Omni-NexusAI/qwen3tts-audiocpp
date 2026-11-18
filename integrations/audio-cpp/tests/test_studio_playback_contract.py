@@ -2,19 +2,19 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import types
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).parents[3]
 INTEGRATION = Path(__file__).parents[1]
 UI = INTEGRATION / "gradio_voice_studio.py"
 WORKLET = ROOT / "web" / "hf-realtime-voice" / "worklets" / "studio-playback.js"
 NODE_TEST = Path(__file__).with_name("studio_playback.test.mjs")
+SNAPSHOT_NODE_TEST = Path(__file__).with_name("studio_response_snapshot.test.mjs")
 
 gradio_stub = types.ModuleType("gradio")
 gradio_stub.Blocks = object
@@ -85,14 +85,59 @@ class StudioPlaybackContractTests(unittest.TestCase):
         self.assertNotIn("createBufferSource", active_widget)
         self.assertIn("findImmediateBoundary", active_widget)
         self.assertIn("findSafePhraseCut", active_widget)
-        self.assertIn("config.textLookahead", active_widget)
-        self.assertIn("config.phraseFlushMs", active_widget)
-        self.assertIn("config.phraseHardCap", active_widget)
+        self.assertIn("phrasePolicyForResponse", active_widget)
+        self.assertIn("snapshot.phrasePolicy", active_widget)
+        self.assertIn("requestSnapshotForPhraseDispatch", active_widget)
         self.assertIn("ensurePlaybackQueue", active_widget)
         self.assertIn("enqueuePcmForTurn", active_widget)
         self.assertIn("finishPlaybackTurn", active_widget)
         self.assertIn("kind: 'clear'", active_widget)
         self.assertIn("config.playbackStartupMs", active_widget)
+        self.assertIn("max(1, first_block_frames) * 80", active_widget)
+        self.assertNotIn("first_block_frames + steady_block_frames", active_widget)
+
+    def test_live_profile_or_mode_change_keeps_the_active_widget_and_snapshot(self) -> None:
+        source = UI.read_text(encoding="utf-8")
+        wiring = source.split("# Streaming mode wiring", 1)[1].split("tuning_context_unlock.change", 1)[0]
+        self.assertIn("queue_streaming_widget_next_config", wiring)
+        self.assertNotIn("fn=on_update_streaming_widget", wiring)
+        self.assertIn("pendingNextResponseConfig", source)
+        self.assertIn("function queueNextResponseConfig", source)
+        self.assertIn("function applyNextResponseConfig", source)
+        self.assertIn("applyNextResponseConfig();", source.split("function sendToLLM", 1)[1].split("function", 1)[0])
+
+    def test_response_snapshot_uses_only_supervisor_frozen_tuning_fields(self) -> None:
+        source = UI.read_text(encoding="utf-8")
+        snapshot = source.split("function freezeResponseSnapshot", 1)[1].split(
+            "function ttsPayloadForPhrase", 1
+        )[0]
+        self.assertNotIn("'crossfade_samples'", snapshot)
+        for field in (
+            "model", "clone_mode", "max_reference_seconds", "first_block_frames",
+            "steady_block_frames", "left_context_frames", "text_lookahead",
+            "phrase_flush_ms", "temperature", "top_k", "top_p",
+            "repetition_penalty", "seed",
+        ):
+            self.assertIn(f"'{field}'", snapshot)
+        self.assertIn("clone_snapshot: responseSnapshot.cloneSnapshot", source)
+        self.assertIn("expected_engine_epoch: responseSnapshot.engineEpoch", source)
+        self.assertIn("expected_supervisor_instance_id: responseSnapshot.supervisorInstanceId", source)
+
+    def test_phrase_provider_failure_is_terminal_for_the_active_response(self) -> None:
+        source = UI.read_text(encoding="utf-8")
+        helper = source.split("function terminatePhrasesAfterProviderFailure", 1)[1].split(
+            "function synthesizeSpeech", 1
+        )[0]
+        self.assertIn("state.ttsFailureTerminal = true", helper)
+        self.assertIn("state.phraseQueue = []", helper)
+        self.assertIn("state.phraseText = ''", helper)
+        self.assertIn("state.activeLlmRequest.abort()", helper)
+        self.assertIn("finishPlaybackTurn(turnId, responseSnapshot)", helper)
+        phrase_pump = source.split("function pumpProgressiveSpeech", 1)[1].split(
+            "function synthesizeSpeech", 1
+        )[0]
+        self.assertIn("if (state.ttsFailureTerminal) return", phrase_pump)
+        self.assertIn("if (!state.ttsFailureTerminal) pumpProgressiveSpeech()", phrase_pump)
 
     def test_worklet_is_packaged_by_both_candidate_images(self) -> None:
         self.assertTrue(WORKLET.is_file())
@@ -113,8 +158,8 @@ class StudioPlaybackContractTests(unittest.TestCase):
         self.assertIn("tuning_context_unlock", source)
         self.assertIn("first_block_frames", source.split("def resolve_tuning_override", 1)[1])
         self.assertIn("max_reference_seconds", source.split("def resolve_tuning_override", 1)[1])
-        self.assertIn('profile.get("left_context_frames", 72)', source)
-        self.assertIn('value=72', source)
+        self.assertIn('profile.get("left_context_frames", 25)', source)
+        self.assertIn('value=25', source)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for AudioWorklet behavior tests")
     def test_audio_worklet_behavior(self) -> None:
@@ -127,6 +172,19 @@ class StudioPlaybackContractTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn("studio playback worklet tests passed", completed.stdout)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for Voice Studio browser tests")
+    def test_response_snapshot_payload_behavior(self) -> None:
+        completed = subprocess.run(
+            [shutil.which("node"), str(SNAPSHOT_NODE_TEST)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("studio response snapshot payload tests passed", completed.stdout)
+        self.assertIn("studio provider failure terminal tests passed", completed.stdout)
 
 
 if __name__ == "__main__":

@@ -6,11 +6,11 @@ import base64
 import copy
 import importlib.util
 import io
-from pathlib import Path
+import json
 import tempfile
-import wave
 import unittest
-
+import wave
+from pathlib import Path
 
 SUPERVISOR = Path(__file__).parents[1] / "supervisor.py"
 SPEC = importlib.util.spec_from_file_location("candidate_supervisor_reference_test", SUPERVISOR)
@@ -32,15 +32,17 @@ def wav_bytes(seconds: int, *, rate: int = 10) -> bytes:
 class _FakeResponse:
     def __init__(
         self, content: bytes, chunks: list[bytes] | None = None,
-        decode_mode: str | None = None,
+        decode_mode: str | None = None, native_sse: bool = False,
     ) -> None:
         self.content = content
-        self.headers = {"content-type": "audio/wav"}
+        self.headers = {"content-type": "audio/wav", "X-AudioCPP-Termination": "eos",
+                        "X-AudioCPP-Generated-Frames": "25", "X-AudioCPP-Generation-Cap": "150"}
         if decode_mode:
             self.headers[supervisor.ENGINE_DECODE_MODE_HEADER] = decode_mode
         self.status_code = 200
         self.is_error = False
         self._chunks = chunks or [b"\x01\x00", b"\x02\x00"]
+        self._native_sse = native_sse
 
     async def aread(self) -> bytes:
         return self.content
@@ -48,6 +50,19 @@ class _FakeResponse:
     async def aiter_raw(self):
         for chunk in self._chunks:
             yield chunk
+
+    async def aiter_lines(self):
+        if not self._native_sse:
+            return
+        yield 'data: {"type":"speech.decode_mode","mode":"native-incremental-pcm"}'
+        for value in (b"\x01\x00", b"\x02\x00"):
+            yield "data: " + json.dumps({"type": "speech.audio.delta", "audio": base64.b64encode(value * 1920).decode()})
+        yield 'data: {"type":"speech.generation","generated_frames":2,"generation_cap":150,"termination":"eos"}'
+        yield 'data: {"type":"speech.audio.done"}'
+        yield "data: [DONE]"
+
+    async def aclose(self) -> None:
+        return None
 
     async def __aenter__(self):
         return self
@@ -88,6 +103,21 @@ class _FakeAsyncClient:
     def stream(self, _method: str, _url: str, json: dict) -> _FakeResponse:
         self._capture(json)
         return _FakeResponse(self.output, decode_mode="native-incremental-pcm")
+
+    def build_request(self, _method: str, _url: str, json: dict) -> dict:
+        return {"json": json}
+
+    async def send(self, request: dict, *, stream: bool) -> _FakeResponse:
+        assert stream is True
+        self._capture(request["json"])
+        return _FakeResponse(
+            self.output,
+            decode_mode="native-incremental-pcm",
+            native_sse=True,
+        )
+
+    async def aclose(self) -> None:
+        return None
 
 
 class ReferencePairingContractTests(unittest.TestCase):
@@ -147,19 +177,25 @@ class ReferencePairingContractTests(unittest.TestCase):
 
         buffered = asyncio.run(supervisor._voice_clone_response(self.payload(response_format="pcm", stream=False)))
         self.assert_full_pair_headers(buffered, "buffered-fallback")
+        self.assertEqual(buffered.headers["x-tts-decoder-mode"], "offline-full-decoder")
+        self.assertEqual(
+            _FakeAsyncClient.requests[-1]["options"]["qwen3_tts.decode_mode"],
+            "offline_full",
+        )
         self.assert_last_reference_cleaned()
 
     def test_18_second_pair_is_not_audio_only_cropped_in_native_pcm(self) -> None:
-        response = supervisor._native_clone_pcm_response(
-            self.payload(response_format="pcm", stream=True),
-            "qwen3-tts-1.7b-base-bf16",
-        )
+        async def request_and_consume():
+            response = await supervisor._native_clone_pcm_response(
+                self.payload(response_format="pcm", stream=True),
+                "qwen3-tts-1.7b-base-bf16",
+            )
+            output = b"".join([chunk async for chunk in response.body_iterator])
+            return response, output
+
+        response, output = asyncio.run(request_and_consume())
         self.assert_full_pair_headers(response, "native-incremental-pcm")
-
-        async def consume() -> bytes:
-            return b"".join([chunk async for chunk in response.body_iterator])
-
-        self.assertEqual(asyncio.run(consume()), b"\x01\x00\x02\x00")
+        self.assertEqual(output, b"\x01\x00" * 1920 + b"\x02\x00" * 1920)
         self.assert_last_reference_cleaned()
 
     def test_matched_excerpt_can_apply_to_streaming_but_never_full_wav(self) -> None:
@@ -226,7 +262,7 @@ class ReferencePairingContractTests(unittest.TestCase):
             finally:
                 supervisor.VOICE_LIBRARY_DIR = original_library
 
-    def test_builtins_migrate_to_72_frames_and_reduced_custom_context_warns(self) -> None:
+    def test_builtins_migrate_to_25_frames_and_only_reduced_context_warns(self) -> None:
         saved = supervisor._default_tuning_profiles()
         for profile in saved["profiles"].values():
             profile["left_context_frames"] = 25
@@ -239,6 +275,10 @@ class ReferencePairingContractTests(unittest.TestCase):
 
         payload = self.payload(response_format="pcm", stream=True)
         payload["tuning"]["overrides"]["left_context_frames"] = 25
+        snapshot = supervisor._resolve_request_tuning(payload)
+        self.assertFalse(any("Reduced decoder context" in warning for warning in snapshot["warnings"]))
+
+        payload["tuning"]["overrides"]["left_context_frames"] = 24
         snapshot = supervisor._resolve_request_tuning(payload)
         self.assertTrue(any("Reduced decoder context" in warning for warning in snapshot["warnings"]))
 

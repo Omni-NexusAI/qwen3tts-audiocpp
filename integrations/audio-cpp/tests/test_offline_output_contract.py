@@ -6,13 +6,11 @@ import base64
 import copy
 import importlib.util
 import io
-from pathlib import Path
-import tempfile
 import unittest
 import wave
+from pathlib import Path
 
 from fastapi import HTTPException
-
 
 SUPERVISOR = Path(__file__).parents[1] / "supervisor.py"
 SPEC = importlib.util.spec_from_file_location("candidate_supervisor_offline_output_test", SUPERVISOR)
@@ -36,7 +34,8 @@ class _FakeResponse:
         self.content = content
         self.status_code = 200
         self.is_error = False
-        self.headers = {"content-type": "audio/wav"}
+        self.headers = {"content-type": "audio/wav", "X-AudioCPP-Termination": "eos",
+                        "X-AudioCPP-Generated-Frames": "13", "X-AudioCPP-Generation-Cap": "150"}
         if decode_mode:
             self.headers[supervisor.ENGINE_DECODE_MODE_HEADER] = decode_mode
 
@@ -66,6 +65,9 @@ class _JsonRequest:
 
     async def json(self) -> dict:
         return copy.deepcopy(self.payload)
+
+    async def is_disconnected(self) -> bool:
+        return False
 
 
 class OfflineOutputContractTests(unittest.TestCase):
@@ -118,8 +120,9 @@ class OfflineOutputContractTests(unittest.TestCase):
         async def ready(_payload: dict) -> str:
             return "qwen3-tts-1.7b-base-bf16"
 
-        async def respond(payload: dict):
+        async def respond(payload: dict, *, request=None):
             captured.update(payload)
+            self.assertIsNotNone(request)
             return supervisor.Response(content=b"ok")
 
         supervisor._assert_synthesis_ready = ready
@@ -139,8 +142,9 @@ class OfflineOutputContractTests(unittest.TestCase):
         async def ready(_payload: dict) -> str:
             return "qwen3-tts-1.7b-base-bf16"
 
-        async def respond(payload: dict):
+        async def respond(payload: dict, *, request=None):
             captured.update(payload)
+            self.assertIsNotNone(request)
             return supervisor.Response(content=b"ok")
 
         supervisor._assert_synthesis_ready = ready
@@ -156,6 +160,42 @@ class OfflineOutputContractTests(unittest.TestCase):
         snapshot = captured["_tuning_snapshot"]
         self.assertEqual(snapshot["delivery_mode"], "buffered-fallback")
         self.assertEqual(snapshot["policy"], "profile-streaming")
+
+    def test_buffered_disconnect_cancels_upstream_and_releases_generation_lock(self) -> None:
+        class BlockingClient:
+            started = asyncio.Event()
+            cancelled = False
+
+            async def post(self, _url: str, json: dict):
+                del json
+                type(self).started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    type(self).cancelled = True
+                    raise
+
+        class DisconnectedRequest:
+            async def is_disconnected(self) -> bool:
+                return BlockingClient.started.is_set()
+
+        async def scenario() -> None:
+            async def abandoned_request() -> None:
+                async with supervisor.generation_lock:
+                    await supervisor._post_engine_with_disconnect(
+                        BlockingClient(),
+                        {"input": "abandoned"},
+                        request=DisconnectedRequest(),
+                    )
+
+            task = asyncio.create_task(abandoned_request())
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1.0)
+            self.assertTrue(BlockingClient.cancelled)
+            await asyncio.wait_for(supervisor.generation_lock.acquire(), timeout=0.25)
+            supervisor.generation_lock.release()
+
+        asyncio.run(scenario())
 
     def test_offline_request_uses_one_wav_master_and_proven_decoder_mode(self) -> None:
         response = asyncio.run(supervisor._voice_clone_response(self.payload("pcm")))
@@ -184,13 +224,29 @@ class OfflineOutputContractTests(unittest.TestCase):
         payload = self.payload("pcm")
         payload["stream"] = False
         payload["_tuning_snapshot"] = supervisor._resolve_request_tuning(payload)
-        _FakeAsyncClient.decode_mode = "native-incremental-pcm"
         response = asyncio.run(supervisor._voice_clone_response(payload))
         upstream = _FakeAsyncClient.request
         assert upstream is not None
-        self.assertNotIn("qwen3_tts.decode_mode", upstream.get("options", {}))
+        self.assertEqual(
+            upstream["options"]["qwen3_tts.decode_mode"],
+            "offline_full",
+        )
         self.assertEqual(response.headers["x-tts-delivery-mode"], "buffered-fallback")
-        self.assertEqual(response.headers["x-tts-decoder-mode"], "native-incremental-pcm")
+        self.assertEqual(response.headers["x-tts-decoder-mode"], "offline-full-decoder")
+        self.assertEqual(
+            response.headers["x-audiocpp-qwen3-decode-mode"],
+            "offline-full-decoder",
+        )
+
+    def test_buffered_pcm_rejects_native_decoder_proof(self) -> None:
+        payload = self.payload("pcm")
+        payload["stream"] = False
+        payload["_tuning_snapshot"] = supervisor._resolve_request_tuning(payload)
+        _FakeAsyncClient.decode_mode = "native-incremental-pcm"
+        with self.assertRaises(HTTPException) as error:
+            asyncio.run(supervisor._voice_clone_response(payload))
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertEqual(error.exception.detail["state"], "decoder-mode-mismatch")
 
     def test_proven_offline_decoder_mismatch_is_a_hard_error(self) -> None:
         _FakeAsyncClient.decode_mode = "native-incremental-pcm"

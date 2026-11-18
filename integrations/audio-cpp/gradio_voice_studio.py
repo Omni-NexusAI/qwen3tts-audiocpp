@@ -36,8 +36,12 @@ import httpx
 MODULE_DIR = Path(__file__).resolve().parent
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
-from profile_library import PROFILE_PROVIDER, canonical_profile, live_profiles, valid_profile_id
-
+from profile_library import (  # noqa: E402
+    PROFILE_PROVIDER,
+    canonical_profile,
+    live_profiles,
+    valid_profile_id,
+)
 
 # -----------------------------------------------------------------------------
 # Configuration and Defaults
@@ -72,8 +76,8 @@ STUDIO_PLAYBACK_WORKLET_URL = "/worklets/studio-playback.js?v=20260805-1"
 
 
 def default_playback_mode() -> str:
-    """Prefer true native PCM whenever this candidate process enables it."""
-    return NATIVE_PLAYBACK_MODE if NATIVE_INCREMENTAL_PCM_ENABLED else BUFFERED_PLAYBACK_MODE
+    """Keep the rollback-safe buffered path selected during native repair."""
+    return BUFFERED_PLAYBACK_MODE
 
 
 DEFAULT_PLAYBACK_MODE = default_playback_mode()
@@ -92,6 +96,10 @@ DEFAULT_REFERENCE_LINE = (
 # Fallback voices list used when the server does not provide a voices
 # endpoint or fails to return names.
 FALLBACK_VOICES = ["Vivian", "Ryan", "Serena", "Dylan", "Eric", "Aiden"]
+
+
+def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    """Retained as a no-op compatibility hook for the recovered Studio."""
 
 
 @dataclass
@@ -241,21 +249,21 @@ def write_bytes_to_temp_audio(content: bytes, ext: str) -> str:
 
 def pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
     """Convert raw PCM bytes to WAV format with proper header."""
-    import struct
     import io
-    
+    import struct
+
     bytes_per_sample = bits_per_sample // 8
     byte_rate = sample_rate * num_channels * bytes_per_sample
     block_align = num_channels * bytes_per_sample
     data_size = len(pcm_bytes)
-    
+
     buffer = io.BytesIO()
-    
+
     # RIFF header
     buffer.write(b'RIFF')
     buffer.write(struct.pack('<I', 36 + data_size))  # File size - 8
     buffer.write(b'WAVE')
-    
+
     # Format chunk
     buffer.write(b'fmt ')
     buffer.write(struct.pack('<I', 16))  # Chunk size
@@ -265,12 +273,12 @@ def pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000, num_channels: int = 1
     buffer.write(struct.pack('<I', byte_rate))
     buffer.write(struct.pack('<H', block_align))
     buffer.write(struct.pack('<H', bits_per_sample))
-    
+
     # Data chunk
     buffer.write(b'data')
     buffer.write(struct.pack('<I', data_size))
     buffer.write(pcm_bytes)
-    
+
     return buffer.getvalue()
 
 
@@ -685,7 +693,8 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
         try:
             with httpx.Client(timeout=10.0) as client:
                 response = client.get(f"{base_url.rstrip('/')}/v1/tuning/profiles")
-                response.raise_for_status(); payload = response.json()
+                response.raise_for_status()
+                payload = response.json()
             profiles = list((payload.get("profiles") or {}).values())
             choices = [(f"{p.get('name', p.get('id'))} — {p.get('first_block_frames', 0) * 80}/{p.get('steady_block_frames', 0) * 80} ms", p.get("id")) for p in profiles]
             studio_selections = (payload.get("selections") or {}).get("voice-studio") or {}
@@ -704,7 +713,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                 gr.update(choices=choices, value=selected), status,
                 gr.update(value=profile.get("name", "")), gr.update(value=profile.get("revision", 1)),
                 gr.update(value=profile.get("first_block_frames", 4)), gr.update(value=profile.get("steady_block_frames", 12)),
-                gr.update(value=profile.get("left_context_frames", 72)), gr.update(value=profile.get("max_reference_seconds", 20)),
+                gr.update(value=profile.get("left_context_frames", 25)), gr.update(value=profile.get("max_reference_seconds", 20)),
                 gr.update(value=profile.get("model") or ""), gr.update(value=profile.get("text_lookahead", 64)),
                 gr.update(value=profile.get("phrase_flush_ms", 500)), gr.update(value=profile.get("temperature", 1.0)),
                 gr.update(value=profile.get("top_k", 50)), gr.update(value=profile.get("top_p", 0.95)),
@@ -785,7 +794,8 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
         try:
             with httpx.Client(timeout=15.0) as client:
                 response = client.post(f"{base_url.rstrip('/')}/v1/tuning/resolve", json={"provider": PROFILE_PROVIDER, "scope": "voice-studio", "profile_id": profile_id, "overrides": overrides})
-            if response.status_code == 409: return f"Resident model mismatch: {response.text}", current or {}
+            if response.status_code == 409:
+                return f"Resident model mismatch: {response.text}", current or {}
             response.raise_for_status()
             return (
                 f"**Named profile:** `{profile_id}` · **Temporary overrides:** {len(overrides)} active · "
@@ -804,19 +814,22 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
 
     def export_tuning_json(base_url: str) -> str:
         with httpx.Client(timeout=15.0) as client:
-            response = client.get(f"{base_url.rstrip('/')}/v1/tuning/export"); response.raise_for_status()
+            response = client.get(f"{base_url.rstrip('/')}/v1/tuning/export")
+            response.raise_for_status()
         return json.dumps(response.json(), indent=2)
 
     def import_tuning_json(base_url: str, document: str) -> str:
         try:
             with httpx.Client(timeout=15.0) as client:
                 response = client.post(f"{base_url.rstrip('/')}/v1/tuning/import", json=json.loads(document))
-            response.raise_for_status(); return "Tuning profiles imported safely; built-ins preserved."
-        except Exception as exc: return f"Import rejected: {exc}"
+            response.raise_for_status()
+            return "Tuning profiles imported safely; built-ins preserved."
+        except Exception as exc:
+            return f"Import rejected: {exc}"
+
     with gr.Blocks(title="Qwen3 Voice Studio", css=CSS, theme=orange_theme()) as demo:
         # Shared state variables
         state_base_url = gr.State(initial_base_url)
-        state_library_dir = gr.State(str(initial_library_dir))
         state_voices = gr.State([])
 
         # Header section
@@ -887,10 +900,10 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                         tuning_repetition = gr.Number(label="[audio.cpp engine] Repetition penalty", value=1.05)
                         tuning_seed = gr.Textbox(label="[audio.cpp engine] Seed", info="Blank means random; otherwise enter an unsigned 32-bit integer.")
                 with gr.Group():
-                    gr.Markdown("#### Expert safety\nThe model requires 72 decoder-context frames for stable quality. Lower values are an unsafe experiment.")
+                    gr.Markdown("#### Expert safety\nThe model requires 25 decoder-context frames (2 seconds) for stable quality. Lower values are an unsafe experiment.")
                     with gr.Row():
                         tuning_model = gr.Textbox(label="[safety] Required resident model", placeholder="Leave blank for current resident model")
-                        tuning_context = gr.Number(label="[experimental] Decoder context (frames × 80 ms)", value=72, precision=0, interactive=False, info="Unlock explicitly to test below the required 72-frame context.")
+                        tuning_context = gr.Number(label="[experimental] Decoder context (frames × 80 ms)", value=25, precision=0, interactive=False, info="The authoritative causal context is 25 frames (2 seconds); only lower values require explicit experimental testing.")
                         tuning_context_unlock = gr.Checkbox(label="Unlock unsafe decoder-context editing", value=False, interactive=NATIVE_INCREMENTAL_PCM_ENABLED)
                     gr.Markdown("**Fixed/inactive capabilities:** PCM16 at 24 kHz · full-ICL clone mode · x-vector-only unavailable · overlap/crossfade fixed at 0.", elem_classes=["small"])
                 with gr.Accordion("Advanced request overrides (session-only)", open=False):
@@ -1192,7 +1205,7 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                                 allow_custom_value=True,
                             )
                             gr.Markdown(
-                                "**Widget settings** (endpoint, model, API key, system prompt) are stored in your browser's local storage.",
+                                "**Widget settings:** Save stores non-secret connection and tuning preferences locally. The API key stays in this page session unless you explicitly enable Remember API key.",
                                 elem_classes=["small"],
                             )
                         with gr.Column(scale=2, min_width=480):
@@ -1678,7 +1691,7 @@ if (typeof Alpine === 'undefined') {
                 .replace('__TTS_BASE_URL__', tts_base_url)
                 .replace('__VOICE_NAME__', voice_name)
                 .replace('__UID__', uid)
-                .replace('__UID__', uid)) 
+                .replace('__UID__', uid))
 
         def _build_streaming_widget_html(
             tts_base_url: str,
@@ -1716,8 +1729,20 @@ if (typeof Alpine === 'undefined') {
             first_block_frames = int(effective_overrides.get("first_block_frames", first_block_frames))
             steady_block_frames = int(effective_overrides.get("steady_block_frames", steady_block_frames))
             phrase_hard_cap = max(96, min(512, int(text_lookahead) * 4))
+            # Cold priming admits the first emitted codec block only.  The
+            # steady block describes the cadence needed after playback starts;
+            # including it here doubled the initial reservoir and made the
+            # explicit low-latency profile needlessly slow.
             startup_ms = (
-                max(1, first_block_frames + steady_block_frames) * 80
+                max(1, first_block_frames) * 80
+                if native_streaming
+                else 0
+            )
+            # A real underrun is not another cold start. Re-prime only to the
+            # steady decoder cadence; the worklet keeps this bounded below the
+            # same two-second ceiling as the first reservoir.
+            reprime_ms = (
+                min(2000, max(80, steady_block_frames * 80))
                 if native_streaming
                 else 0
             )
@@ -1737,8 +1762,10 @@ if (typeof Alpine === 'undefined') {
                     "phraseFlushMs": max(100, min(3000, int(phrase_flush_ms))),
                     "phraseHardCap": phrase_hard_cap,
                     "playbackStartupMs": startup_ms,
+                    "playbackReprimeMs": reprime_ms,
                     "playbackWorkletUrl": STUDIO_PLAYBACK_WORKLET_URL,
                     "tuningProfileId": tuning_profile_id,
+                    "nativeStreamingAvailable": NATIVE_INCREMENTAL_PCM_ENABLED,
                     "nativeStreaming": native_streaming,
                     "streamingMode": "native-incremental-pcm" if native_streaming else "buffered-fallback",
                     "tuning": request_tuning,
@@ -2121,6 +2148,13 @@ if (typeof Alpine === 'undefined') {
     <div class="sv-settings-title">Progressive PCM diagnostics</div>
     <p class="sv-status" data-role="phrase-policy"></p>
     <p class="sv-status" data-role="capture-diagnostics">Mic transport: WAV PCM16 at 16 kHz. Waiting for a turn.</p>
+    <label class="sv-field"><span class="sv-field-label">Local diagnostic WAV <span class="sv-help" tabindex="0" title="Explicit test only: send a selected local clip through this widget's normal LLM, frozen snapshot, TTS and playback path. This does not test microphone capture or VAD and never records ordinary conversations.">i</span></span>
+      <input data-role="diagnostic-clip" type="file" accept=".wav,audio/wav">
+    </label>
+    <div class="sv-row">
+      <button class="sv-button sv-button-secondary" data-action="send-diagnostic-clip" type="button">Send diagnostic clip</button>
+      <button class="sv-button sv-button-secondary" data-action="cancel-diagnostic-clip" type="button">Cancel diagnostic turn</button>
+    </div>
     <p class="sv-status"><b>Output transport:</b> model-native PCM16 at 24 kHz. Phrase sizing affects latency and prosody only; it does not change model resolution or bitrate.</p>
     <p class="sv-status"><span class="sv-help" tabindex="0" title="Stop cancels the active microphone, LLM, or phrase TTS request. A new turn increments cancellation identity so late audio is ignored.">i</span> __STREAMING_DISCLOSURE__</p>
   </div>
@@ -2199,7 +2233,8 @@ if (typeof Alpine === 'undefined') {
     'user-empty', 'voice-badge', 'voice-name', 'voice-wave', 'ttf', 'tts',
     'ai-audio', 'ai-empty', 'transcript', 'clear', 'speech-threshold',
     'start-hold', 'silence-delay', 'min-utterance', 'max-utterance', 'pre-roll', 'phrase-policy',
-    'llm-input-format', 'llm-input-rate', 'capture-diagnostics', 'tts-mode'
+    'llm-input-format', 'llm-input-rate', 'capture-diagnostics', 'tts-mode',
+    'diagnostic-clip', 'send-diagnostic-clip', 'cancel-diagnostic-clip'
   ].forEach(function(name) {
     refs[name] = root.querySelector('[data-role="' + name + '"], [data-action="' + name + '"]');
   });
@@ -2236,7 +2271,25 @@ if (typeof Alpine === 'undefined') {
     phraseText: '',
     phraseQueue: [],
     phrasePumping: false,
+    // A provider failure ends this answer's phrase pipeline.  Retain the
+    // response snapshot only long enough to drain audio already accepted by
+    // the turn-scoped worklet; never dispatch a later phrase under it.
+    ttsFailureTerminal: false,
     llmFinished: false,
+    // Captured once at the first stable assistant phrase. Do not rebuild it
+    // from mutable Studio controls for later phrases in this answer.
+    responseSnapshot: null,
+    responseSnapshotPromise: null,
+    responseSnapshotTurn: null,
+    phraseIndex: 0,
+    // Control changes are deliberately retained for the next accepted answer.
+    // Replacing this Gradio HTML node mid-answer would discard the active
+    // requests, AudioWorklet queue, and immutable response snapshot.
+    pendingNextResponseConfig: null,
+    // Llama.cpp can reach EOS while the first stable phrase is still waiting
+    // for immutable settings.  Retain that tail until the snapshot dispatches
+    // it instead of treating the answer as complete prematurely.
+    finalPhrasePending: false,
     playbackNode: null,
     playbackModulePromise: null,
     playbackReadyPromise: null,
@@ -2692,13 +2745,21 @@ if (typeof Alpine === 'undefined') {
 
   function stopLiveMic() {
     state.turnId += 1;
+    state.phrasePumping = false;
     state.phraseQueue = [];
     state.phraseText = '';
     state.llmFinished = false;
+    state.ttsFailureTerminal = false;
+    state.responseSnapshot = null;
+    state.responseSnapshotPromise = null;
+    state.responseSnapshotTurn = null;
+    state.finalPhrasePending = false;
     if (state.activeLlmRequest) { state.activeLlmRequest.abort(); state.activeLlmRequest = null; }
     if (state.activeTtsRequest) { state.activeTtsRequest.abort(); state.activeTtsRequest = null; }
     cancelScheduledPlayback();
     setLive(false);
+    setSpeaking(false);
+    setProcessing(false);
     discardSpeechSegment('');
     if (state.captureNode) { try { state.captureNode.disconnect(); } catch (err) {} state.captureNode = null; }
     if (state.captureModuleUrl) { URL.revokeObjectURL(state.captureModuleUrl); state.captureModuleUrl = null; }
@@ -2716,17 +2777,29 @@ if (typeof Alpine === 'undefined') {
   }
 
   function sendToLLM(audioBlob) {
+    // A control update never replaces this widget while a response is active.
+    // Apply the deferred profile/mode only as a new accepted turn starts, so
+    // this response receives one immutable snapshot from its first phrase.
+    applyNextResponseConfig();
     if (state.activeLlmRequest) { state.activeLlmRequest.abort(); state.activeLlmRequest = null; }
     if (state.activeTtsRequest) { state.activeTtsRequest.abort(); state.activeTtsRequest = null; }
     cancelScheduledPlayback();
     state.turnId += 1;
     var llmTurn = state.turnId;
-    beginPlaybackTurn(llmTurn).catch(function(error) {
+    // The response snapshot freezes the profile-derived priming values before
+    // the first phrase.  Do not begin the worklet with mutable widget values.
+    ensurePlaybackQueue().catch(function(error) {
       if (llmTurn === state.turnId) setStatus('PCM playback setup failed: ' + error.message);
     });
     state.phraseText = '';
     state.phraseQueue = [];
     state.phrasePumping = false;
+    state.ttsFailureTerminal = false;
+    state.responseSnapshot = null;
+    state.responseSnapshotPromise = null;
+    state.responseSnapshotTurn = null;
+    state.phraseIndex = 0;
+    state.finalPhrasePending = false;
     state.llmFinished = false;
     state.pcmChunks = [];
     state.ttsStartedAt = 0;
@@ -2832,6 +2905,7 @@ if (typeof Alpine === 'undefined') {
           }).catch(function(err) {
             if (state.activeLlmRequest === llmController) state.activeLlmRequest = null;
             if (llmTurn !== state.turnId) return;
+            if (state.ttsFailureTerminal) return;
             setProcessing(false);
             if (err.name === 'AbortError') {
               setStatus(state.isLive ? 'LLM turn cancelled. Listening.' : 'LLM turn cancelled.');
@@ -2845,6 +2919,7 @@ if (typeof Alpine === 'undefined') {
       }).catch(function(err) {
         if (state.activeLlmRequest === llmController) state.activeLlmRequest = null;
         if (llmTurn !== state.turnId) return;
+        if (state.ttsFailureTerminal) return;
         setProcessing(false);
         if (err.name === 'AbortError') {
           setStatus(state.isLive ? 'LLM turn cancelled. Listening.' : 'LLM turn cancelled.');
@@ -2865,6 +2940,41 @@ if (typeof Alpine === 'undefined') {
       float32Data[i] = sample / 32768.0;
     }
     return float32Data;
+  }
+
+  async function sendDiagnosticClip() {
+    if (state.isLive || state.isProcessing || state.isSpeaking) {
+      setStatus('Stop the live microphone or cancel the active response before sending a diagnostic clip.');
+      return;
+    }
+    var file = refs['diagnostic-clip'].files && refs['diagnostic-clip'].files[0];
+    if (!file || !/\.wav$/i.test(file.name) || !file.size || file.size > 10 * 1024 * 1024) {
+      setStatus('Choose a complete local WAV diagnostic clip, up to 10 MiB and 30 seconds.');
+      return;
+    }
+    var turnId = state.turnId;
+    setProcessing(true);
+    try {
+      var context = getAudioContext();
+      await context.resume();
+      var decoded = await context.decodeAudioData(await file.arrayBuffer());
+      if (turnId !== state.turnId) return;
+      if (!decoded.length || decoded.duration > 30) throw new Error('Diagnostic clip must contain at most 30 seconds of audio.');
+      var mono = new Float32Array(decoded.length);
+      for (var channel = 0; channel < decoded.numberOfChannels; channel++) {
+        var samples = decoded.getChannelData(channel);
+        for (var index = 0; index < samples.length; index++) mono[index] += samples[index] / decoded.numberOfChannels;
+      }
+      var targetRate = parseInt(refs['llm-input-rate'].value, 10) || 16000;
+      var wav = pcmToWav(resamplePcm(mono, decoded.sampleRate, targetRate), targetRate);
+      refs['capture-diagnostics'].textContent = 'Explicit local diagnostic clip: ' + decoded.duration.toFixed(2) + ' s; ' + targetRate + ' Hz WAV source. Microphone and VAD bypassed.';
+      sendToLLM(wav);
+    } catch (error) {
+      if (turnId === state.turnId) {
+        setProcessing(false);
+        setStatus('Diagnostic clip failed: ' + error.message);
+      }
+    }
   }
 
   function onPlaybackEvent(message) {
@@ -2918,7 +3028,7 @@ if (typeof Alpine === 'undefined') {
     return state.playbackModulePromise;
   }
 
-  function beginPlaybackTurn(turnId) {
+  function beginPlaybackTurn(turnId, responseSnapshot) {
     state.playbackEndSent = false;
     state.playbackQueuedMs = 0;
     state.playbackUnderruns = 0;
@@ -2926,26 +3036,29 @@ if (typeof Alpine === 'undefined') {
       if (turnId !== state.turnId) return null;
       node.port.postMessage({
         kind: 'begin', turnId: turnId, inputRate: config.sampleRate,
-        startupMs: config.nativeStreaming ? config.playbackStartupMs : 0
+        startupMs: responseSnapshot && responseSnapshot.nativeStreaming
+          ? responseSnapshot.playbackStartupMs : (config.nativeStreaming ? config.playbackStartupMs : 0),
+        reprimeMs: responseSnapshot && responseSnapshot.nativeStreaming
+          ? responseSnapshot.playbackReprimeMs : (config.nativeStreaming ? config.playbackReprimeMs : 0)
       });
       return node;
     });
     return state.playbackReadyPromise;
   }
 
-  function enqueuePcmForTurn(pcmData, sampleRate, turnId) {
+  function enqueuePcmForTurn(pcmData, sampleRate, turnId, responseSnapshot) {
     var samples = pcm16ToFloat32(pcmData);
-    var ready = state.playbackReadyPromise || beginPlaybackTurn(turnId);
+    var ready = state.playbackReadyPromise || beginPlaybackTurn(turnId, responseSnapshot);
     return ready.then(function(node) {
       if (!node || turnId !== state.turnId) return;
       node.port.postMessage({ kind: 'audio', turnId: turnId, samples: samples }, [samples.buffer]);
     });
   }
 
-  function finishPlaybackTurn(turnId) {
+  function finishPlaybackTurn(turnId, responseSnapshot) {
     if (state.playbackEndSent) return Promise.resolve();
     state.playbackEndSent = true;
-    var ready = state.playbackReadyPromise || beginPlaybackTurn(turnId);
+    var ready = state.playbackReadyPromise || beginPlaybackTurn(turnId, responseSnapshot);
     return ready.then(function(node) {
       if (!node || turnId !== state.turnId) return;
       node.port.postMessage({ kind: 'end', turnId: turnId });
@@ -2955,6 +3068,10 @@ if (typeof Alpine === 'undefined') {
   function cancelScheduledPlayback() {
     state.playbackEndSent = true;
     state.playbackQueuedMs = 0;
+    // The next accepted turn must issue its own `begin` with its frozen
+    // profile.  Retaining the old readiness promise would bind new PCM to the
+    // prior turn's worklet queue.
+    state.playbackReadyPromise = null;
     if (state.playbackNode) {
       state.playbackNode.port.postMessage({ kind: 'clear', turnId: state.turnId });
     }
@@ -3013,49 +3130,266 @@ if (typeof Alpine === 'undefined') {
     return !!phrase;
   }
 
-  function drainImmediateAndCappedPhrases() {
+  function randomUint32() {
+    var values = new Uint32Array(1);
+    if (window.crypto && window.crypto.getRandomValues) {
+      window.crypto.getRandomValues(values);
+      return values[0];
+    }
+    return Math.floor(Math.random() * 0x100000000) >>> 0;
+  }
+
+  function responseForSnapshot(response, label) {
+    if (!response.ok) return response.text().then(function(body) {
+      throw new Error(label + ' snapshot failed (' + response.status + '): ' + body);
+    });
+    return response.json();
+  }
+
+  // Capture the existing supervisor contracts once at the first stable phrase.
+  // Later phrases carry the same clone bytes, engine lifecycle, profile revision,
+  // effective sampler values, language, and one response-scoped seed.
+  function freezeResponseSnapshot(turnId) {
+    if (state.responseSnapshot && state.responseSnapshotTurn === turnId) return Promise.resolve(state.responseSnapshot);
+    if (state.responseSnapshotPromise && state.responseSnapshotTurn === turnId) return state.responseSnapshotPromise;
+    state.responseSnapshotTurn = turnId;
+    var profileId = String(config.ttsVoice || '').replace(/^clone:/, '');
+    if (!profileId) return Promise.reject(new Error('Choose a Base clone before starting speech.'));
+    var tuningRequest = {
+      provider: 'qwen3tts-audiocpp', scope: 'voice-studio', profile_id: config.tuningProfileId,
+      overrides: (config.tuning && config.tuning.overrides) || {}
+    };
+    state.responseSnapshotPromise = Promise.all([
+      fetch(config.proxyBaseUrl + '/control/status', { cache: 'no-store' }).then(function(r) { return responseForSnapshot(r, 'engine lifecycle'); }),
+      fetch(config.proxyBaseUrl + '/v1/voices/profiles/' + encodeURIComponent(profileId), { cache: 'no-store' }).then(function(r) { return responseForSnapshot(r, 'clone'); }),
+      fetch(config.proxyBaseUrl + '/tuning/resolve', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(tuningRequest), cache: 'no-store'
+      }).then(function(r) { return responseForSnapshot(r, 'tuning'); })
+    ]).then(function(values) {
+      if (turnId !== state.turnId) throw new DOMException('Turn superseded', 'AbortError');
+      var status = values[0], clone = values[1], tuningResult = values[2];
+      if (!status || status.state !== 'loaded' || !status.activeModel) throw new Error('No audio.cpp model is resident for this response snapshot.');
+      if (!clone || clone.profile_id !== profileId || !clone.content_hash || !clone.ref_audio || !clone.ref_text) {
+        throw new Error('The selected Base clone cannot provide immutable conditioning material.');
+      }
+      var effective = Object.assign({}, tuningResult.profile || {}, tuningResult.temporaryOverrides || {});
+      var allowed = ['model', 'clone_mode', 'max_reference_seconds', 'first_block_frames', 'steady_block_frames',
+        'left_context_frames', 'text_lookahead', 'phrase_flush_ms', 'temperature', 'top_k',
+        'top_p', 'repetition_penalty', 'seed'];
+      var frozenEffective = {};
+      allowed.forEach(function(key) { if (Object.prototype.hasOwnProperty.call(effective, key)) frozenEffective[key] = effective[key]; });
+      var seed = Number.isInteger(frozenEffective.seed) && frozenEffective.seed >= 0 && frozenEffective.seed <= 0xffffffff
+        ? frozenEffective.seed : randomUint32();
+      frozenEffective.seed = seed;
+      var profile = tuningResult.profile || {};
+      var snapshot = {
+        provider: 'qwen3tts-audiocpp', model: status.activeModel, engineEpoch: Number(status.engineEpoch),
+        supervisorInstanceId: String(status.supervisorInstanceId || ''), cloneId: profileId,
+        cloneFingerprint: String(clone.content_hash), cloneRevision: Number(clone.content_revision),
+        profileId: String(profile.id || config.tuningProfileId), profileRevision: Number(profile.revision),
+        language: clone.language || config.language || 'Auto', nativeStreaming: !!config.nativeStreaming, seed: seed,
+        cloneSnapshot: { profile_id: profileId, content_hash: clone.content_hash, content_revision: clone.content_revision,
+          ref_audio: clone.ref_audio, ref_text: clone.ref_text, reference_excerpts: clone.reference_excerpts || [] },
+        tuning: { provider: 'qwen3tts-audiocpp', scope: 'voice-studio', profile_id: String(profile.id || config.tuningProfileId),
+          profile_revision: Number(profile.revision), effective: frozenEffective, overrides: { seed: seed } }
+      };
+      // Phrase scheduling is part of one audible answer.  Do not reread live
+      // widget values after the first stable phrase: a profile switch while
+      // llama.cpp is still generating must apply only to the next answer.
+      var frozenLookahead = Number(frozenEffective.text_lookahead);
+      if (!Number.isFinite(frozenLookahead)) frozenLookahead = Number(config.textLookahead);
+      frozenLookahead = Math.max(8, Math.min(512, Math.round(frozenLookahead || 64)));
+      var frozenFlushMs = Number(frozenEffective.phrase_flush_ms);
+      if (!Number.isFinite(frozenFlushMs)) frozenFlushMs = Number(config.phraseFlushMs);
+      frozenFlushMs = Math.max(100, Math.min(3000, Math.round(frozenFlushMs || 500)));
+      snapshot.phrasePolicy = {
+        textLookahead: frozenLookahead,
+        phraseFlushMs: frozenFlushMs,
+        phraseHardCap: Math.max(96, Math.min(512, frozenLookahead * 4))
+      };
+      // Cold priming is one first codec block.  Underrun recovery remains
+      // steady-cadence based and is enforced by the worklet's two-second cap.
+      var firstFrames = Math.max(1, Math.round(Number(frozenEffective.first_block_frames) || 1));
+      var steadyFrames = Math.max(1, Math.round(Number(frozenEffective.steady_block_frames) || 1));
+      snapshot.playbackStartupMs = snapshot.nativeStreaming ? firstFrames * 80 : 0;
+      snapshot.playbackReprimeMs = snapshot.nativeStreaming ? Math.min(2000, Math.max(80, steadyFrames * 80)) : 0;
+      if (!Number.isSafeInteger(snapshot.engineEpoch) || snapshot.engineEpoch < 0 || !/^[0-9a-f]{32}$/.test(snapshot.supervisorInstanceId)
+          || !Number.isSafeInteger(snapshot.cloneRevision) || snapshot.cloneRevision < 1
+          || !Number.isSafeInteger(snapshot.profileRevision) || snapshot.profileRevision < 1) {
+        throw new Error('Candidate returned an incomplete immutable response snapshot.');
+      }
+      state.responseSnapshot = snapshot;
+      console.info('[voice-studio] response snapshot frozen', {
+        turn_id: turnId, model: snapshot.model, engine_epoch: snapshot.engineEpoch,
+        clone_fingerprint: snapshot.cloneFingerprint, profile_revision: snapshot.profileRevision,
+        language: snapshot.language, seed: snapshot.seed
+      });
+      return snapshot;
+    }).finally(function() {
+      if (turnId === state.turnId) state.responseSnapshotPromise = null;
+    });
+    return state.responseSnapshotPromise;
+  }
+
+  // Keep the request construction itself response-scoped as well. This makes
+  // an accidental read from a live control impossible after the first phrase.
+  function ttsPayloadForPhrase(phrase, responseSnapshot) {
+    return {
+      input: phrase,
+      model: responseSnapshot.model,
+      voice: 'clone:' + responseSnapshot.cloneId,
+      language: responseSnapshot.language,
+      response_format: 'pcm',
+      stream: responseSnapshot.nativeStreaming,
+      tuning: responseSnapshot.tuning,
+      clone_snapshot: responseSnapshot.cloneSnapshot,
+      expected_engine_epoch: responseSnapshot.engineEpoch,
+      expected_supervisor_instance_id: responseSnapshot.supervisorInstanceId
+    };
+  }
+
+  function phrasePolicyForResponse() {
+    var snapshot = state.responseSnapshot;
+    if (snapshot && state.responseSnapshotTurn === state.turnId && snapshot.phrasePolicy) {
+      return snapshot.phrasePolicy;
+    }
+    var lookahead = Math.max(8, Math.min(512, Number(config.textLookahead) || 64));
+    return {
+      textLookahead: lookahead,
+      phraseFlushMs: Math.max(100, Math.min(3000, Number(config.phraseFlushMs) || 500)),
+      phraseHardCap: Math.max(96, Math.min(512, Number(config.phraseHardCap) || lookahead * 4))
+    };
+  }
+
+  function responseIsActive() {
+    return !!(
+      state.isProcessing || state.isSpeaking || state.activeLlmRequest ||
+      state.activeTtsRequest || state.phrasePumping ||
+      state.responseSnapshot || state.responseSnapshotPromise
+    );
+  }
+
+  function applyNextResponseConfig() {
+    var next = state.pendingNextResponseConfig;
+    if (!next) return false;
+    state.pendingNextResponseConfig = null;
+    var profileId = String(next.profileId || '').trim();
+    if (!profileId) return false;
+    config.ttsVoice = 'clone:' + profileId;
+    config.profileLabel = profileId;
+    config.voiceName = profileId;
+    config.tuningProfileId = String(next.tuningProfileId || config.tuningProfileId || 'balanced');
+    config.tuning = {
+      provider: 'qwen3tts-audiocpp',
+      scope: 'voice-studio',
+      profile_id: config.tuningProfileId,
+      overrides: next.sessionTuning && typeof next.sessionTuning.overrides === 'object'
+        ? Object.assign({}, next.sessionTuning.overrides) : {}
+    };
+    config.nativeStreaming = String(next.playbackMode || '').indexOf('Native incremental PCM') === 0
+      && !!config.nativeStreamingAvailable;
+    config.streamingMode = config.nativeStreaming ? 'native-incremental-pcm' : 'buffered-fallback';
+    if (refs['voice-name']) refs['voice-name'].textContent = profileId;
+    if (refs['tts-mode']) refs['tts-mode'].textContent = config.nativeStreaming
+      ? 'Native PCM (experimental)' : 'Buffered phrase PCM';
+    return true;
+  }
+
+  function queueNextResponseConfig(detail) {
+    state.pendingNextResponseConfig = detail || null;
+    if (responseIsActive()) {
+      setStatus('Settings queued for the next response; the active answer keeps its frozen clone, profile, language, seed, and playback mode.');
+      return false;
+    }
+    var applied = applyNextResponseConfig();
+    if (applied) setStatus('Settings applied for the next response.');
+    return applied;
+  }
+
+  window.addEventListener('voice-studio-next-config', function(event) {
+    queueNextResponseConfig((event && event.detail) || {});
+  });
+
+  function requestSnapshotForPhraseDispatch(turnId) {
+    if (state.responseSnapshot || state.responseSnapshotPromise) return;
+    freezeResponseSnapshot(turnId).then(function() {
+      if (turnId === state.turnId) queueProgressiveSpeech('', false);
+    }).catch(function(error) {
+      if (turnId === state.turnId) {
+        setProcessing(false);
+        setStatus(error.name === 'AbortError' ? 'Response snapshot cancelled.' : 'Response snapshot failed: ' + error.message);
+      }
+    });
+  }
+
+  function drainImmediateAndCappedPhrases(policy) {
     while (state.phraseText) {
       var immediate = findImmediateBoundary(state.phraseText);
       if (immediate > 0) {
         enqueueStablePhrase(immediate);
         continue;
       }
-      if (state.phraseText.length < config.phraseHardCap) break;
-      var safeCut = findSafePhraseCut(state.phraseText, config.phraseHardCap);
+      if (state.phraseText.length < policy.phraseHardCap) break;
+      var safeCut = findSafePhraseCut(state.phraseText, policy.phraseHardCap);
       if (safeCut <= 0) break;
       enqueueStablePhrase(safeCut);
     }
   }
 
   function queueProgressiveSpeech(delta, final) {
+    if (state.ttsFailureTerminal) return;
     if (delta) state.phraseText += delta;
-    drainImmediateAndCappedPhrases();
     if (state.phraseIdleTimer) { clearTimeout(state.phraseIdleTimer); state.phraseIdleTimer = null; }
-    if (final) {
+    if (final) state.finalPhrasePending = true;
+    var policy = phrasePolicyForResponse();
+    // Capture once a stable phrase (or EOS tail) is available, then hold every
+    // phrase cut while it resolves. Later live-widget changes cannot split the
+    // current answer under a different profile.
+    if (!state.responseSnapshot) {
+      var firstBoundary = findImmediateBoundary(state.phraseText);
+      if (state.finalPhrasePending || firstBoundary > 0 || state.phraseText.length >= policy.textLookahead) {
+        requestSnapshotForPhraseDispatch(state.turnId);
+      } else {
+        state.phraseIdleTimer = setTimeout(function() {
+          state.phraseIdleTimer = null;
+          if (state.phraseText.trim() && !state.responseSnapshot) requestSnapshotForPhraseDispatch(state.turnId);
+        }, policy.phraseFlushMs);
+      }
+      return;
+    }
+    policy = phrasePolicyForResponse();
+    drainImmediateAndCappedPhrases(policy);
+    if (state.finalPhrasePending) {
       if (state.phraseText.trim()) state.phraseQueue.push(state.phraseText.trim());
       state.phraseText = '';
       state.llmFinished = true;
-    } else if (state.phraseText.length >= config.textLookahead) {
+      state.finalPhrasePending = false;
+    } else if (state.phraseText.length >= policy.textLookahead) {
       state.phraseIdleTimer = setTimeout(function() {
         state.phraseIdleTimer = null;
-        var safeCut = findSafePhraseCut(state.phraseText, Math.min(state.phraseText.length, config.phraseHardCap));
+        var currentPolicy = phrasePolicyForResponse();
+        var safeCut = findSafePhraseCut(state.phraseText, Math.min(state.phraseText.length, currentPolicy.phraseHardCap));
         if (safeCut > 0) {
           enqueueStablePhrase(safeCut);
-          drainImmediateAndCappedPhrases();
+          drainImmediateAndCappedPhrases(currentPolicy);
           pumpProgressiveSpeech();
         }
-      }, config.phraseFlushMs);
+      }, policy.phraseFlushMs);
     }
     pumpProgressiveSpeech();
   }
 
   function pumpProgressiveSpeech() {
+    if (state.ttsFailureTerminal) return;
     if (state.phrasePumping) return;
     var phrase = state.phraseQueue.shift();
     if (!phrase) {
       if (state.llmFinished) {
+        var responseStreaming = state.responseSnapshot
+          ? state.responseSnapshot.nativeStreaming
+          : !!config.nativeStreaming;
         state.ttsMs = Math.round(performance.now() - state.ttsStartedAt);
-        refs.tts.textContent = config.nativeStreaming && state.ttsFirstPcmMs !== null
+        refs.tts.textContent = responseStreaming && state.ttsFirstPcmMs !== null
           ? state.ttsFirstPcmMs + 'ms first PCM / ' + state.ttsMs + 'ms total'
           : state.ttsMs + 'ms buffered phrase PCM';
         if (state.pcmChunks.length) {
@@ -3063,38 +3397,59 @@ if (typeof Alpine === 'undefined') {
           state.aiAudioUrl = URL.createObjectURL(pcmChunksToWav(state.pcmChunks, config.sampleRate));
           showAudio(refs['ai-audio'], refs['ai-empty'], state.aiAudioUrl);
         }
-        finishPlaybackTurn(state.turnId).catch(function(error) {
+        finishPlaybackTurn(state.turnId, state.responseSnapshot).catch(function(error) {
           setSpeaking(false); setProcessing(false);
           setStatus('PCM playback finalization failed: ' + error.message);
         });
-        setStatus(config.nativeStreaming
+        setStatus(responseStreaming
           ? 'Native synthesis complete; the continuous PCM queue is draining.'
           : 'Buffered phrase synthesis complete; the continuous PCM queue is draining.');
       }
       return;
     }
+    var currentTurn = state.turnId;
+    // Freeze before dispatching the first phrase. Requeue it at the front so
+    // phrase order remains exact while the snapshot is being admitted.
+    if (!state.responseSnapshot || state.responseSnapshotTurn !== currentTurn) {
+      state.phrasePumping = true;
+      freezeResponseSnapshot(currentTurn).then(function() {
+        if (currentTurn === state.turnId) {
+          state.phrasePumping = false;
+          state.phraseQueue.unshift(phrase);
+          pumpProgressiveSpeech();
+        }
+      }).catch(function(error) {
+        if (currentTurn === state.turnId) {
+          state.phrasePumping = false;
+          setProcessing(false);
+          setStatus(error.name === 'AbortError' ? 'Response snapshot cancelled.' : 'Response snapshot failed: ' + error.message);
+        }
+      });
+      return;
+    }
     state.phrasePumping = true;
     if (!state.ttsStartedAt) state.ttsStartedAt = performance.now();
     state.activeTtsRequest = new AbortController();
-    var currentTurn = state.turnId;
+    var responseSnapshot = state.responseSnapshot;
+    var streamingResponse = responseSnapshot.nativeStreaming;
+    if (!state.playbackReadyPromise) {
+      beginPlaybackTurn(currentTurn, responseSnapshot).catch(function(error) {
+        if (currentTurn === state.turnId) setStatus('PCM playback setup failed: ' + error.message);
+      });
+    }
+    var outcomeRequestId = '';
     fetch(config.proxyBaseUrl + '/audio/speech', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: state.activeTtsRequest.signal,
-      body: JSON.stringify({
-        input: phrase,
-        voice: config.ttsVoice,
-        language: config.language || 'Auto',
-        response_format: 'pcm',
-        stream: !!config.nativeStreaming,
-        tuning: config.tuning
-      })
+      body: JSON.stringify(ttsPayloadForPhrase(phrase, responseSnapshot))
     }).then(function(response) {
+      outcomeRequestId = String(response.headers && response.headers.get && response.headers.get('x-tts-request-id') || '');
       if (!response.ok) return response.text().then(function(body) {
         if (response.status === 409 && body.indexOf('No candidate model is loaded') >= 0) {
           throw new Error('No audio.cpp model is resident. Load the selected model in Settings before starting a streaming turn.');
         }
         throw new Error(response.status + ': ' + body);
       });
-      if (!config.nativeStreaming) return response.arrayBuffer();
+      if (!streamingResponse) return response.arrayBuffer();
       if (!response.body || !response.body.getReader) throw new Error('This browser cannot consume streamed PCM. Select buffered phrase PCM.');
       var reader = response.body.getReader();
       var carry = new Uint8Array(0);
@@ -3120,22 +3475,101 @@ if (typeof Alpine === 'undefined') {
               setStatus('Native PCM is arriving and playing before synthesis completes.');
             }
             state.pcmChunks.push(pcm);
-            return enqueuePcmForTurn(pcm, config.sampleRate, currentTurn).then(consume);
+            return enqueuePcmForTurn(pcm, config.sampleRate, currentTurn, responseSnapshot).then(consume);
           }
           return consume();
         });
       }
       return consume();
     }).then(function(buffer) {
-      if (config.nativeStreaming || currentTurn !== state.turnId || !buffer) return;
+      if (currentTurn !== state.turnId) return null;
+      return lookupNativeAudioOutcome(outcomeRequestId, true).then(function(reason) {
+        if (reason) throw new Error(reason);
+        return buffer;
+      });
+    }).then(function(buffer) {
+      if (streamingResponse || currentTurn !== state.turnId || !buffer) return;
       var pcm = new Uint8Array(buffer);
+      if (!pcm.length || pcm.length % 2) throw new Error('Buffered PCM is empty or ended on an incomplete PCM16 sample.');
       state.pcmChunks.push(pcm);
-      return enqueuePcmForTurn(pcm, config.sampleRate, currentTurn);
+      return enqueuePcmForTurn(pcm, config.sampleRate, currentTurn, responseSnapshot);
     }).catch(function(err) {
-      if (err.name !== 'AbortError') setStatus((config.nativeStreaming ? 'Native' : 'Buffered') + ' PCM error: ' + err.message);
+      if (err.name !== 'AbortError' && currentTurn === state.turnId) {
+        if (!streamingResponse) {
+          terminatePhrasesAfterProviderFailure(currentTurn, err, responseSnapshot, false, true);
+          return;
+        }
+        // Stop this exact response synchronously before awaiting diagnostics.
+        // Otherwise finally() could dispatch its next phrase during lookup.
+        terminatePhrasesAfterProviderFailure(currentTurn, err, responseSnapshot, true, true);
+        return lookupNativeAudioOutcome(outcomeRequestId).then(function(reason) {
+          if (currentTurn !== state.turnId) return;
+          var terminal = reason || 'Native PCM delivery failed; candidate outcome could not be verified (' + err.message + ').';
+          setStatus(terminal + ' Remaining phrases and playback were cancelled.');
+        });
+      }
     }).finally(function() {
-      if (currentTurn === state.turnId) { state.phrasePumping = false; state.activeTtsRequest = null; pumpProgressiveSpeech(); }
+      if (currentTurn === state.turnId) {
+        state.phraseIndex += 1;
+        state.phrasePumping = false;
+        state.activeTtsRequest = null;
+        if (!state.ttsFailureTerminal) pumpProgressiveSpeech();
+      }
     });
+  }
+
+  function lookupNativeAudioOutcome(requestId, requireComplete) {
+    var unknown = requireComplete ? 'Candidate synthesis completion could not be verified.' : '';
+    if (!/^[0-9a-f]{32}$/.test(String(requestId || ''))) return Promise.resolve(unknown);
+    return fetch(config.proxyBaseUrl + '/audio/outcomes/' + requestId, { cache: 'no-store' })
+      .then(function(response) {
+        if (!response.ok) return null;
+        return response.json().catch(function() { return null; });
+      })
+      .then(function(outcome) {
+        if (!outcome || outcome.requestId !== requestId) return unknown;
+        if (outcome.state === 'completed') return '';
+        if (!['limited', 'error', 'cancelled'].includes(String(outcome.state || ''))) return unknown;
+        var detail = String(outcome.reason || outcome.detail || outcome.error || '').trim();
+        return 'Candidate outcome ' + outcome.state + (detail ? ': ' + detail : '.');
+      })
+      .catch(function() { return unknown; });
+  }
+
+  function terminatePhrasesAfterProviderFailure(turnId, error, responseSnapshot, streamingResponse, cancelPlayback) {
+    if (turnId !== state.turnId || state.ttsFailureTerminal) return false;
+    state.ttsFailureTerminal = true;
+    state.phraseQueue = [];
+    state.phraseText = '';
+    state.finalPhrasePending = false;
+    state.llmFinished = true;
+    if (state.phraseIdleTimer) {
+      clearTimeout(state.phraseIdleTimer);
+      state.phraseIdleTimer = null;
+    }
+    // Stop generation too: otherwise a long-running LLM can keep supplying
+    // text to a response whose provider has already failed terminally.
+    if (state.activeLlmRequest) {
+      state.activeLlmRequest.abort();
+      state.activeLlmRequest = null;
+    }
+    var delivery = streamingResponse ? 'Native' : 'Buffered';
+    if (cancelPlayback) {
+      cancelScheduledPlayback();
+      setSpeaking(false);
+      setProcessing(false);
+      setStatus(delivery + ' PCM provider error: ' + error.message + '. Remaining phrases and playback were cancelled.');
+      return true;
+    }
+    setStatus(delivery + ' PCM provider error: ' + error.message + '. Remaining phrases were suppressed; draining accepted audio.');
+    finishPlaybackTurn(turnId, responseSnapshot).catch(function(finalizeError) {
+      if (turnId === state.turnId) {
+        setSpeaking(false);
+        setProcessing(false);
+        setStatus('PCM playback finalization failed after provider error: ' + finalizeError.message);
+      }
+    });
+    return true;
   }
 
   function synthesizeSpeech(text) {
@@ -3193,6 +3627,12 @@ if (typeof Alpine === 'undefined') {
     state.phraseText = '';
     state.phraseQueue = [];
     state.phrasePumping = false;
+    state.ttsFailureTerminal = false;
+    state.responseSnapshot = null;
+    state.responseSnapshotPromise = null;
+    state.responseSnapshotTurn = null;
+    state.phraseIndex = 0;
+    state.finalPhrasePending = false;
     state.llmFinished = false;
     cancelScheduledPlayback();
     setSpeaking(false);
@@ -3305,6 +3745,11 @@ if (typeof Alpine === 'undefined') {
   refs['save-llm-settings'].addEventListener('click', saveLlmSettings);
   refs['toggle-record'].addEventListener('click', toggleLiveMic);
   refs['refresh-mics'].addEventListener('click', function() { refreshMics(true); });
+  refs['send-diagnostic-clip'].addEventListener('click', sendDiagnosticClip);
+  refs['cancel-diagnostic-clip'].addEventListener('click', function() {
+    if (!state.isLive) stopLiveMic();
+    else setStatus('Use Stop live mic to cancel microphone capture.');
+  });
   refs.clear.addEventListener('click', clearConversation);
 
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
@@ -3371,9 +3816,16 @@ if (typeof Alpine === 'undefined') {
         def load_backend_models(base_url: str):
             """Fetch backend model list; show column and dropdown; display loading/error state; enable/disable Generate buttons."""
             try:
+                run_id = f"ui-models-{int(datetime.utcnow().timestamp() * 1000)}"
+                # region agent log
+                _debug_log(run_id, "H1", "gradio_voice_studio.py:load_backend_models:entry", "load_backend_models entry", {"base_url": base_url})
+                # endregion
                 url = f"{base_url.rstrip('/')}/v1/backend/models"
                 r = httpx.get(url, timeout=10.0)
                 if r.status_code != 200:
+                    # region agent log
+                    _debug_log(run_id, "H2", "gradio_voice_studio.py:load_backend_models:non200", "backend models non-200", {"status_code": r.status_code, "url": url})
+                    # endregion
                     return (
                         gr.update(visible=False),
                         gr.update(choices=[], value=None),
@@ -3384,6 +3836,9 @@ if (typeof Alpine === 'undefined') {
                 data = r.json()
                 available = [m for m in (data.get("available") or []) if "base" in m.lower()]
                 if not available:
+                    # region agent log
+                    _debug_log(run_id, "H3", "gradio_voice_studio.py:load_backend_models:no_base", "no Base models returned", {"available_raw": data.get("available"), "state": data.get("state")})
+                    # endregion
                     return (
                         gr.update(visible=False),
                         gr.update(choices=[], value=None),
@@ -3437,6 +3892,15 @@ if (typeof Alpine === 'undefined') {
                     status_parts.append(f"**Last error:** `{err}`")
 
                 model_ready = state == "loaded"
+                # region agent log
+                _debug_log(
+                    run_id,
+                    "H4",
+                    "gradio_voice_studio.py:load_backend_models:success",
+                    "backend models loaded",
+                    {"state": state, "current": current, "loaded_models": loaded, "model_ready": model_ready, "last_error": err},
+                )
+                # endregion
                 return (
                     gr.update(visible=True),
                     gr.update(choices=available, value=current or available[0]),
@@ -3531,8 +3995,15 @@ if (typeof Alpine === 'undefined') {
             if not model_key:
                 return gr.update(), "Select a model first.", gr.update(), gr.update()
             try:
+                run_id = f"ui-switch-{int(datetime.utcnow().timestamp() * 1000)}"
+                # region agent log
+                _debug_log(run_id, "H5", "gradio_voice_studio.py:do_switch_backend_model:entry", "switch requested", {"base_url": base_url, "model_key": model_key})
+                # endregion
                 url = f"{base_url.rstrip('/')}/v1/backend/models/switch"
                 r = httpx.post(url, json={"model_key": model_key}, timeout=600.0)
+                # region agent log
+                _debug_log(run_id, "H5", "gradio_voice_studio.py:do_switch_backend_model:switch_response", "switch response received", {"status_code": r.status_code})
+                # endregion
                 if r.status_code != 200:
                     err = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
                     msg = err.get("detail", {}).get("message", "Switch failed") if isinstance(err.get("detail"), dict) else str(err.get("detail", "Switch failed"))
@@ -3546,6 +4017,9 @@ if (typeof Alpine === 'undefined') {
                 state = data.get("state", "loaded")
                 model_ready = state == "loaded"
                 msg = f"✅ Loaded: `{data.get('current', model_key)}` | In memory: `{', '.join(loaded) if loaded else 'none'}`"
+                # region agent log
+                _debug_log(run_id, "H4", "gradio_voice_studio.py:do_switch_backend_model:post_status", "post-switch models status", {"state": state, "current": data.get("current", model_key), "loaded_models": loaded})
+                # endregion
                 return (
                     gr.update(choices=available, value=data.get("current", model_key)),
                     msg,
@@ -3733,10 +4207,10 @@ if (typeof Alpine === 'undefined') {
                     "format": headers.get("x-tts-format", ext),
                 }
                 out_path = write_bytes_to_temp_audio(audio_bytes, ext)
-                
+
                 # Format timing info as readable markdown
                 total_time = timing_info.get('total_time')
-                
+
                 timing_md = f"""### ⏱️ Generation Timing
 | Metric | Value |
 |--------|-------|
@@ -3923,7 +4397,7 @@ if (typeof Alpine === 'undefined') {
                     if not vp.ref_text.strip():
                         raise gr.Error("This profile needs ref_text unless x_vector_only_mode is enabled.")
                     payload["ref_text"] = vp.ref_text.strip()
-                
+
                 # Use one complete offline decode for the full-quality master.
                 try:
                     audio_bytes, ext, headers = request_tts_voice_clone(base_url, payload, float(timeout_s))
@@ -4027,7 +4501,7 @@ if (typeof Alpine === 'undefined') {
                 "Full Quality is independent: one offline full decoder pass with the dedicated Quality sampler policy. All streaming and tuning-profile controls are locked; output format and speed remain available."
                 if not is_streaming
                 else (
-                    "Native profile controls are active. Output remains fixed PCM16 / 24 kHz; startup waits for the selected first-plus-steady block duration."
+                    "Native profile controls are active. Output remains fixed PCM16 / 24 kHz; cold startup waits for the selected first-block duration."
                     if is_native
                     else "Buffered fallback uses the selected phrase look-ahead and flush policy. Native block/context controls are inactive."
                 )
@@ -4065,10 +4539,25 @@ if (typeof Alpine === 'undefined') {
                 gr.update(interactive=is_streaming),  # import
             )
 
-        def on_s_voice_change(pid: str, base_url: str, library_dir_str: str, tuning_profile_id: str | None, playback_mode: str, session_tuning: dict[str, Any] | None):
-            """Update the streaming widget HTML when the voice profile changes."""
-            html = on_update_streaming_widget(base_url, pid, library_dir_str, tuning_profile_id, playback_mode, session_tuning)
-            return gr.update(value=html)
+        def queue_streaming_widget_next_config(
+            _base_url: str,
+            _profile_id: str,
+            _library_dir_str: str,
+            _tuning_profile_id: str | None,
+            _playback_mode: str,
+            _session_tuning: dict[str, Any] | None,
+        ) -> None:
+            """Keep the mounted widget alive; browser JS applies this next-turn config."""
+            return None
+
+        streaming_widget_next_config_js = r"""
+            (baseUrl, profileId, libraryDir, tuningProfileId, playbackMode, sessionTuning) => {
+              window.dispatchEvent(new CustomEvent('voice-studio-next-config', {
+                detail: { baseUrl, profileId, libraryDir, tuningProfileId, playbackMode, sessionTuning }
+              }));
+              return [baseUrl, profileId, libraryDir, tuningProfileId, playbackMode, sessionTuning];
+            }
+        """
 
         # ------------------------------------------------------------------
         # Wire up UI interactions to callbacks
@@ -4197,9 +4686,10 @@ if (typeof Alpine === 'undefined') {
             ],
         )
         play_mode.change(
-            fn=on_update_streaming_widget,
+            fn=queue_streaming_widget_next_config,
             inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state],
-            outputs=[s_streaming_widget],
+            outputs=[],
+            js=streaming_widget_next_config_js,
         )
         tuning_context_unlock.change(
             fn=lambda mode, unlocked: gr.update(
@@ -4213,9 +4703,17 @@ if (typeof Alpine === 'undefined') {
             outputs=[tuning_context],
         )
         s_voice_profile_id.change(
-            fn=on_s_voice_change,
+            fn=queue_streaming_widget_next_config,
             inputs=[s_voice_profile_id, base_url_in, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state],
-            outputs=[s_streaming_widget],
+            outputs=[],
+            js=r"""
+                (profileId, baseUrl, libraryDir, tuningProfileId, playbackMode, sessionTuning) => {
+                  window.dispatchEvent(new CustomEvent('voice-studio-next-config', {
+                    detail: { baseUrl, profileId, libraryDir, tuningProfileId, playbackMode, sessionTuning }
+                  }));
+                  return [profileId, baseUrl, libraryDir, tuningProfileId, playbackMode, sessionTuning];
+                }
+            """,
         )
 
         # Render the active native-or-buffered default on first load. Render the same
@@ -4246,7 +4744,9 @@ if (typeof Alpine === 'undefined') {
         tuning_form_outputs = [tuning_profile_dropdown, tuning_profile_status, tuning_name, tuning_revision, tuning_first, tuning_steady, tuning_context, tuning_reference_s, tuning_model, tuning_lookahead, tuning_flush_ms, tuning_temperature, tuning_top_k, tuning_top_p, tuning_repetition, tuning_seed]
         demo.load(fn=tuning_profile_form, inputs=[base_url_in], outputs=tuning_form_outputs)
         tuning_profile_dropdown.change(fn=tuning_profile_form, inputs=[base_url_in, tuning_profile_dropdown], outputs=tuning_form_outputs).then(
-            fn=on_update_streaming_widget, inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state], outputs=[s_streaming_widget]
+            fn=queue_streaming_widget_next_config,
+            inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state],
+            outputs=[], js=streaming_widget_next_config_js,
         )
         refresh_tuning_btn.click(fn=tuning_profile_form, inputs=[base_url_in, tuning_profile_dropdown], outputs=tuning_form_outputs)
         save_tuning_btn.click(fn=save_tuning_selection, inputs=[base_url_in, tuning_profile_dropdown], outputs=[tuning_profile_status]).then(
@@ -4265,10 +4765,14 @@ if (typeof Alpine === 'undefined') {
             fn=tuning_profile_form, inputs=[base_url_in, tuning_profile_dropdown], outputs=tuning_form_outputs
         )
         resolve_tuning_btn.click(fn=resolve_tuning_override, inputs=[base_url_in, tuning_profile_dropdown, tuning_model, tuning_first, tuning_steady, tuning_context, tuning_reference_s, tuning_lookahead, tuning_flush_ms, tuning_temperature, tuning_top_k, tuning_top_p, tuning_repetition, tuning_seed, tuning_override_state], outputs=[tuning_profile_status, tuning_override_state]).then(
-            fn=on_update_streaming_widget, inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state], outputs=[s_streaming_widget]
+            fn=queue_streaming_widget_next_config,
+            inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state],
+            outputs=[], js=streaming_widget_next_config_js,
         )
         clear_tuning_override_btn.click(fn=clear_tuning_override, outputs=[tuning_profile_status, tuning_override_state]).then(
-            fn=on_update_streaming_widget, inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state], outputs=[s_streaming_widget]
+            fn=queue_streaming_widget_next_config,
+            inputs=[base_url_in, s_voice_profile_id, library_dir_in, tuning_profile_dropdown, play_mode, tuning_override_state],
+            outputs=[], js=streaming_widget_next_config_js,
         )
         export_tuning_btn.click(fn=export_tuning_json, inputs=[base_url_in], outputs=[tuning_json])
         import_tuning_btn.click(fn=import_tuning_json, inputs=[base_url_in, tuning_json], outputs=[tuning_profile_status])

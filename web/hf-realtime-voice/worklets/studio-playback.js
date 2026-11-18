@@ -3,7 +3,7 @@
  * Turn-scoped PCM playback queue for the copied Gradio Voice Studio.
  *
  * Main thread -> worklet:
- *   { kind: "begin", turnId, inputRate, startupMs }
+ *   { kind: "begin", turnId, inputRate, startupMs, reprimeMs }
  *   { kind: "audio", turnId, samples: Float32Array }
  *   { kind: "end", turnId }
  *   { kind: "clear", turnId }
@@ -16,7 +16,8 @@
  *   { kind: "clear", turnId }
  *
  * Native playback waits until the configured first-plus-steady duration is
- * queued. A completed short utterance starts immediately after `end`. The
+ * queued. A real underrun uses the smaller steady-state re-prime target. A
+ * completed short utterance starts immediately after `end`. The
  * queue remains alive across every phrase in one assistant turn; `clear`
  * invalidates all queued audio so cancelled turns cannot leak a stale tail.
  */
@@ -31,6 +32,7 @@ class StudioPlaybackProcessor extends AudioWorkletProcessor {
     this._inputRate = 24000;
     this._stepRatio = this._inputRate / sampleRate;
     this._startupMs = 0;
+    this._reprimeMs = 0;
     this._queue = [];
     this._readIdx = 0;
     this._fracPos = 0;
@@ -54,6 +56,7 @@ class StudioPlaybackProcessor extends AudioWorkletProcessor {
         if (Number(data.inputRate) > 0) this._inputRate = Number(data.inputRate);
         this._stepRatio = this._inputRate / sampleRate;
         this._startupMs = Math.max(0, Number(data.startupMs) || 0);
+        this._reprimeMs = Math.max(0, Math.min(2000, Number(data.reprimeMs) || Math.min(this._startupMs, 240)));
         return;
       }
       if (data.kind === "clear") {
@@ -112,7 +115,8 @@ class StudioPlaybackProcessor extends AudioWorkletProcessor {
 
   _armPlayback(completed) {
     if (this._playing || this._queue.length === 0) return;
-    if (!completed && this._queuedMs() + 0.001 < this._startupMs) return;
+    var targetMs = this._startedOnce ? this._reprimeMs : this._startupMs;
+    if (!completed && this._queuedMs() + 0.001 < targetMs) return;
     const resumed = this._startedOnce;
     this._playing = true;
     this._startedOnce = true;

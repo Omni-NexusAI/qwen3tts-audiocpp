@@ -75,7 +75,7 @@ LIMITER_ENABLED = bool(LOAD_BALANCER_URL) and bool(SPACE_ID)
 SERPER_URL = "https://google.serper.dev/search"
 # Cap results so the tool output stays small enough to feed back to the model.
 MAX_RESULTS = 5
-LOCAL_UI_API_VERSION = 20
+LOCAL_UI_API_VERSION = 21
 HERE = os.path.dirname(os.path.abspath(__file__))
 _repo_runtime_dir = Path(HERE).parents[1] / ".runtime"
 # In the repository the legacy shared runtime is two levels above the UI.
@@ -110,6 +110,9 @@ PUBLIC_UI_SETTING_KEYS = {
     "modelName",
     "voiceByBackend",
     "ttsProfileByBackend",
+    "playbackContinuity",
+    "ttsDeliveryMode",
+    "historyCompaction",
 }
 DEFAULT_QWEN3_VOICE_ID = "16d9bb336799"
 DEFAULT_QWEN3_VOICE = f"clone:{DEFAULT_QWEN3_VOICE_ID}"
@@ -154,7 +157,7 @@ def _normalize_tts_provider_settings(payload: dict[str, Any]) -> dict[str, Any]:
 DEFAULT_VOICE_LIBRARY_DIR = Path(
     os.environ.get(
         "VOICE_LIBRARY_DIR",
-        r"C:\Users\yepyy\Documents\Codex\2026-05-24\files-mentioned-by-the-user-i\qwen3-tts-candidate\voice_library_from_original",
+        "/voices",
     )
 ).expanduser()
 
@@ -170,7 +173,23 @@ def _read_public_ui_settings() -> dict[str, Any]:
         except (OSError, ValueError):
             continue
         if isinstance(saved, dict):
-            return _normalize_tts_provider_settings(saved)
+            # A historical browser build could write API keys here.  Retain
+            # only the explicit public allowlist and atomically rewrite the
+            # file when legacy/private keys are present.  Never inspect,
+            # return, or log the discarded values.
+            public = {key: saved[key] for key in PUBLIC_UI_SETTING_KEYS if key in saved}
+            if set(saved) != set(public):
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = path.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(public, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                    temporary.replace(path)
+                except OSError:
+                    # Filtering still prevents a legacy secret from reaching
+                    # the browser if an unrelated filesystem failure blocks
+                    # cleanup.
+                    pass
+            return _normalize_tts_provider_settings(public)
     return {}
 
 
@@ -215,6 +234,25 @@ def _write_public_ui_settings(payload: dict[str, Any]) -> dict[str, Any]:
                 if cleaned:
                     calibrations[pair[:512]] = cleaned
             existing[key] = calibrations
+        elif key == "historyCompaction" and isinstance(value, dict):
+            enabled = bool(value.get("enabled", True))
+            trigger = value.get("trigger_ratio", 0.70)
+            target = value.get("target_ratio", 0.50)
+            recent_turns = value.get("recent_turns", 6)
+            if isinstance(trigger, bool) or not isinstance(trigger, (int, float)):
+                trigger = 0.70
+            if isinstance(target, bool) or not isinstance(target, (int, float)):
+                target = 0.50
+            if isinstance(recent_turns, bool) or not isinstance(recent_turns, (int, float)):
+                recent_turns = 6
+            trigger = max(0.20, min(0.90, float(trigger)))
+            target = max(0.10, min(trigger - 0.05, float(target)))
+            existing[key] = {
+                "enabled": enabled,
+                "trigger_ratio": trigger,
+                "target_ratio": target,
+                "recent_turns": max(1, min(12, int(recent_turns))),
+            }
         elif isinstance(value, (str, int, float, bool)):
             existing[key] = value
     UI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -866,19 +904,39 @@ def select_qwen3_profile(req: ProfileSelectRequest):
 @app.get("/api/local-pipeline")
 async def local_pipeline():
     """Best-effort live description of the local runtime backing the UI."""
-    gemma_base = os.environ.get("GEMMA_AUDIO_BASE_URL", "http://127.0.0.1:8818/v1").rstrip("/")
-    tts_base = os.environ.get("QWEN3_TTS_API_BASE_URL", "http://127.0.0.1:8881/v1").rstrip("/")
+    saved = _read_public_ui_settings()
+    model_provider = str(saved.get("modelProvider") or "local").strip().lower()
+    if model_provider not in {"local", "remote"}:
+        model_provider = "local"
+    configured_gemma_base = os.environ.get("GEMMA_AUDIO_BASE_URL", "http://127.0.0.1:8818/v1")
+    if model_provider == "remote" and isinstance(saved.get("modelUrl"), str):
+        candidate_base = saved["modelUrl"].strip()
+        if candidate_base.startswith(("http://", "https://")):
+            configured_gemma_base = candidate_base
+    gemma_base = configured_gemma_base.rstrip("/")
+    configured_gemma_model = os.environ.get("GEMMA_AUDIO_MODEL", "gemma-4-12b-it-qat")
+    if model_provider == "remote" and isinstance(saved.get("modelName"), str) and saved["modelName"].strip():
+        configured_gemma_model = saved["modelName"].strip()
+    selected_provider = _canonical_tts_provider(saved.get("ttsBackend"))
+    if selected_provider not in TTS_BACKENDS:
+        selected_provider = "faster"
+    selected_spec = TTS_BACKENDS[selected_provider]
+    tts_base = str(selected_spec["endpoint"]).rstrip("/")
     status = {
         "mode": "local-direct-audio",
         "vad": {"name": "Silero VAD", "device": "CPU", "sampleRate": 16000},
-        "gemma": {"baseUrl": gemma_base, "model": os.environ.get("GEMMA_AUDIO_MODEL", "gemma-4-12b-it-qat")},
+        "gemma": {
+            "provider": model_provider,
+            "baseUrl": gemma_base,
+            "model": configured_gemma_model,
+            "contextWindow": None,
+        },
         "tts": {
             "baseUrl": tts_base,
-            "backend": "qwen3-tts-faster",
-            "apiModel": "qwen3-tts",
-            "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-            "voice": DEFAULT_QWEN3_VOICE,
-            "container": "281c411e5cfe02d0b0d903f67cd3fb712ab38bc705eb3edbedd8a2041c78702b",
+            "backend": selected_provider,
+            "displayName": selected_spec["displayName"],
+            "model": selected_spec.get("requiredModel") or "provider-managed model",
+            "voice": (saved.get("voiceByBackend") or {}).get(selected_provider) or DEFAULT_QWEN3_VOICE,
         },
         "tools": {"serper": bool(SERPER_KEY), "camera": True},
     }
@@ -889,8 +947,11 @@ async def local_pipeline():
             if gemma.status_code == 200:
                 data = gemma.json()
                 models = data.get("data") or []
-                if models and isinstance(models[0], dict):
-                    status["gemma"]["model"] = models[0].get("id") or status["gemma"]["model"]
+                status["gemma"]["availableModels"] = [
+                    str(item.get("id"))
+                    for item in models
+                    if isinstance(item, dict) and item.get("id")
+                ]
         except Exception:
             status["gemma"]["reachable"] = False
         try:
@@ -1012,7 +1073,6 @@ async def _probe_audio_cpp_candidate(
     """
     config = TTS_BACKENDS["qwen3tts-audiocpp"]
     endpoint = str(config["endpoint"]).rstrip("/")
-    control_endpoint = os.environ.get("AUDIO_CPP_CONTROL_URL", f"{endpoint.removesuffix('/v1')}/control").rstrip("/")
     candidate_models = _audio_cpp_model_ids()
     requested_model = model_id or None
     if requested_model and requested_model not in candidate_models:
@@ -1263,6 +1323,46 @@ def _audio_cpp_proxy_base() -> str:
     return str(TTS_BACKENDS["qwen3tts-audiocpp"]["endpoint"]).rstrip("/")
 
 
+def _no_store_json_response(upstream: httpx.Response) -> Response:
+    """Return a bounded candidate read without allowing browser cache reuse."""
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type="application/json",
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
+
+
+@app.get("/api/audio-cpp/control/status")
+async def proxy_audio_cpp_control_status() -> Response:
+    """Expose only the candidate's read-only lifecycle snapshot to Studio."""
+    candidate_api_base = _audio_cpp_proxy_base()
+    control_base = candidate_api_base.removesuffix("/v1")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as http:
+        upstream = await http.get(f"{control_base}/control/status")
+    return _no_store_json_response(upstream)
+
+
+@app.get("/api/audio-cpp/v1/voices/profiles/{profile_id}")
+async def proxy_audio_cpp_profile_snapshot(profile_id: str) -> Response:
+    """Expose one immutable clone snapshot; no generic candidate relay exists."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", profile_id):
+        raise HTTPException(status_code=404, detail="Unknown audio.cpp clone profile.")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as http:
+        upstream = await http.get(f"{_audio_cpp_proxy_base()}/voices/profiles/{profile_id}")
+    return _no_store_json_response(upstream)
+
+
+@app.get("/api/audio-cpp/audio/outcomes/{request_id}")
+async def proxy_audio_cpp_audio_outcome(request_id: str) -> Response:
+    """Expose one short-lived candidate outcome; mutations stay unavailable."""
+    if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        raise HTTPException(status_code=404, detail="Unknown audio.cpp request outcome.")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as http:
+        upstream = await http.get(f"{_audio_cpp_proxy_base()}/audio/outcomes/{request_id}")
+    return _no_store_json_response(upstream)
+
+
 @app.get("/api/audio-cpp/settings")
 async def proxy_audio_cpp_settings() -> Response:
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as http:
@@ -1289,7 +1389,7 @@ async def proxy_audio_cpp_tuning(path: str, request: Request) -> Response:
         kwargs["json"] = await request.json()
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as http:
         upstream = await http.request(request.method, f"{_audio_cpp_proxy_base()}/tuning/{path}", **kwargs)
-    return Response(content=upstream.content, status_code=upstream.status_code, media_type="application/json")
+    return _no_store_json_response(upstream)
 
 
 @app.post("/api/audio-cpp/audio/speech")
@@ -1869,14 +1969,23 @@ async def session_end(request: Request):
 try:
     import gradio as gr
     from gradio_voice_studio import build_app as build_gradio_voice_studio
-    app = gr.mount_gradio_app(
-        app,
-        build_gradio_voice_studio(
-            os.environ.get("AUDIO_CPP_TTS_BASE_URL", "http://127.0.0.1:8080/v1").removesuffix("/v1"),
-            DEFAULT_VOICE_LIBRARY_DIR,
-        ),
-        path="/voice-studio",
-    )
+
+    mount_gradio_app = getattr(gr, "mount_gradio_app", None)
+    if callable(mount_gradio_app):
+        app = mount_gradio_app(
+            app,
+            build_gradio_voice_studio(
+                os.environ.get("AUDIO_CPP_TTS_BASE_URL", "http://127.0.0.1:8080/v1").removesuffix("/v1"),
+                DEFAULT_VOICE_LIBRARY_DIR,
+            ),
+            path="/voice-studio",
+        )
+    else:
+        # Repository test/development environments may carry a pre-mount
+        # Gradio release.  Keep the HF Realtime server usable there; the
+        # self-contained candidate image pins a release with this API and must
+        # still pass its separate Voice Studio route smoke test.
+        logger.info("Voice Studio route unavailable: Gradio mount API is not installed")
 except ImportError:
     # The regular Realtime server stays runnable outside the candidate image.
     pass

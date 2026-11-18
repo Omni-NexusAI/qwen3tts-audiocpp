@@ -2,16 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import json
-from pathlib import Path
 import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 
 from fastapi import HTTPException
-
 
 INTEGRATION = Path(__file__).parents[1]
 sys.path.insert(0, str(INTEGRATION))
@@ -93,6 +93,45 @@ class ProfileRuntimeContractTests(unittest.TestCase):
         self.assertEqual(supervisor._voice_profiles(), [])
         self.assertEqual(studio.list_profiles(self.library), [])
 
+    def test_frozen_clone_snapshot_survives_same_id_profile_edit_between_phrases(self) -> None:
+        original_audio = b"RIFF-original-reference"
+        original = supervisor._write_candidate_profile(
+            "mutable-clone",
+            {
+                "name": "Mutable clone",
+                "ref_audio": base64.b64encode(original_audio).decode("ascii"),
+                "ref_text": "Original conditioning transcript.",
+            },
+        )
+        inventory = supervisor._voice_profiles()
+        self.assertEqual(inventory[0]["content_revision"], original["content_revision"])
+        self.assertEqual(inventory[0]["content_hash"], original["content_hash"])
+        frozen = supervisor._candidate_profile_payload("mutable-clone", include_audio=True)
+        frozen_snapshot = {
+            key: frozen[key]
+            for key in ("profile_id", "content_revision", "content_hash", "ref_audio", "ref_text", "reference_excerpts")
+        }
+
+        edited = supervisor._write_candidate_profile(
+            "mutable-clone",
+            {
+                "name": "Mutable clone edited",
+                "ref_audio": base64.b64encode(b"RIFF-edited-reference").decode("ascii"),
+                "ref_text": "Edited conditioning transcript.",
+            },
+        )
+        self.assertGreater(edited["content_revision"], original["content_revision"])
+        self.assertNotEqual(edited["content_hash"], original["content_hash"])
+
+        request = {"voice": "clone:mutable-clone", "clone_snapshot": frozen_snapshot}
+        supervisor._apply_clone_profile(request)
+
+        self.assertEqual(request["ref_audio"], frozen_snapshot["ref_audio"])
+        self.assertEqual(request["ref_text"], "Original conditioning transcript.")
+        self.assertEqual(request["_frozen_clone_content_hash"], original["content_hash"])
+        self.assertEqual(request["_frozen_clone_content_revision"], original["content_revision"])
+        self.assertNotIn("clone_snapshot", request)
+
     def test_tuning_definitions_are_shared_but_selections_are_surface_scoped(self) -> None:
         migrated = supervisor._normalize_tuning_document({
             "version": 1,
@@ -126,12 +165,12 @@ class ProfileRuntimeContractTests(unittest.TestCase):
             asyncio.run(supervisor.select_tuning_profile({"scope": "unknown", "profile_id": "balanced"}))
         self.assertEqual(invalid.exception.status_code, 422)
 
-    def test_disabled_guard_and_native_ui_are_process_defaults(self) -> None:
+    def test_disabled_guard_and_buffered_ui_are_process_defaults(self) -> None:
         self.assertEqual(supervisor._default_gpu_guard_settings()["mode"], "disabled")
         original = studio.NATIVE_INCREMENTAL_PCM_ENABLED
         try:
             studio.NATIVE_INCREMENTAL_PCM_ENABLED = True
-            self.assertEqual(studio.default_playback_mode(), studio.NATIVE_PLAYBACK_MODE)
+            self.assertEqual(studio.default_playback_mode(), studio.BUFFERED_PLAYBACK_MODE)
             studio.NATIVE_INCREMENTAL_PCM_ENABLED = False
             self.assertEqual(studio.default_playback_mode(), studio.BUFFERED_PLAYBACK_MODE)
         finally:

@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-from pathlib import Path
 import sys
 import types
 import unittest
+from pathlib import Path
 
 from fastapi import HTTPException
-
 
 SUPERVISOR = Path(__file__).parents[1] / "supervisor.py"
 SPEC = importlib.util.spec_from_file_location("candidate_supervisor_tuning_test", SUPERVISOR)
@@ -49,7 +48,8 @@ class TuningProfileContractTests(unittest.TestCase):
     def tearDown(self) -> None:
         supervisor._read_tuning_profiles = self.original_read
         supervisor._write_tuning_profiles = self.original_write
-        supervisor.state.clear(); supervisor.state.update(self.original_state)
+        supervisor.state.clear()
+        supervisor.state.update(self.original_state)
 
     def test_duplicate_create_never_overwrites_builtin_or_custom(self) -> None:
         with self.assertRaises(HTTPException) as error:
@@ -223,6 +223,11 @@ class TuningProfileContractTests(unittest.TestCase):
         for profile in self.document["profiles"].values():
             for field in ("model", "text_lookahead", "phrase_flush_ms", "temperature", "top_k", "top_p", "repetition_penalty", "seed"):
                 self.assertIn(field, profile)
+            self.assertEqual(
+                profile["left_context_frames"],
+                supervisor.MODEL_REQUIRED_LEFT_CONTEXT_FRAMES,
+            )
+        self.assertEqual(supervisor.MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, 25)
         resolved = asyncio.run(supervisor.resolve_tuning_profile({"provider": "qwen3tts-audiocpp", "profile_id": "balanced"}))
         if not supervisor.NATIVE_INCREMENTAL_PCM_ENABLED:
             self.assertIn("first_block_frames", resolved["inactiveFields"])
@@ -255,9 +260,10 @@ class TuningProfileContractTests(unittest.TestCase):
     def test_reference_temp_files_and_editor_hydration_have_explicit_contracts(self) -> None:
         source = SUPERVISOR.read_text(encoding="utf-8")
         buffered = source.split("async def _voice_clone_response", 1)[1].split("def _native_clone_pcm_response", 1)[0]
-        native = source.split("def _native_clone_pcm_response", 1)[1].split('@app.post("/v1/voice-studio', 1)[0]
+        native = source.split("async def _native_clone_pcm_response", 1)[1].split('@app.post("/v1/voice-studio', 1)[0]
         self.assertIn("finally:\n        reference.unlink(missing_ok=True)", buffered)
-        self.assertIn("finally:\n            reference.unlink(missing_ok=True)", native)
+        self.assertIn("await close_upstream()", native)
+        self.assertIn("reference.unlink(missing_ok=True)", native)
         ui_source = UI.read_text(encoding="utf-8")
         self.assertIn("def tuning_profile_form", ui_source)
         self.assertIn("tuning_profile_dropdown.change(fn=tuning_profile_form", ui_source)

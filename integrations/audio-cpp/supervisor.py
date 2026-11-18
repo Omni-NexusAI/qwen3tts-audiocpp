@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import deque
 import io
 import json
 import logging
@@ -11,24 +10,51 @@ import math
 import os
 import re
 import shutil
-from secrets import token_hex
-import sys
-from urllib.parse import urlsplit, urlunsplit
 import subprocess
+import sys
 import tempfile
 import time
 import wave
+from collections import OrderedDict, deque
 from pathlib import Path
+from secrets import token_hex
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 MODULE_DIR = Path(__file__).resolve().parent
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
-from profile_library import canonical_profile, live_profiles, valid_profile_id
+from profile_library import (  # noqa: E402
+    canonical_profile,
+    clone_content_hash,
+    live_profiles,
+    valid_profile_id,
+)
+
+
+class _OwnedStreamingResponse(StreamingResponse):
+    """Streaming response whose external resources survive only for its ASGI call.
+
+    Starlette may fail while sending response headers, before the body iterator
+    is entered.  A generator ``finally`` alone cannot release an already-held
+    model-generation lock in that ordering, so the response itself owns one
+    idempotent asynchronous cleanup callback as the outermost boundary.
+    """
+
+    def __init__(self, *args: Any, cleanup: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._cleanup = cleanup
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._cleanup()
 
 TEMPLATE = Path(os.environ.get("AUDIO_CPP_CONFIG_TEMPLATE", "/config/qwen3-tts-base-f16.json"))
 ACTIVE_CONFIG = Path("/run/audio-cpp-active.json")
@@ -38,6 +64,12 @@ ACTIVE_MODEL = os.environ.get("AUDIO_CPP_ACTIVE_MODEL", "qwen3-tts-1.7b-base-bf1
 NATIVE_INCREMENTAL_PCM_ENABLED = os.environ.get("AUDIO_CPP_NATIVE_INCREMENTAL_PCM", "false").lower() == "true"
 NATIVE_LOAD_WARMUP_ENABLED = os.environ.get("AUDIO_CPP_NATIVE_LOAD_WARMUP", "false").lower() == "true"
 NATIVE_LOAD_WARMUP_TIMEOUT_SECONDS = float(os.environ.get("AUDIO_CPP_NATIVE_LOAD_WARMUP_TIMEOUT_SECONDS", "180"))
+try:
+    TALKER_PREFIX_CACHE_SLOTS = int(os.environ.get("AUDIO_CPP_TALKER_PREFIX_CACHE_SLOTS", "0"))
+except ValueError as exc:
+    raise RuntimeError("AUDIO_CPP_TALKER_PREFIX_CACHE_SLOTS must be an integer from 0 through 64") from exc
+if not 0 <= TALKER_PREFIX_CACHE_SLOTS <= 64:
+    raise RuntimeError("AUDIO_CPP_TALKER_PREFIX_CACHE_SLOTS must be from 0 through 64")
 VOICE_LIBRARY_DIR = Path(os.environ.get("VOICE_LIBRARY_DIR", "/voices"))
 MIN_SYNTHESIS_FREE_MIB = 2048
 # The 0.6B reserve is derived from the observed 7,266 -> 1,636 MiB load delta
@@ -60,7 +92,7 @@ TUNING_PROFILES_PATH = VOICE_LIBRARY_DIR / "tts_profiles.json"
 GPU_GUARD_MODES = {"enforced", "custom", "disabled"}
 TUNING_PROVIDER = "qwen3tts-audiocpp"
 TUNING_SCOPES = {"voice-studio", "realtime"}
-MODEL_REQUIRED_LEFT_CONTEXT_FRAMES = 72
+MODEL_REQUIRED_LEFT_CONTEXT_FRAMES = 25
 BUILTIN_TUNING_PROFILE_IDS = {"quality", "balanced", "low-latency"}
 TUNING_VALUE_FIELDS = {
     "model",
@@ -81,9 +113,130 @@ ENGINE_DECODE_MODE_HEADER = "X-AudioCPP-Qwen3-Decode-Mode"
 OFFLINE_FULL_DECODE_MODE = "offline-full-decoder"
 SUPPORTED_MASTER_OUTPUT_FORMATS = {"wav", "pcm", "flac", "mp3", "aac", "opus"}
 EVENTS: deque[dict[str, Any]] = deque(maxlen=20)
+REQUEST_OUTCOMES: OrderedDict[str, dict[str, Any]] = OrderedDict()
+OUTCOME_TTL_SECONDS = 600.0
+OUTCOME_CAPACITY = 256
+LIVE_SYNTHESIS_WALL_SECONDS = 180.0
+
+
+def _prune_request_outcomes() -> None:
+    cutoff = time.monotonic() - OUTCOME_TTL_SECONDS
+    for key, value in list(REQUEST_OUTCOMES.items()):
+        if value["_updated"] < cutoff:
+            del REQUEST_OUTCOMES[key]
+    while len(REQUEST_OUTCOMES) > OUTCOME_CAPACITY:
+        REQUEST_OUTCOMES.popitem(last=False)
+
+
+def _begin_request_outcome(payload: dict[str, Any], model: str, mode: str) -> str:
+    # Server-generated identities prevent collisions or prompt material from
+    # being stored in this deliberately content-free diagnostic lookup.
+    request_id = uuid4().hex
+    payload["_outcome_id"] = request_id
+    REQUEST_OUTCOMES[request_id] = {
+        "requestId": request_id, "model": model, "mode": mode,
+        "state": "pending", "reason": None, "generatedFrames": None,
+        "generationCap": None, "eos": None, "audioSeconds": 0.0,
+        "bytes": 0, "elapsedSeconds": None, "_updated": time.monotonic(),
+    }
+    _prune_request_outcomes()
+    return request_id
+
+
+def _finish_request_outcome(request_id: str, status: str, reason: str | None = None,
+                            **fields: Any) -> None:
+    record = REQUEST_OUTCOMES.get(request_id)
+    if record is None or record["state"] in {"completed", "error", "cancelled", "limited"}:
+        return
+    allowed = {"generatedFrames", "generationCap", "eos", "audioSeconds", "bytes", "elapsedSeconds",
+               "promptMs", "prefillMs", "talkerMs", "decodeMs"}
+    record.update({key: value for key, value in fields.items() if key in allowed})
+    record.update(state=status, reason=reason, _updated=time.monotonic())
+    _prune_request_outcomes()
+
+
+def _request_audio_limit_frames(payload: dict[str, Any], mode: str) -> int | None:
+    if mode == OFFLINE_FULL_DECODE_MODE or payload.get("_internal_warmup"):
+        # Full WAV keeps the engine's established capacity. Do not shorten a
+        # user's long offline clip with a live-conversation heuristic.
+        return None
+    text = str(payload.get("input") or payload.get("text") or "")
+    words = len(re.findall(r"\w+", text, re.UNICODE))
+    characters = len(re.sub(r"\s+", "", text))
+    estimated = max(words / 2.6, characters / 14.0)
+    seconds = min(60.0, max(12.0, 3.0 * estimated + 5.0))
+    return int(seconds / 0.08)
+
+
+def _install_request_limit(payload: dict[str, Any], engine_payload: dict[str, Any], mode: str) -> int | None:
+    cap = _request_audio_limit_frames(payload, mode)
+    options = dict(engine_payload.get("options") or {})
+    # The candidate owns this safety bound; arbitrary options cannot raise it.
+    options.pop("qwen3_tts.max_generated_frames", None)
+    if cap is not None:
+        options["qwen3_tts.max_generated_frames"] = cap
+    if options:
+        engine_payload["options"] = options
+    else:
+        engine_payload.pop("options", None)
+    return cap
+
+
+def _generation_event_fields(event: dict[str, Any]) -> dict[str, Any]:
+    values = (event.get("generated_frames"), event.get("generation_cap"))
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+        raise HTTPException(502, "Malformed audio.cpp generation outcome")
+    frames, cap = values
+    termination = event.get("termination")
+    if cap < 1 or frames > cap or termination not in {"eos", "max_generated_frames"}:
+        raise HTTPException(502, "Malformed audio.cpp generation outcome")
+    result = {"generatedFrames": frames, "generationCap": cap, "eos": termination == "eos"}
+    for engine_key, key in (("prompt_ms", "promptMs"), ("prefill_ms", "prefillMs"), ("talker_ms", "talkerMs"), ("decode_ms", "decodeMs")):
+        if engine_key in event:
+            value = event[engine_key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 600000:
+                raise HTTPException(502, "Malformed audio.cpp stage timing")
+            result[key] = value
+    return result
+
+
+def _raise_generation_limit() -> None:
+    raise HTTPException(422, {"state": "generation-limit", "reason": "max_generated_frames",
+                              "message": "Synthesis reached its generated-audio limit; output is incomplete."})
+
+
+async def _deadline_lines(lines: Any, deadline: float) -> Any:
+    """Bound the entire engine stream, not each individual socket read."""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("synthesis wall-clock deadline exceeded")
+        try:
+            yield await asyncio.wait_for(lines.__anext__(), remaining)
+        except StopAsyncIteration:
+            return
+
+# A numeric epoch changes when this process replaces its child.  The nonce
+# additionally distinguishes a new supervisor process whose counter begins at
+# zero again, so frozen response snapshots cannot cross a candidate restart.
+SUPERVISOR_INSTANCE_ID = uuid4().hex
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("audio_cpp_candidate")
 app = FastAPI(title="audio.cpp candidate supervisor")
+
+
+@app.get("/v1/audio/outcomes/{request_id}")
+async def request_outcome(request_id: str) -> Response:
+    if not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        raise HTTPException(422, "Invalid synthesis request ID")
+    _prune_request_outcomes()
+    outcome = REQUEST_OUTCOMES.get(request_id)
+    if outcome is None:
+        raise HTTPException(404, "Synthesis outcome is absent or expired")
+    return JSONResponse({key: value for key, value in outcome.items() if not key.startswith("_")},
+                        headers={"Cache-Control": "no-store"})
+
+
 engine: subprocess.Popen[bytes] | None = None
 switch_lock = asyncio.Lock()
 generation_lock = asyncio.Lock()
@@ -119,7 +272,7 @@ def _enforced_gpu_policy() -> dict[str, Any]:
                 "admissionKind": "measured-residency-plus-synthesis-floor",
                 "residencyReserveMiB": residency_mib,
                 "postLoadSynthesisReserveMiB": MIN_SYNTHESIS_FREE_MIB,
-                "formula": "measured model/graph residency reserve + post-load synthesis floor",
+                "formula": "measured model residency reserve + post-load synthesis floor",
             }
         else:
             models[model_id] = {
@@ -351,6 +504,70 @@ def _record_event(action: str, *, model_id: str | None = None, **details: Any) -
     return event
 
 
+def _native_request_diagnostics(
+    payload: dict[str, Any],
+    tuning_snapshot: dict[str, Any],
+    engine_payload: dict[str, Any],
+    reference_stats: dict[str, Any],
+    model_id: str,
+) -> dict[str, Any]:
+    """Return non-text identifiers and frozen settings for one native request.
+
+    This deliberately omits the phrase and reference transcript. The same
+    dictionary is attached to every lifecycle event for the request, which
+    makes a timing trace useful without turning the candidate event trail into
+    a prompt log.
+    """
+    supplied_id = payload.get("_outcome_id", payload.get("request_id", payload.get("requestId")))
+    if supplied_id is None:
+        supplied_id = payload.get("response_id", payload.get("responseId"))
+    request_id = str(supplied_id or token_hex(12)).strip()
+    if not request_id or len(request_id) > 160:
+        request_id = token_hex(12)
+    effective = tuning_snapshot.get("effective", {})
+    if not isinstance(effective, dict):
+        effective = {}
+    clone_id = str(payload.get("voice") or "")
+    if clone_id.startswith("clone:"):
+        clone_id = clone_id.removeprefix("clone:")
+    else:
+        clone_id = None
+    return {
+        "requestId": request_id,
+        "provider": TUNING_PROVIDER,
+        "modelId": model_id,
+        "engineEpoch": int(payload.get("_engine_epoch") or state.get("engineEpoch") or 0),
+        "supervisorInstanceId": SUPERVISOR_INSTANCE_ID,
+        "tuningScope": tuning_snapshot.get("scope"),
+        "tuningProfileId": tuning_snapshot.get("id"),
+        "tuningProfileRevision": tuning_snapshot.get("revision"),
+        "effectiveFirstBlockFrames": effective.get("first_block_frames"),
+        "effectiveSteadyBlockFrames": effective.get("steady_block_frames"),
+        "effectiveLeftContextFrames": effective.get("left_context_frames"),
+        "responseSeed": engine_payload.get("seed"),
+        "cloneId": clone_id,
+        "cloneContentHash": payload.get("_frozen_clone_content_hash"),
+        "cloneContentRevision": payload.get("_frozen_clone_content_revision"),
+        **_reference_event_fields(reference_stats, "native-incremental-pcm"),
+    }
+
+
+def _engine_stage_timings(response: httpx.Response | Any) -> dict[str, str]:
+    """Expose engine timing headers when a patched engine provides them.
+
+    The pinned audio.cpp server does not promise a fixed stage-header schema,
+    so this is intentionally pass-through telemetry rather than fabricated
+    numbers. It is correlated with the supervisor request id in the event.
+    """
+    headers = getattr(response, "headers", {})
+    return {
+        str(name): str(value)
+        for name, value in headers.items()
+        if str(name).lower().startswith(("x-audiocpp-", "x-engine-"))
+        and str(name).lower() != ENGINE_DECODE_MODE_HEADER.lower()
+    }
+
+
 def _template() -> dict[str, Any]:
     return json.loads(TEMPLATE.read_text(encoding="utf-8"))
 
@@ -406,7 +623,7 @@ def gpu_guard(
         if operation == "load" and details.get("admissionKind") == "measured-residency-plus-synthesis-floor":
             reason = (
                 f"GPU load blocked: {free_mib} MiB free, but enforced admission requires {required} MiB "
-                f"({details['residencyReserveMiB']} MiB measured/rounded model/graph residency + "
+                f"({details['residencyReserveMiB']} MiB measured/rounded model residency + "
                 f"{details['postLoadSynthesisReserveMiB']} MiB post-load synthesis floor)."
             )
         elif operation == "load" and details.get("admissionKind") == "existing-total-threshold":
@@ -441,7 +658,8 @@ def _stop_engine(*, action: str = "release") -> None:
         try:
             engine.wait(timeout=20)
         except subprocess.TimeoutExpired:
-            engine.kill(); engine.wait(timeout=10)
+            engine.kill()
+            engine.wait(timeout=10)
     engine = None
     _record_event(action)
 
@@ -455,20 +673,36 @@ def _start_engine(model_id: str) -> None:
         # not change the BF16 checkpoint or permit a second resident model.
         "qwen3_tts.mem_saver": "false" if NATIVE_INCREMENTAL_PCM_ENABLED else "true",
     }
-    config = _template(); config["port"] = 8081; config["models"] = [model]
+    if NATIVE_INCREMENTAL_PCM_ENABLED and TALKER_PREFIX_CACHE_SLOTS > 0:
+        # Cache only immutable clone/language/control/reference talker state.
+        # Phrase-dependent suffix rows are replayed and generated speech state
+        # remains request-local inside audio.cpp.
+        model["session_options"]["qwen3_tts.talker_prefix_cache_slots"] = str(
+            TALKER_PREFIX_CACHE_SLOTS
+        )
+    config = _template()
+    config["port"] = 8081
+    config["models"] = [model]
     # Keep the published buffered candidate in Offline mode.  The experimental
     # engine accepts Streaming only when the separately enabled native path is
     # installed and validated.
     config["models"][0]["mode"] = _configured_model_mode()
     ACTIVE_CONFIG.write_text(json.dumps(config), encoding="utf-8")
     engine = subprocess.Popen([ENGINE_BIN, "--config", str(ACTIVE_CONFIG)])
-    _record_event("child-start", model_id=model_id, memSaver=not NATIVE_INCREMENTAL_PCM_ENABLED)
+    _record_event(
+        "child-start",
+        model_id=model_id,
+        memSaver=not NATIVE_INCREMENTAL_PCM_ENABLED,
+        talkerPrefixCacheSlots=TALKER_PREFIX_CACHE_SLOTS if NATIVE_INCREMENTAL_PCM_ENABLED else 0,
+    )
 
 
 async def _engine_ready() -> bool:
     async with httpx.AsyncClient(timeout=1.0) as client:
-        try: return (await client.get(f"{ENGINE_URL}/health")).is_success
-        except httpx.HTTPError: return False
+        try:
+            return (await client.get(f"{ENGINE_URL}/health")).is_success
+        except httpx.HTTPError:
+            return False
 
 
 async def _complete_native_load_warmup(model_id: str) -> None:
@@ -503,7 +737,8 @@ async def _complete_native_load_warmup(model_id: str) -> None:
 
 
 async def switch_model(model_id: str) -> dict[str, Any]:
-    if model_id not in _models(): raise HTTPException(status_code=404, detail="Unknown candidate model.")
+    if model_id not in _models():
+        raise HTTPException(status_code=404, detail="Unknown candidate model.")
     async with switch_lock:
         _reconcile_engine()
         warm_after_load = NATIVE_INCREMENTAL_PCM_ENABLED and NATIVE_LOAD_WARMUP_ENABLED
@@ -614,7 +849,15 @@ async def health() -> dict[str, Any]:
                 "native_incremental_pcm": NATIVE_INCREMENTAL_PCM_ENABLED,
                 "native_load_warmup": NATIVE_LOAD_WARMUP_ENABLED,
                 "native_load_warmup_timeout_seconds": NATIVE_LOAD_WARMUP_TIMEOUT_SECONDS,
-                "cuda_graphs_disabled": os.environ.get("GGML_CUDA_DISABLE_GRAPHS") is not None,
+                "cuda_graphs_disabled": None,
+                "cuda_graphs_control_supported": False,
+                "cuda_graphs_mode": "engine-default-uncontrolled",
+                "talker_prefix_cache_slots": TALKER_PREFIX_CACHE_SLOTS if NATIVE_INCREMENTAL_PCM_ENABLED else 0,
+                "talker_prefix_cache_state": (
+                    "configured-experimental"
+                    if NATIVE_INCREMENTAL_PCM_ENABLED and TALKER_PREFIX_CACHE_SLOTS > 0
+                    else "disabled"
+                ),
                 "progressive_phrase_pcm": True,
                 "sample_rate": 24000,
                 "sample_format": "pcm_s16le",
@@ -625,6 +868,7 @@ async def health() -> dict[str, Any]:
             },
         },
         **state,
+        "supervisorInstanceId": SUPERVISOR_INSTANCE_ID,
         "singleResident": True,
         "nativeIncrementalPcm": NATIVE_INCREMENTAL_PCM_ENABLED,
         "ttsMode": "native-incremental-pcm" if NATIVE_INCREMENTAL_PCM_ENABLED else "offline-buffered",
@@ -636,6 +880,7 @@ async def control_status() -> dict[str, Any]:
     _reconcile_engine()
     return {
         **state,
+        "supervisorInstanceId": SUPERVISOR_INSTANCE_ID,
         "singleResident": True,
         "availableModels": list(_models()),
         "events": list(EVENTS),
@@ -727,6 +972,21 @@ def _candidate_profile_payload(profile_id: str, *, include_audio: bool = False) 
         if not reference.is_file():
             raise HTTPException(status_code=409, detail="Clone profile reference audio is missing.")
         result["ref_audio"] = base64.b64encode(reference.read_bytes()).decode("ascii")
+        frozen_excerpts: list[dict[str, str]] = []
+        for excerpt in meta.get("reference_excerpts") or []:
+            if not isinstance(excerpt, dict):
+                continue
+            filename = str(excerpt.get("ref_audio_filename") or "").strip()
+            transcript = str(excerpt.get("ref_text") or "").strip()
+            excerpt_path = path / filename
+            if filename and Path(filename).name == filename and transcript and excerpt_path.is_file():
+                frozen_excerpts.append(
+                    {
+                        "ref_audio": base64.b64encode(excerpt_path.read_bytes()).decode("ascii"),
+                        "ref_text": transcript,
+                    }
+                )
+        result["reference_excerpts"] = frozen_excerpts
     return result
 
 
@@ -931,8 +1191,10 @@ async def delete_tuning_profile(profile_id: str) -> dict[str, Any]:
 
 @app.post("/v1/tuning/profiles/{profile_id}/clone")
 async def clone_tuning_profile(profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    document = _read_tuning_profiles(); source = document["profiles"].get(profile_id)
-    if not isinstance(source, dict): raise HTTPException(status_code=404, detail="Unknown tuning profile.")
+    document = _read_tuning_profiles()
+    source = document["profiles"].get(profile_id)
+    if not isinstance(source, dict):
+        raise HTTPException(status_code=404, detail="Unknown tuning profile.")
     clone_id = str(payload.get("id") or token_hex(5))
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", clone_id):
         raise HTTPException(status_code=422, detail="Invalid clone id.")
@@ -958,8 +1220,10 @@ async def clone_tuning_profile(profile_id: str, payload: dict[str, Any]) -> dict
 @app.post("/v1/tuning/profiles/{profile_id}/reset")
 async def reset_tuning_profile(profile_id: str) -> dict[str, Any]:
     defaults = _default_tuning_profiles()["profiles"]
-    if profile_id not in defaults: raise HTTPException(status_code=409, detail="Only built-in tuning profiles can be reset.")
-    document = _read_tuning_profiles(); document["profiles"][profile_id] = defaults[profile_id]
+    if profile_id not in defaults:
+        raise HTTPException(status_code=409, detail="Only built-in tuning profiles can be reset.")
+    document = _read_tuning_profiles()
+    document["profiles"][profile_id] = defaults[profile_id]
     return _write_tuning_profiles(document)
 
 
@@ -978,7 +1242,13 @@ async def import_tuning_profiles(payload: dict[str, Any]) -> dict[str, Any]:
     for profile_id, profile in incoming["profiles"].items():
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", str(profile_id)) or not isinstance(profile, dict):
             raise HTTPException(status_code=422, detail="Invalid imported profile.")
-        candidate = dict(profile); candidate.update(id=str(profile_id), clone_mode="full_icl", crossfade_samples=0, revision=1)
+        candidate = dict(profile)
+        candidate.update(
+            id=str(profile_id),
+            clone_mode="full_icl",
+            crossfade_samples=0,
+            revision=1,
+        )
         _validate_tuning_profile(candidate)
         if profile_id in BUILTIN_TUNING_PROFILE_IDS:
             continue
@@ -998,7 +1268,9 @@ async def import_tuning_profiles(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.put("/v1/tuning/selection")
 async def select_tuning_profile(payload: dict[str, Any]) -> dict[str, Any]:
-    document = _read_tuning_profiles(); provider = str(payload.get("provider") or TUNING_PROVIDER); profile_id = str(payload.get("profile_id") or "balanced")
+    document = _read_tuning_profiles()
+    provider = str(payload.get("provider") or TUNING_PROVIDER)
+    profile_id = str(payload.get("profile_id") or "balanced")
     scope = str(payload.get("scope") or "realtime")
     if provider != TUNING_PROVIDER:
         raise HTTPException(status_code=422, detail="Tuning profile selection is available only for qwen3tts-audiocpp.")
@@ -1014,7 +1286,8 @@ async def select_tuning_profile(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/v1/tuning/resolve")
 async def resolve_tuning_profile(payload: dict[str, Any]) -> dict[str, Any]:
-    document = _read_tuning_profiles(); provider = str(payload.get("provider") or TUNING_PROVIDER)
+    document = _read_tuning_profiles()
+    provider = str(payload.get("provider") or TUNING_PROVIDER)
     scope = str(payload.get("scope") or "realtime")
     if provider != TUNING_PROVIDER:
         raise HTTPException(status_code=422, detail="Tuning profiles are available only for qwen3tts-audiocpp.")
@@ -1026,7 +1299,8 @@ async def resolve_tuning_profile(payload: dict[str, Any]) -> dict[str, Any]:
     if profile.get("model") and profile["model"] != state["activeModel"]:
         raise HTTPException(status_code=409, detail={"active": state["activeModel"], "required": profile["model"], "auto_switch": False})
     overrides = payload.get("overrides") or {}
-    if not isinstance(overrides, dict): raise HTTPException(status_code=422, detail="Temporary overrides must be an object.")
+    if not isinstance(overrides, dict):
+        raise HTTPException(status_code=422, detail="Temporary overrides must be an object.")
     supported = TUNING_VALUE_FIELDS - {"clone_mode"}
     unknown = set(overrides) - supported
     if unknown:
@@ -1110,6 +1384,12 @@ async def backend_models() -> dict[str, Any]:
             "gpu_guard": dict(gpu_guard_settings),
             "mem_saver": not NATIVE_INCREMENTAL_PCM_ENABLED,
             "native_incremental_pcm": NATIVE_INCREMENTAL_PCM_ENABLED,
+            "talker_prefix_cache_slots": TALKER_PREFIX_CACHE_SLOTS if NATIVE_INCREMENTAL_PCM_ENABLED else 0,
+            "talker_prefix_cache_state": (
+                "configured-experimental"
+                if NATIVE_INCREMENTAL_PCM_ENABLED and TALKER_PREFIX_CACHE_SLOTS > 0
+                else "disabled"
+            ),
             "progressive_phrase_pcm": True,
             "sample_rate": 24000,
             "sample_format": "pcm_s16le",
@@ -1117,6 +1397,8 @@ async def backend_models() -> dict[str, Any]:
         },
         "events": list(EVENTS),
         "last_action": state["lastAction"],
+        "engineEpoch": int(state.get("engineEpoch") or 0),
+        "supervisorInstanceId": SUPERVISOR_INSTANCE_ID,
         "singleResident": True,
     }
 
@@ -1140,6 +1422,63 @@ def _apply_clone_profile(payload: dict[str, Any]) -> None:
     if not voice.startswith("clone:"):
         return
     profile_id = voice.removeprefix("clone:")
+    if not valid_profile_id(profile_id):
+        raise HTTPException(status_code=422, detail="Invalid clone profile id.")
+    frozen = payload.pop("clone_snapshot", None)
+    if frozen is not None:
+        if not isinstance(frozen, dict):
+            raise HTTPException(status_code=422, detail="clone_snapshot must be an object.")
+        frozen_id = str(frozen.get("profile_id") or "")
+        content_hash = str(frozen.get("content_hash") or "")
+        content_revision = frozen.get("content_revision")
+        raw = str(frozen.get("ref_audio") or "")
+        transcript = str(frozen.get("ref_text") or "").strip()
+        raw_excerpts = frozen.get("reference_excerpts") or []
+        if (
+            frozen_id != profile_id
+            or not re.fullmatch(r"[0-9a-f]{64}", content_hash)
+            or isinstance(content_revision, bool)
+            or not isinstance(content_revision, int)
+            or content_revision < 1
+            or not raw
+            or not transcript
+            or not isinstance(raw_excerpts, list)
+        ):
+            raise HTTPException(status_code=422, detail="Invalid frozen clone snapshot.")
+        try:
+            reference_audio = base64.b64decode(raw, validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="Frozen clone reference audio is invalid.") from exc
+        matched_pairs: list[dict[str, str]] = []
+        hash_excerpts: list[tuple[bytes, str]] = []
+        for excerpt in raw_excerpts:
+            if not isinstance(excerpt, dict):
+                raise HTTPException(status_code=422, detail="Frozen clone excerpts must be objects.")
+            excerpt_encoded = str(excerpt.get("ref_audio") or "")
+            excerpt_text = str(excerpt.get("ref_text") or "").strip()
+            if not excerpt_encoded or not excerpt_text:
+                raise HTTPException(status_code=422, detail="Frozen clone excerpts require audio and transcript.")
+            try:
+                excerpt_audio = base64.b64decode(excerpt_encoded, validate=True)
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail="Frozen clone excerpt audio is invalid.") from exc
+            hash_excerpts.append((excerpt_audio, excerpt_text))
+            matched_pairs.append({"ref_audio": excerpt_encoded, "ref_text": excerpt_text})
+        if clone_content_hash(reference_audio, transcript, hash_excerpts) != content_hash:
+            raise HTTPException(status_code=409, detail="Frozen clone content hash does not match its reference material.")
+        # Do not reopen mutable library metadata here.  These bytes were
+        # captured when the response snapshot was created, so later profile
+        # edits cannot change a later phrase in the same answer.
+        payload.update(
+            task_type="Base",
+            ref_audio=raw,
+            ref_text=transcript,
+            x_vector_only_mode=False,
+            _matched_reference_pairs=matched_pairs,
+            _frozen_clone_content_hash=content_hash,
+            _frozen_clone_content_revision=content_revision,
+        )
+        return
     profile_root = VOICE_LIBRARY_DIR / "profiles" / profile_id
     try:
         meta = json.loads((profile_root / "meta.json").read_text(encoding="utf-8"))
@@ -1298,6 +1637,8 @@ def _voice_profiles() -> list[dict[str, Any]]:
             "task": "Base",
             "language": str(meta["language"]),
             "provider": TUNING_PROVIDER,
+            "content_revision": int(meta["content_revision"]),
+            "content_hash": str(meta["content_hash"]),
         }
         for meta in live_profiles(VOICE_LIBRARY_DIR, normalize=True)
     ]
@@ -1337,6 +1678,22 @@ def _write_candidate_profile(profile_id: str, payload: dict[str, Any]) -> dict[s
         except HTTPException as exc:
             raise HTTPException(status_code=422, detail=exc.detail) from exc
         prepared_excerpts.append((f"ref_excerpt_{index}.wav", excerpt_audio, excerpt_text))
+    current = canonical_profile(VOICE_LIBRARY_DIR, profile_id, normalize=True)
+    content_hash = clone_content_hash(
+        audio,
+        reference_text,
+        [(excerpt_audio, excerpt_text) for _, excerpt_audio, excerpt_text in prepared_excerpts],
+    )
+    previous_revision = (
+        int(current.get("content_revision", 1))
+        if isinstance(current, dict) and isinstance(current.get("content_revision"), int)
+        else 0
+    )
+    content_revision = (
+        previous_revision
+        if isinstance(current, dict) and current.get("content_hash") == content_hash
+        else previous_revision + 1
+    )
     profile_dir = VOICE_LIBRARY_DIR / "profiles" / profile_id
     profile_dir.mkdir(parents=True, exist_ok=True)
     reference_name = "ref_audio.wav"
@@ -1361,6 +1718,8 @@ def _write_candidate_profile(profile_id: str, payload: dict[str, Any]) -> dict[s
         "ref_audio_filename": reference_name,
         "origin": str(payload.get("origin") or "audio.cpp Base clone"),
         "provider": TUNING_PROVIDER,
+        "content_revision": max(1, content_revision),
+        "content_hash": content_hash,
         "reference_excerpts": [
             {"ref_audio_filename": filename, "ref_text": transcript}
             for filename, _, transcript in prepared_excerpts
@@ -1369,7 +1728,13 @@ def _write_candidate_profile(profile_id: str, payload: dict[str, Any]) -> dict[s
     temp_meta.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
     temp_meta.replace(profile_dir / "meta.json")
     _record_event("profile-imported", profile_id=profile_id)
-    return {"id": profile_id, "voice": f"clone:{profile_id}", "name": metadata["name"]}
+    return {
+        "id": profile_id,
+        "voice": f"clone:{profile_id}",
+        "name": metadata["name"],
+        "content_revision": metadata["content_revision"],
+        "content_hash": metadata["content_hash"],
+    }
 
 
 def _render_master_wav(master_wav: bytes, requested_format: str) -> tuple[bytes, str, str, dict[str, int | str]]:
@@ -1447,7 +1812,38 @@ async def _assert_synthesis_ready(payload: dict[str, Any]) -> str:
         state.update(reason=guard["reason"], lastError=guard["reason"])
         _record_event("gpu-blocked-synthesis", model_id=model_id, gpu=guard)
         raise HTTPException(status_code=409, detail={"state": "blocked", **guard})
+    expected_epoch_raw = payload.pop("expected_engine_epoch", None)
+    expected_instance_raw = payload.pop("expected_supervisor_instance_id", None)
+    expected_epoch: int | None = None
+    expected_instance: str | None = None
+    if expected_epoch_raw is not None:
+        if isinstance(expected_epoch_raw, bool):
+            raise HTTPException(status_code=422, detail="expected_engine_epoch must be a non-negative integer.")
+        if isinstance(expected_epoch_raw, int):
+            expected_epoch = expected_epoch_raw
+        elif isinstance(expected_epoch_raw, str) and expected_epoch_raw.isdecimal():
+            expected_epoch = int(expected_epoch_raw)
+        else:
+            raise HTTPException(status_code=422, detail="expected_engine_epoch must be a non-negative integer.")
+        if expected_epoch < 0:
+            raise HTTPException(status_code=422, detail="expected_engine_epoch must be a non-negative integer.")
+    if expected_instance_raw is not None:
+        if not isinstance(expected_instance_raw, str) or not re.fullmatch(r"[0-9a-f]{32}", expected_instance_raw):
+            raise HTTPException(status_code=422, detail="expected_supervisor_instance_id must be a supervisor instance nonce.")
+        expected_instance = expected_instance_raw
+    if (expected_epoch is None) != (expected_instance is None):
+        raise HTTPException(
+            status_code=422,
+            detail="expected_engine_epoch and expected_supervisor_instance_id must be supplied together.",
+        )
     admission_epoch = int(state.get("engineEpoch") or 0)
+    if expected_epoch is not None and (
+        expected_epoch != admission_epoch or expected_instance != SUPERVISOR_INSTANCE_ID
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Candidate engine lifecycle changed before synthesis admission; retry with the current supervisor identity.",
+        )
     if not await _engine_ready():
         raise HTTPException(status_code=503, detail="Candidate model is switching/loading; retry when Voice Studio reports loaded.")
     if state["state"] != "loaded" or state["activeModel"] != model_id or admission_epoch != int(state.get("engineEpoch") or 0):
@@ -1491,16 +1887,50 @@ def _resolve_request_tuning(
 ) -> dict[str, Any]:
     """Resolve one immutable request policy without mixing offline and stream knobs."""
     tuning = payload.get("tuning") or {}
-    if not isinstance(tuning, dict): raise HTTPException(status_code=422, detail="tuning must be an object.")
+    if not isinstance(tuning, dict):
+        raise HTTPException(status_code=422, detail="tuning must be an object.")
     provider = tuning.get("provider")
     if provider is not None and provider != TUNING_PROVIDER:
         raise HTTPException(status_code=422, detail="tuning is available only for qwen3tts-audiocpp.")
     scope = str(tuning.get("scope") or "realtime")
-    document = _read_tuning_profiles()
-    selected = _selected_tuning_profile(document, scope)
-    profile_id = str(tuning.get("profile_id") or selected)
-    profile = document["profiles"].get(profile_id)
-    if not isinstance(profile, dict): raise HTTPException(status_code=404, detail="Unknown tuning profile.")
+    frozen_effective = tuning.get("effective")
+    if frozen_effective is not None:
+        # HF Realtime resolves the named profile when the user applies it, then
+        # freezes this bounded value snapshot for one assistant response.  Do
+        # not reread the mutable profile document for later phrase requests:
+        # the profile may have been edited or deleted after the answer began.
+        if provider != TUNING_PROVIDER or not isinstance(frozen_effective, dict):
+            raise HTTPException(status_code=422, detail="Frozen tuning requires the qwen3tts-audiocpp provider and an effective object.")
+        unknown_effective = set(frozen_effective) - TUNING_VALUE_FIELDS
+        if unknown_effective:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unsupported frozen tuning field(s): {', '.join(sorted(unknown_effective))}.",
+            )
+        required_effective = TUNING_VALUE_FIELDS - {"model", "clone_mode"}
+        missing_effective = required_effective - set(frozen_effective)
+        if missing_effective:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Frozen tuning is missing field(s): {', '.join(sorted(missing_effective))}.",
+            )
+        profile_id = str(tuning.get("profile_id") or "")
+        if not profile_id:
+            raise HTTPException(status_code=422, detail="Frozen tuning requires profile_id.")
+        revision = tuning.get("profile_revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise HTTPException(status_code=422, detail="Frozen tuning requires a positive profile_revision.")
+        profile = dict(frozen_effective)
+        profile.setdefault("clone_mode", "full_icl")
+        _validate_tuning_profile(profile)
+    else:
+        document = _read_tuning_profiles()
+        selected = _selected_tuning_profile(document, scope)
+        profile_id = str(tuning.get("profile_id") or selected)
+        profile = document["profiles"].get(profile_id)
+        if not isinstance(profile, dict):
+            raise HTTPException(status_code=404, detail="Unknown tuning profile.")
+        revision = profile.get("revision", 1)
     required_model = tuning.get("model") or profile.get("model")
     if required_model and required_model != state["activeModel"]:
         raise HTTPException(status_code=409, detail={"active": state["activeModel"], "required": required_model, "auto_switch": False})
@@ -1518,7 +1948,9 @@ def _resolve_request_tuning(
         request_seed = _normalize_seed_value(payload["seed"])
     else:
         request_seed = None
-    candidate = dict(profile); candidate.update(overrides); _validate_tuning_profile(candidate)
+    candidate = dict(profile)
+    candidate.update(overrides)
+    _validate_tuning_profile(candidate)
     if candidate.get("model") and candidate["model"] != state["activeModel"]:
         raise HTTPException(status_code=409, detail={"active": state["activeModel"], "required": candidate["model"], "auto_switch": False})
     allowed.update(overrides)
@@ -1576,7 +2008,7 @@ def _resolve_request_tuning(
     return {
         "id": profile_id,
         "scope": scope,
-        "revision": profile.get("revision", 1),
+        "revision": revision,
         "policy": "offline-full-quality" if offline_full_quality else "profile-streaming",
         "delivery_mode": delivery_mode,
         "effective": effective,
@@ -1602,17 +2034,18 @@ async def speech(request: Request) -> Response:
             raise HTTPException(status_code=409, detail="Native incremental PCM is not enabled in this candidate build; use buffered phrase PCM or deploy a validated native build.")
         if not (payload.get("task_type") == "Base" or payload.get("ref_audio")):
             raise HTTPException(status_code=422, detail="Native streaming currently supports Base clone requests only.")
-        return _native_clone_pcm_response(payload, model_id)
+        return await _native_clone_pcm_response(payload, model_id, request=request)
     async with generation_lock:
         _revalidate_generation_admission(payload, model_id)
         _record_event("generation-start", model_id=model_id, requestedFormat=str(payload.get("response_format") or "wav"))
         if payload.get("task_type") == "Base" or payload.get("ref_audio"):
-            return await _voice_clone_response(payload)
+            return await _voice_clone_response(payload, request=request)
         payload.pop("_tuning_snapshot", None)
         payload.pop("tuning", None)
+        _strip_private_engine_fields(payload)
         payload["stream"] = False
         async with httpx.AsyncClient(timeout=600.0) as client:
-            response = await client.post(f"{ENGINE_URL}/v1/audio/speech", json=payload)
+            response = await _post_engine_with_disconnect(client, payload, request=request)
         return Response(content=response.content, status_code=response.status_code, media_type=response.headers.get("content-type"))
 
 
@@ -1632,7 +2065,7 @@ async def voice_clone(request: Request) -> Response:
     async with generation_lock:
         _revalidate_generation_admission(payload, model_id)
         _record_event("generation-start", model_id=model_id, requestedFormat=str(payload.get("response_format") or "wav"))
-        return await _voice_clone_response(payload)
+        return await _voice_clone_response(payload, request=request)
 
 
 def _decode_reference_wav(raw: str, label: str) -> tuple[bytes, float]:
@@ -1758,7 +2191,7 @@ def _apply_engine_tuning(engine_payload: dict[str, Any]) -> dict[str, Any]:
 def _strip_private_engine_fields(engine_payload: dict[str, Any]) -> None:
     """Keep supervisor bookkeeping out of audio.cpp's public request schema."""
     for key in list(engine_payload):
-        if key.startswith("_"):
+        if key.startswith("_") or key in {"request_id", "requestId", "response_id", "responseId"}:
             engine_payload.pop(key, None)
 
 
@@ -1795,7 +2228,302 @@ def _validate_engine_decode_mode(
     return actual or "unreported"
 
 
-async def _voice_clone_response(payload: dict[str, Any]) -> Response:
+_NATIVE_SSE_DONE = object()
+
+
+def _native_sse_event(line: str) -> dict[str, Any] | object | None:
+    """Decode one audio.cpp SSE data line without treating transport text as PCM.
+
+    Native PCM is admitted only after the engine emits its own decoder-mode
+    artifact.  The candidate never converts request metadata into that proof.
+    """
+    if not line.startswith("data:"):
+        return None
+    data = line[5:].strip()
+    if not data:
+        return None
+    if data == "[DONE]":
+        return _NATIVE_SSE_DONE
+    try:
+        value = json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="audio.cpp native SSE contained invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=502, detail="audio.cpp native SSE event must be an object")
+    return value
+
+
+async def _await_native_decode_mode_proof(lines: Any) -> str:
+    """Consume only engine SSE metadata until native decode proof is observed.
+
+    The caller retains the same iterator for PCM relay, so the proof is not
+    replayed and the first audio delta remains the next unread event.  PCM or
+    completion before the proof is a fail-closed protocol violation.
+    """
+    while True:
+        try:
+            line = await lines.__anext__()
+        except StopAsyncIteration as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"state": "decoder-mode-proof-missing", "expected": "native-incremental-pcm"},
+            ) from exc
+        event = _native_sse_event(line)
+        if event is _NATIVE_SSE_DONE:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "state": "decoder-mode-proof-missing",
+                    "message": "audio.cpp native SSE ended before decoder-mode proof",
+                    "expected": "native-incremental-pcm",
+                },
+            )
+        if event is None:
+            continue
+        assert isinstance(event, dict)
+        event_type = str(event.get("type") or "")
+        if event_type == "error":
+            error = event.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "state": "native-stream-error",
+                    "message": str(message or "audio.cpp native stream failed before decoder-mode proof"),
+                    "chunksReceived": 0,
+                },
+            )
+        if event_type == "speech.decode_mode":
+            candidate_mode = str(event.get("mode") or "")
+            if candidate_mode != "native-incremental-pcm":
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "state": "decoder-mode-mismatch",
+                        "expected": "native-incremental-pcm",
+                        "actual": candidate_mode or None,
+                    },
+                )
+            return candidate_mode
+        if event_type in {"speech.audio.delta", "speech.audio.done"}:
+            raise HTTPException(
+                status_code=502,
+                detail={"state": "decoder-mode-proof-missing", "expected": "native-incremental-pcm"},
+            )
+
+
+def _decode_native_pcm_delta(event: dict[str, Any]) -> bytes:
+    """Decode one engine-owned PCM delta without altering its boundaries."""
+
+    encoded = event.get("audio")
+    if not isinstance(encoded, str):
+        raise HTTPException(status_code=502, detail="audio.cpp native SSE PCM delta is missing audio")
+    try:
+        chunk = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=502, detail="audio.cpp native SSE PCM delta is malformed") from exc
+    if not chunk:
+        return b""
+    if len(chunk) % 2:
+        raise HTTPException(status_code=502, detail="audio.cpp native SSE PCM delta is not PCM16 aligned")
+    return chunk
+
+
+async def _prefetch_native_pcm_proof(
+    lines: Any,
+    *,
+    verified_decode_mode: str,
+    minimum_chunks: int = 2,
+) -> list[tuple[bytes, float]]:
+    """Require genuine engine delta boundaries before committing headers.
+
+    HTTP client read boundaries are not engine chunk boundaries: intermediaries
+    may coalesce two SSE deltas into one byte read or split one delta across
+    reads.  This preflight consumes two *decoded* nonempty speech.audio.delta
+    events from the same iterator, buffers them once, and lets the relay emit
+    those exact bytes exactly once.
+    """
+
+    prefetched: list[tuple[bytes, float]] = []
+    while len(prefetched) < minimum_chunks:
+        try:
+            line = await lines.__anext__()
+        except StopAsyncIteration as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "state": "native-stream-not-incremental",
+                    "message": f"audio.cpp native SSE ended before {minimum_chunks} nonempty PCM delta events",
+                    "chunksReceived": len(prefetched),
+                },
+            ) from exc
+        event = _native_sse_event(line)
+        if event is _NATIVE_SSE_DONE:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "state": "native-stream-not-incremental",
+                    "message": f"audio.cpp native SSE ended before {minimum_chunks} nonempty PCM delta events",
+                    "chunksReceived": len(prefetched),
+                },
+            )
+        if event is None:
+            continue
+        assert isinstance(event, dict)
+        event_type = str(event.get("type") or "")
+        if event_type == "error":
+            error = event.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "state": "native-stream-error",
+                    "message": str(message or "audio.cpp native stream failed before incremental proof"),
+                    "chunksReceived": len(prefetched),
+                },
+            )
+        if event_type == "speech.decode_mode":
+            candidate_mode = str(event.get("mode") or "")
+            if candidate_mode != verified_decode_mode:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "state": "decoder-mode-mismatch",
+                        "expected": verified_decode_mode,
+                        "actual": candidate_mode or None,
+                    },
+                )
+            continue
+        if event_type == "speech.audio.done":
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "state": "native-stream-not-incremental",
+                    "message": f"audio.cpp native SSE completed before {minimum_chunks} nonempty PCM delta events",
+                    "chunksReceived": len(prefetched),
+                },
+            )
+        if event_type == "speech.generation":
+            generation = _generation_event_fields(event)
+            if not generation["eos"]:
+                _raise_generation_limit()
+            raise HTTPException(502, "audio.cpp generation completed before two native PCM events")
+        if event_type != "speech.audio.delta":
+            continue
+        chunk = _decode_native_pcm_delta(event)
+        if chunk:
+            prefetched.append((chunk, time.monotonic()))
+    return prefetched
+
+
+def _is_native_terminal_transport_line(line: str) -> bool:
+    """Return whether a post-completion SSE line is only a blank separator."""
+
+    return not line.strip()
+
+
+async def _await_native_stage_with_disconnect(
+    awaitable: Any,
+    *,
+    request: Request | None,
+    stage: str,
+    model_id: str,
+    internal_warmup: bool,
+) -> Any:
+    """Await one pre-header native stage while retaining downstream ownership.
+
+    Starlette cannot cancel a response iterator until the StreamingResponse has
+    been returned.  Native proof deliberately happens before that boundary, so
+    every blocking stage must observe a browser disconnect itself or the sole
+    generation lock can remain pinned for the upstream timeout.
+    """
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        if request is None:
+            return await task
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=0.05)
+            if done:
+                break
+            if await request.is_disconnected():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                if not internal_warmup:
+                    _record_event(
+                        "generation-cancelled",
+                        model_id=model_id,
+                        nativeIncremental=True,
+                        reason="client-disconnected",
+                        stage=stage,
+                    )
+                raise asyncio.CancelledError(
+                    f"downstream client disconnected during native {stage}"
+                )
+        return await task
+    except BaseException:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        raise
+
+
+async def _post_engine_with_disconnect(
+    client: httpx.AsyncClient,
+    payload: dict[str, Any],
+    *,
+    request: Request | None,
+) -> httpx.Response:
+    """Own a buffered upstream POST until completion or client disconnect.
+
+    A regular ``await client.post`` gives FastAPI no cancellation point tied to
+    the downstream socket while the engine is synthesizing.  Because the caller
+    holds the single-generation lock, an abandoned ten-minute request could
+    otherwise block cancellation, model lifecycle, and every successor turn.
+    """
+
+    upstream = asyncio.create_task(
+        client.post(f"{ENGINE_URL}/v1/audio/speech", json=payload)
+    )
+    try:
+        if request is None:
+            return await upstream
+        while not upstream.done():
+            done, _ = await asyncio.wait({upstream}, timeout=0.05)
+            if done:
+                break
+            if await request.is_disconnected():
+                upstream.cancel()
+                try:
+                    await upstream
+                except asyncio.CancelledError:
+                    pass
+                _record_event(
+                    "generation-cancelled",
+                    model_id=state.get("activeModel"),
+                    reason="client-disconnected",
+                )
+                raise asyncio.CancelledError("downstream client disconnected")
+        return await upstream
+    except BaseException:
+        if not upstream.done():
+            upstream.cancel()
+            try:
+                await upstream
+            except asyncio.CancelledError:
+                pass
+        raise
+
+
+async def _voice_clone_response(
+    payload: dict[str, Any], *, request: Request | None = None
+) -> Response:
     if bool(payload.get("x_vector_only_mode")):
         raise HTTPException(status_code=422, detail="x_vector_only_mode is unavailable; use a full ICL reference and transcript.")
     raw = str(payload.get("ref_audio") or "")
@@ -1818,7 +2546,13 @@ async def _voice_clone_response(payload: dict[str, Any]) -> Response:
     options = dict(options)
     options.pop("qwen3_tts.decode_mode", None)
     expected_decode_mode: str | None = None
-    if delivery_mode == OFFLINE_FULL_DECODE_MODE:
+    # Buffered phrase delivery is a completed-response fallback.  It must use
+    # the original offline decoder even when the resident model also supports
+    # native incremental PCM; otherwise the engine performs the slower native
+    # block loop internally and merely buffers those blocks before returning.
+    # Keep the outward delivery label distinct so callers can still tell a
+    # completed PCM phrase from a Full Quality export.
+    if delivery_mode in {OFFLINE_FULL_DECODE_MODE, "buffered-fallback"}:
         options["qwen3_tts.decode_mode"] = "offline_full"
         expected_decode_mode = OFFLINE_FULL_DECODE_MODE
     if options:
@@ -1830,6 +2564,10 @@ async def _voice_clone_response(payload: dict[str, Any]) -> Response:
         tuning_snapshot,
         f"audio-cpp-reference-{token_hex(8)}.wav",
     )
+    lifecycle_headers = {
+        "X-TTS-Engine-Epoch": str(int(payload.get("_engine_epoch") or state.get("engineEpoch") or 0)),
+        "X-TTS-Supervisor-Instance-Id": SUPERVISOR_INSTANCE_ID,
+    }
     engine_payload.update(
         model=state["activeModel"],
         voice_ref=str(reference),
@@ -1837,11 +2575,32 @@ async def _voice_clone_response(payload: dict[str, Any]) -> Response:
         response_format="wav",
         stream=False,
     )
+    cap = _install_request_limit(payload, engine_payload, delivery_mode)
+    outcome_id = _begin_request_outcome(payload, str(state["activeModel"]), delivery_mode)
+    _finish_request_outcome(outcome_id, "producing", generationCap=cap)
+    lifecycle_headers["X-TTS-Request-Id"] = outcome_id
+    started = time.monotonic()
+    diagnostics = _native_request_diagnostics(payload, tuning_snapshot, engine_payload, reference_stats, str(state["activeModel"]))
+    diagnostics["deliveryMode"] = delivery_mode
     _strip_private_engine_fields(engine_payload)
     try:
-        async with httpx.AsyncClient(timeout=600.0) as client:
-            response = await client.post(f"{ENGINE_URL}/v1/audio/speech", json=engine_payload)
+        wall_seconds = 600.0 if delivery_mode == OFFLINE_FULL_DECODE_MODE else LIVE_SYNTHESIS_WALL_SECONDS
+        async with httpx.AsyncClient(timeout=wall_seconds) as client:
+            response = await asyncio.wait_for(
+                _post_engine_with_disconnect(client, engine_payload, request=request),
+                timeout=wall_seconds,
+            )
         if response.is_error:
+            termination = response.headers.get("X-AudioCPP-Termination", "")
+            # Completed-result exceptions cannot carry engine artifact headers.
+            # Match only the engine-owned marker, never infer degeneration from
+            # arbitrary error prose or repeat a failed request in another mode.
+            if "qwen3_tts.max_generated_frames_exhausted" in response.text[:4096]:
+                termination = "max_generated_frames"
+            _finish_request_outcome(outcome_id, "limited" if termination == "max_generated_frames" else "error",
+                                    "max_generated_frames" if termination == "max_generated_frames" else "engine-error")
+            if termination == "max_generated_frames":
+                _raise_generation_limit()
             proven_decoder_mode = _engine_decode_mode(response)
             upstream_decoder_mode = proven_decoder_mode or "unreported"
             _record_event(
@@ -1853,6 +2612,7 @@ async def _voice_clone_response(payload: dict[str, Any]) -> Response:
             )
             error_headers = {
                 "X-TTS-Decoder-Mode": upstream_decoder_mode,
+                **lifecycle_headers,
                 **_reference_headers(reference_stats, delivery_mode),
             }
             if proven_decoder_mode:
@@ -1875,6 +2635,22 @@ async def _voice_clone_response(payload: dict[str, Any]) -> Response:
                 **_reference_event_fields(reference_stats, delivery_mode),
             )
             raise
+        termination = response.headers.get("X-AudioCPP-Termination", "")
+        if termination == "max_generated_frames":
+            _finish_request_outcome(outcome_id, "limited", "max_generated_frames")
+            _raise_generation_limit()
+        if delivery_mode == "buffered-fallback" and termination != "eos":
+            raise HTTPException(502, "audio.cpp buffered synthesis lacks engine-owned EOS telemetry")
+        generation_fields = {}
+        if termination == "eos":
+            try:
+                generation_fields = _generation_event_fields({
+                    "generated_frames": int(response.headers["X-AudioCPP-Generated-Frames"]),
+                    "generation_cap": int(response.headers["X-AudioCPP-Generation-Cap"]),
+                    "termination": termination,
+                })
+            except (KeyError, ValueError) as exc:
+                raise HTTPException(502, "Malformed audio.cpp completed generation telemetry") from exc
         try:
             content, media_type, extension, metadata = _render_master_wav(
                 response.content, requested_format,
@@ -1890,6 +2666,13 @@ async def _voice_clone_response(payload: dict[str, Any]) -> Response:
                 **_reference_event_fields(reference_stats, delivery_mode),
             )
             raise
+        # The engine permits EOS immediately after exactly cap codec frames.
+        # Duration alone cannot distinguish that valid final lookahead step
+        # from a cap termination; buffered output already requires engine EOS.
+        _finish_request_outcome(outcome_id, "completed", termination or "complete-unreported-eos",
+                                audioSeconds=metadata.get("durationSeconds"), bytes=len(content),
+                                elapsedSeconds=round(time.monotonic() - started, 3),
+                                **generation_fields)
         _record_event(
             "generation-complete",
             model_id=state["activeModel"],
@@ -1903,7 +2686,9 @@ async def _voice_clone_response(payload: dict[str, Any]) -> Response:
             sampleRate=metadata.get("sampleRate"),
             bitsPerSample=metadata.get("bitsPerSample"),
             channels=metadata.get("channels"),
-            **_reference_event_fields(reference_stats, delivery_mode),
+            elapsedSeconds=round(time.monotonic() - started, 3),
+            realtimeFactor=round((time.monotonic() - started) / metadata["durationSeconds"], 3) if metadata.get("durationSeconds") else None,
+            **diagnostics,
         )
         result_headers = {
             "X-TTS-Model": state["activeModel"],
@@ -1916,10 +2701,14 @@ async def _voice_clone_response(payload: dict[str, Any]) -> Response:
             "X-TTS-Duration-Seconds": str(metadata["durationSeconds"]),
             "X-TTS-Format": extension,
             "X-TTS-Decoder-Mode": decoder_mode,
+            **lifecycle_headers,
             **_reference_headers(reference_stats, delivery_mode),
         }
         if "seed" in engine_payload:
             result_headers["X-TTS-Seed"] = str(engine_payload["seed"])
+        for name in ("X-AudioCPP-Generated-Frames", "X-AudioCPP-Generation-Cap", "X-AudioCPP-Termination"):
+            if name in response.headers:
+                result_headers[name] = response.headers[name]
         if decoder_mode != "unreported":
             result_headers[ENGINE_DECODE_MODE_HEADER] = decoder_mode
         return Response(
@@ -1927,11 +2716,27 @@ async def _voice_clone_response(payload: dict[str, Any]) -> Response:
             media_type=media_type,
             headers=result_headers,
         )
+    except asyncio.CancelledError:
+        _finish_request_outcome(outcome_id, "cancelled", "client-cancelled")
+        raise
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        _finish_request_outcome(outcome_id, "error", "wall-timeout")
+        raise HTTPException(504, "Synthesis exceeded its wall-clock deadline", headers=lifecycle_headers) from exc
+    except BaseException as exc:
+        _finish_request_outcome(outcome_id, "error", "synthesis-error")
+        if isinstance(exc, HTTPException):
+            exc.headers = {**(exc.headers or {}), **lifecycle_headers}
+        raise
     finally:
         reference.unlink(missing_ok=True)
 
 
-def _native_clone_pcm_response(payload: dict[str, Any], model_id: str) -> StreamingResponse:
+async def _native_clone_pcm_response(
+    payload: dict[str, Any],
+    model_id: str,
+    *,
+    request: Request | None = None,
+) -> StreamingResponse:
     """Relay one engine request as raw, incrementally-produced PCM16 blocks.
 
     The engine is the sole producer of stream chunks.  The supervisor never
@@ -1970,65 +2775,359 @@ def _native_clone_pcm_response(payload: dict[str, Any], model_id: str) -> Stream
         reference_text=reference_text,
         response_format="pcm",
         stream=True,
-        stream_format="audio",
+        # SSE lets the engine deliver a result-derived mode artifact before
+        # any PCM delta.  Raw chunked PCM has no metadata channel for that
+        # proof, so it is not accepted as the candidate-native relay source.
+        stream_format="sse",
     )
+    cap = _install_request_limit(payload, engine_payload, delivery_mode)
+    outcome_id = _begin_request_outcome(payload, model_id, delivery_mode)
+    _finish_request_outcome(outcome_id, "pending", generationCap=cap)
+    diagnostics = _native_request_diagnostics(
+        payload, tuning_snapshot, engine_payload, reference_stats, model_id,
+    )
+    # These identifiers belong to the candidate's response lifecycle, not to
+    # audio.cpp's public synthesis schema. Capture them above, then keep the
+    # engine request limited to its supported fields.
+    for key in ("request_id", "requestId", "response_id", "responseId"):
+        engine_payload.pop(key, None)
     _strip_private_engine_fields(engine_payload)
 
+    # Establish the upstream response and consume its engine-owned decode-mode
+    # SSE proof before this endpoint commits downstream headers.  Raw PCM has
+    # no metadata channel, so the proof must come from this same SSE iterator;
+    # any PCM before proof is rejected rather than self-labelled as native.
+    client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=600.0))
+    response: httpx.Response | None = None
+    stream_lines: Any = None
+    verified_decode_mode: str | None = None
+    prefetched_pcm: list[tuple[bytes, float]] = []
+    preheader_proof_metrics: dict[str, float | int] = {}
+    native_started = time.monotonic()
+    lock_held = False
+    closed = False
+
+    async def close_upstream() -> None:
+        nonlocal closed, lock_held
+        if closed:
+            return
+        closed = True
+        try:
+            if response is not None:
+                try:
+                    await response.aclose()
+                except BaseException:
+                    # Cleanup remains best effort after disconnect/cancel. One
+                    # broken close must not wedge every later generation.
+                    pass
+            try:
+                await client.aclose()
+            except BaseException:
+                pass
+        finally:
+            if lock_held:
+                generation_lock.release()
+                lock_held = False
+
+    async def cleanup_native_response() -> None:
+        try:
+            await close_upstream()
+        finally:
+            reference.unlink(missing_ok=True)
+            _finish_request_outcome(outcome_id, "cancelled", "transport-closed")
+
+    try:
+        await _await_native_stage_with_disconnect(
+            generation_lock.acquire(),
+            request=request,
+            stage="generation-lock",
+            model_id=model_id,
+            internal_warmup=internal_warmup,
+        )
+        lock_held = True
+        _revalidate_generation_admission(payload, model_id, internal_warmup=internal_warmup)
+        _finish_request_outcome(outcome_id, "producing")
+        engine_started = time.monotonic()
+        diagnostics["admissionQueueMs"] = round((engine_started - native_started) * 1000, 3)
+        upstream_request = client.build_request("POST", f"{ENGINE_URL}/v1/audio/speech", json=engine_payload)
+        response = await _await_native_stage_with_disconnect(
+            asyncio.wait_for(client.send(upstream_request, stream=True), LIVE_SYNTHESIS_WALL_SECONDS),
+            request=request,
+            stage="upstream-send",
+            model_id=model_id,
+            internal_warmup=internal_warmup,
+        )
+        if response.is_error:
+            detail = (
+                await _await_native_stage_with_disconnect(
+                    response.aread(),
+                    request=request,
+                    stage="upstream-error-body",
+                    model_id=model_id,
+                    internal_warmup=internal_warmup,
+                )
+            )[:2048]
+            if not internal_warmup:
+                _record_event(
+                    "generation-error",
+                    model_id=model_id,
+                    status=response.status_code,
+                    nativeIncremental=True,
+                    **diagnostics,
+                )
+            raise HTTPException(
+                status_code=502,
+                detail=f"audio.cpp native stream failed ({response.status_code}): {detail.decode('utf-8', errors='replace')}",
+            )
+        engine_timings = _engine_stage_timings(response)
+        stream_lines = _deadline_lines(response.aiter_lines(), engine_started + LIVE_SYNTHESIS_WALL_SECONDS)
+        verified_decode_mode = await _await_native_stage_with_disconnect(
+            _await_native_decode_mode_proof(stream_lines),
+            request=request,
+            stage="decode-mode-proof",
+            model_id=model_id,
+            internal_warmup=internal_warmup,
+        )
+        # Prove engine incrementality at the SSE event boundary, before raw
+        # HTTP headers are committed downstream. HTTP byte-read boundaries are
+        # deliberately not used as evidence because they can split or coalesce.
+        prefetched_pcm = await _await_native_stage_with_disconnect(
+            _prefetch_native_pcm_proof(
+                stream_lines,
+                verified_decode_mode=verified_decode_mode,
+            ),
+            request=request,
+            stage="incremental-pcm-proof",
+            model_id=model_id,
+            internal_warmup=internal_warmup,
+        )
+        # The exact-once two-delta proof deliberately holds downstream headers
+        # until a second engine-owned boundary exists.  Keep its timing
+        # visible so native performance work can distinguish engine TTFT from
+        # the intentional proof window rather than misattribute it to the
+        # browser or PCM player.
+        proof_first = prefetched_pcm[0][1] - native_started
+        proof_ready = prefetched_pcm[-1][1] - native_started
+        preheader_proof_metrics = {
+            "preheaderProofFirstPcmMs": round(proof_first * 1000.0, 3),
+            "preheaderProofReadyMs": round(proof_ready * 1000.0, 3),
+            "preheaderProofAdditionalWaitMs": round((proof_ready - proof_first) * 1000.0, 3),
+            "preheaderProofChunks": len(prefetched_pcm),
+        }
+    except BaseException as exc:
+        detail = getattr(exc, "detail", None)
+        limited = isinstance(detail, dict) and detail.get("state") == "generation-limit"
+        _finish_request_outcome(outcome_id,
+                                "limited" if limited else "cancelled" if isinstance(exc, asyncio.CancelledError) else "error",
+                                "max_generated_frames" if limited else "client-cancelled" if isinstance(exc, asyncio.CancelledError) else "native-preheader-error")
+        if isinstance(exc, HTTPException):
+            exc.headers = {**(exc.headers or {}), "X-TTS-Request-Id": outcome_id}
+        await cleanup_native_response()
+        raise
+
+    assert response is not None and stream_lines is not None
+    assert verified_decode_mode == "native-incremental-pcm"
+    if not internal_warmup:
+        _record_event(
+            "native-pcm-preheader-proof",
+            model_id=model_id,
+            **preheader_proof_metrics,
+            **diagnostics,
+        )
+        _record_event(
+            "generation-start",
+            model_id=model_id,
+            requestedFormat="pcm",
+            nativeIncremental=True,
+            decoderMode=verified_decode_mode,
+            **diagnostics,
+        )
+        if engine_timings:
+            _record_event(
+                "native-pcm-engine-headers",
+                model_id=model_id,
+                engineTimingHeaders=engine_timings,
+                **diagnostics,
+            )
+
     async def relay() -> Any:
-        started = time.monotonic()
+        started = native_started
         bytes_sent = 0
         chunks_sent = 0
+        saw_audio_done = False
+        saw_done_marker = False
         first_chunk_s: float | None = None
+        last_chunk_at: float | None = None
+        cadence_total_ms = 0.0
+        cadence_count = 0
+        cadence_max_ms = 0.0
+        generation_fields: dict[str, Any] = {}
         try:
-            async with generation_lock:
-                _revalidate_generation_admission(payload, model_id, internal_warmup=internal_warmup)
-                if not internal_warmup:
-                    _record_event(
-                        "generation-start",
-                        model_id=model_id,
-                        requestedFormat="pcm",
-                        nativeIncremental=True,
-                        **_reference_event_fields(reference_stats, delivery_mode),
+            for chunk, received_at in prefetched_pcm:
+                if cap is not None and bytes_sent + len(chunk) > cap * 1920 * 2:
+                    _raise_generation_limit()
+                if first_chunk_s is None:
+                    first_chunk_s = received_at - started
+                    if not internal_warmup:
+                        _record_event(
+                            "native-pcm-first",
+                            model_id=model_id,
+                            firstPcmSeconds=round(first_chunk_s, 3),
+                            bytes=len(chunk),
+                            **diagnostics,
+                        )
+                if last_chunk_at is not None:
+                    cadence_ms = (received_at - last_chunk_at) * 1000.0
+                    cadence_total_ms += cadence_ms
+                    cadence_count += 1
+                    cadence_max_ms = max(cadence_max_ms, cadence_ms)
+                last_chunk_at = received_at
+                chunks_sent += 1
+                bytes_sent += len(chunk)
+                yield chunk
+            async for line in stream_lines:
+                event = _native_sse_event(line)
+                if saw_done_marker:
+                    if event is None and _is_native_terminal_transport_line(line):
+                        continue
+                    raise HTTPException(
+                        status_code=502,
+                        detail="audio.cpp native SSE emitted data after its terminal [DONE] marker",
                     )
-                async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, read=600.0)) as client:
-                    async with client.stream("POST", f"{ENGINE_URL}/v1/audio/speech", json=engine_payload) as response:
-                        if response.is_error:
-                            detail = (await response.aread())[:2048]
-                            if not internal_warmup:
-                                _record_event(
-                                    "generation-error",
-                                    model_id=model_id,
-                                    status=response.status_code,
-                                    nativeIncremental=True,
-                                    **_reference_event_fields(reference_stats, delivery_mode),
-                                )
-                            raise RuntimeError(f"audio.cpp native stream failed ({response.status_code}): {detail.decode('utf-8', errors='replace')}")
-                        actual_decode_mode = _engine_decode_mode(response)
-                        if actual_decode_mode and actual_decode_mode != "native-incremental-pcm":
-                            if not internal_warmup:
-                                _record_event(
-                                    "generation-error",
-                                    model_id=model_id,
-                                    status=502,
-                                    decoderMode=actual_decode_mode,
-                                    expectedDecoderMode="native-incremental-pcm",
-                                    **_reference_event_fields(reference_stats, delivery_mode),
-                                )
-                            raise RuntimeError(
-                                "audio.cpp native stream returned decoder-mode proof "
-                                f"`{actual_decode_mode}` instead of `native-incremental-pcm`."
-                            )
-                        async for chunk in response.aiter_raw():
-                            if not chunk:
-                                continue
-                            if first_chunk_s is None:
-                                first_chunk_s = time.monotonic() - started
-                                if not internal_warmup:
-                                    _record_event("native-pcm-first", model_id=model_id, latencySeconds=round(first_chunk_s, 3), bytes=len(chunk))
-                            chunks_sent += 1
-                            bytes_sent += len(chunk)
-                            yield chunk
+                if saw_audio_done:
+                    if event is _NATIVE_SSE_DONE:
+                        saw_done_marker = True
+                        continue
+                    if event is None and _is_native_terminal_transport_line(line):
+                        continue
+                    raise HTTPException(
+                        status_code=502,
+                        detail="audio.cpp native SSE emitted a structured event after completion",
+                    )
+                if event is _NATIVE_SSE_DONE:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "state": "native-stream-incomplete",
+                            "message": "audio.cpp native SSE ended before speech.audio.done",
+                            "chunksReceived": chunks_sent,
+                            "bytesReceived": bytes_sent,
+                        },
+                    )
+                if event is None:
+                    continue
+                assert isinstance(event, dict)
+                event_type = str(event.get("type") or "")
+                if event_type == "speech.generation":
+                    if generation_fields:
+                        raise HTTPException(502, "audio.cpp native SSE repeated generation telemetry")
+                    generation_fields = _generation_event_fields(event)
+                    if not generation_fields["eos"]:
+                        _raise_generation_limit()
+                    continue
+                if event_type == "error":
+                    error = event.get("error")
+                    message = error.get("message") if isinstance(error, dict) else None
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "state": "native-stream-error",
+                            "message": str(message or "audio.cpp native stream failed after headers"),
+                            "chunksReceived": chunks_sent,
+                            "bytesReceived": bytes_sent,
+                        },
+                    )
+                if event_type == "speech.decode_mode":
+                    candidate_mode = str(event.get("mode") or "")
+                    if candidate_mode != verified_decode_mode:
+                        raise HTTPException(
+                            status_code=502,
+                            detail={
+                                "state": "decoder-mode-mismatch",
+                                "expected": "native-incremental-pcm",
+                                "actual": candidate_mode or None,
+                            },
+                        )
+                    continue
+                if event_type == "speech.audio.done":
+                    if not generation_fields:
+                        raise HTTPException(502, "audio.cpp native SSE lacks engine-owned generation telemetry")
+                    done_mode = str(event.get("decode_mode") or verified_decode_mode)
+                    if done_mode != verified_decode_mode:
+                        raise HTTPException(
+                            status_code=502,
+                            detail={
+                                "state": "decoder-mode-mismatch",
+                                "expected": verified_decode_mode,
+                                "actual": done_mode or None,
+                            },
+                        )
+                    saw_audio_done = True
+                    continue
+                if event_type != "speech.audio.delta":
+                    continue
+                if generation_fields:
+                    raise HTTPException(502, "audio.cpp native SSE emitted PCM after generation telemetry")
+                if verified_decode_mode != "native-incremental-pcm":
+                    raise HTTPException(
+                        status_code=502,
+                        detail={"state": "decoder-mode-proof-missing", "expected": "native-incremental-pcm"},
+                    )
+                chunk = _decode_native_pcm_delta(event)
+                if not chunk:
+                    continue
+                if cap is not None and bytes_sent + len(chunk) > cap * 1920 * 2:
+                    _raise_generation_limit()
+                if first_chunk_s is None:
+                    first_chunk_s = time.monotonic() - started
+                    if not internal_warmup:
+                        _record_event(
+                            "native-pcm-first",
+                            model_id=model_id,
+                            firstPcmSeconds=round(first_chunk_s, 3),
+                            bytes=len(chunk),
+                            **diagnostics,
+                        )
+                now = time.monotonic()
+                if last_chunk_at is not None:
+                    cadence_ms = (now - last_chunk_at) * 1000.0
+                    cadence_total_ms += cadence_ms
+                    cadence_count += 1
+                    cadence_max_ms = max(cadence_max_ms, cadence_ms)
+                last_chunk_at = now
+                chunks_sent += 1
+                bytes_sent += len(chunk)
+                yield chunk
+            if chunks_sent == 0:
+                raise HTTPException(status_code=502, detail="audio.cpp native SSE produced no PCM delta")
+            if not saw_audio_done:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "state": "native-stream-incomplete",
+                        "message": "audio.cpp native SSE ended without speech.audio.done",
+                        "chunksReceived": chunks_sent,
+                        "bytesReceived": bytes_sent,
+                    },
+                )
+            if not saw_done_marker:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "state": "native-stream-incomplete",
+                        "message": "audio.cpp native SSE ended without terminal [DONE]",
+                        "chunksReceived": chunks_sent,
+                        "bytesReceived": bytes_sent,
+                    },
+                )
+            if generation_fields and bytes_sent != generation_fields["generatedFrames"] * 1920 * 2:
+                raise HTTPException(502, "audio.cpp generation frame count differs from emitted PCM")
+            _finish_request_outcome(outcome_id, "completed", "eos",
+                                    **generation_fields, bytes=bytes_sent, audioSeconds=bytes_sent / 48000,
+                                    elapsedSeconds=round(time.monotonic() - started, 3))
             if not internal_warmup:
+                elapsed_seconds = time.monotonic() - started
+                audio_seconds = bytes_sent / (24000 * 2)
                 _record_event(
                     "generation-complete",
                     model_id=model_id,
@@ -2038,24 +3137,51 @@ def _native_clone_pcm_response(payload: dict[str, Any], model_id: str) -> Stream
                     chunks=chunks_sent,
                     bytes=bytes_sent,
                     firstChunkSeconds=round(first_chunk_s, 3) if first_chunk_s is not None else None,
-                    elapsedSeconds=round(time.monotonic() - started, 3),
-                    **_reference_event_fields(reference_stats, delivery_mode),
+                    elapsedSeconds=round(elapsed_seconds, 3),
+                    audioSeconds=round(audio_seconds, 3),
+                    realtimeFactor=round(elapsed_seconds / audio_seconds, 3) if audio_seconds else None,
+                    chunkCadenceMeanMs=round(cadence_total_ms / cadence_count, 3) if cadence_count else None,
+                    chunkCadenceMaxMs=round(cadence_max_ms, 3) if cadence_count else None,
+                    **generation_fields,
+                    **diagnostics,
                 )
         except asyncio.CancelledError:
+            _finish_request_outcome(outcome_id, "cancelled", "client-cancelled", bytes=bytes_sent,
+                                    audioSeconds=bytes_sent / 48000)
             if not internal_warmup:
                 _record_event(
                     "generation-cancelled",
                     model_id=model_id,
                     nativeIncremental=True,
                     chunks=chunks_sent,
-                    **_reference_event_fields(reference_stats, delivery_mode),
+                    **diagnostics,
+                )
+            raise
+        except BaseException as exc:
+            detail = getattr(exc, "detail", None)
+            limited = isinstance(detail, dict) and detail.get("state") == "generation-limit"
+            _finish_request_outcome(outcome_id, "limited" if limited else "error",
+                                    "max_generated_frames" if limited else "wall-timeout" if isinstance(exc, TimeoutError) else "native-stream-error",
+                                    **generation_fields, bytes=bytes_sent, audioSeconds=bytes_sent / 48000,
+                                    elapsedSeconds=round(time.monotonic() - started, 3))
+            if not internal_warmup:
+                detail = getattr(exc, "detail", None)
+                _record_event(
+                    "generation-error",
+                    model_id=model_id,
+                    nativeIncremental=True,
+                    chunks=chunks_sent,
+                    bytes=bytes_sent,
+                    error=detail if detail is not None else str(exc),
+                    **diagnostics,
                 )
             raise
         finally:
-            reference.unlink(missing_ok=True)
+            await cleanup_native_response()
 
-    return StreamingResponse(
+    return _OwnedStreamingResponse(
         relay(),
+        cleanup=cleanup_native_response,
         media_type="audio/pcm",
         headers={
             "X-TTS-Model": model_id,
@@ -2065,8 +3191,29 @@ def _native_clone_pcm_response(payload: dict[str, Any], model_id: str) -> Stream
             "X-TTS-Sample-Rate": "24000",
             "X-TTS-Bits-Per-Sample": "16",
             "X-TTS-Channels": "1",
+            # These exact values are admitted only after consuming the
+            # engine-owned speech.decode_mode event from this response.
             "X-TTS-Streaming-Mode": "native-incremental-pcm",
-            "X-TTS-Decoder-Mode": "native-incremental-pcm",
+            "X-TTS-Decoder-Mode": verified_decode_mode,
+            # This proof is generated only after the supervisor consumes two
+            # nonempty engine speech.audio.delta SSE events. Downstream HTTP
+            # read sizes are explicitly not part of the native proof.
+            "X-TTS-Native-Engine-Chunk-Proof": "two-distinct-sse-delta-events",
+            "X-TTS-Native-Preheader-Proof-First-PCM-Ms": str(
+                preheader_proof_metrics["preheaderProofFirstPcmMs"]
+            ),
+            "X-TTS-Native-Preheader-Proof-Ready-Ms": str(
+                preheader_proof_metrics["preheaderProofReadyMs"]
+            ),
+            "X-TTS-Native-Preheader-Proof-Additional-Wait-Ms": str(
+                preheader_proof_metrics["preheaderProofAdditionalWaitMs"]
+            ),
+            "X-TTS-Request-Id": str(diagnostics["requestId"]),
+            "X-TTS-Engine-Epoch": str(diagnostics["engineEpoch"]),
+            "X-TTS-Supervisor-Instance-Id": str(diagnostics["supervisorInstanceId"]),
+            "X-TTS-Tuning-Scope": str(diagnostics["tuningScope"] or ""),
+            "X-TTS-Tuning-Profile-Id": str(diagnostics["tuningProfileId"] or ""),
+            "X-TTS-Tuning-Profile-Revision": str(diagnostics["tuningProfileRevision"] or ""),
             **_reference_headers(reference_stats, delivery_mode),
         },
     )
@@ -2112,7 +3259,7 @@ async def _run_native_load_warmup(model_id: str) -> dict[str, Any]:
         },
     }
     payload["_tuning_snapshot"] = _resolve_request_tuning(payload)
-    response = _native_clone_pcm_response(payload, model_id)
+    response = await _native_clone_pcm_response(payload, model_id)
     started = time.monotonic()
     chunks = 0
     byte_count = 0

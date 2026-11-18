@@ -1,10 +1,18 @@
 ARG AUDIO_CPP_BUILD_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu22.04
-ARG AUDIO_CPP_BASE_IMAGE=local/audio-cpp-qwen3-tts-voice-studio:rollback-pre-native-profile-fix-20260805
+# This is the retained model-bearing candidate observed before this repair.
+# A rollout must create and pass a fresh rollback tag with --build-arg before
+# building; no Dockerfile build or compose action is performed by this source
+# change.
+ARG AUDIO_CPP_BASE_IMAGE
 
 FROM ${AUDIO_CPP_BUILD_IMAGE} AS engine-build
 
 ARG AUDIO_CPP_REPOSITORY=https://github.com/0xShug0/audio.cpp.git
 ARG AUDIO_CPP_REF=238ab6a9e321c17de8e120559f57efeedaeb1345
+# The build stage has no visible host GPU.  Pin the first CMake configure to
+# the candidate desktop's RTX 3080 Laptop architecture rather than nvcc's
+# compiler default, which was observed as sm_52.
+ARG AUDIO_CPP_CUDA_ARCHITECTURES=86
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -18,8 +26,9 @@ COPY integrations/audio-cpp/patches/qwen3-native-pcm-streaming.patch /tmp/qwen3-
 WORKDIR /opt/audio.cpp
 RUN git apply --check /tmp/qwen3-native-pcm-streaming.patch \
     && git apply /tmp/qwen3-native-pcm-streaming.patch
-RUN bash scripts/build_linux.sh --backend cuda --deployment-build \
-    --model-set custom --models qwen3_tts --target audiocpp_server
+RUN test -n "$AUDIO_CPP_CUDA_ARCHITECTURES" \
+    && CUDAARCHS="$AUDIO_CPP_CUDA_ARCHITECTURES" bash scripts/build_linux.sh --backend cuda --deployment-build \
+    --model-set custom --models qwen3_tts --target audiocpp_server --jobs 2
 
 # Recovery/export target: materialize only the validated engine binary when
 # Docker Desktop cannot load the large model-bearing final image in one pass.
@@ -33,8 +42,24 @@ FROM ${AUDIO_CPP_BASE_IMAGE}
 # Rebuild the pinned engine in the disposable stage above, then add only that
 # binary and the candidate control-plane/browser sources to the final image.
 # This avoids re-downloading or re-exporting either model checkpoint.
-ARG AUDIO_CPP_OVERLAY_REV=offline-full-and-tuning-runtime-20260805
-RUN test -n "$AUDIO_CPP_OVERLAY_REV"
+ARG AUDIO_CPP_OVERLAY_REV=native-stream-fixed-shape-20260903
+ARG AUDIO_CPP_REF=238ab6a9e321c17de8e120559f57efeedaeb1345
+ARG AUDIO_CPP_BASE_IMAGE_ID
+RUN test -n "$AUDIO_CPP_OVERLAY_REV" \
+    && test -n "$AUDIO_CPP_BASE_IMAGE_ID"
+
+LABEL org.opencontainers.image.revision="${AUDIO_CPP_REF}" \
+      org.opencontainers.image.version="${AUDIO_CPP_OVERLAY_REV}" \
+      io.omninexus.rollback.base="${AUDIO_CPP_BASE_IMAGE_ID}" \
+      org.opencontainers.image.description="Pinned audio.cpp Qwen3-TTS candidate overlay"
+
+# Fail the thin overlay build rather than publishing a deceptively incomplete
+# candidate if the retained rollback image ever stops carrying either model,
+# its model map, or the single-container launcher.
+RUN test -d /opt/models/Qwen3-TTS-12Hz-0.6B-Base \
+    && test -d /opt/models/Qwen3-TTS-12Hz-1.7B-Base \
+    && test -f /config/qwen3-tts-base-f16.json \
+    && test -x /usr/local/bin/audio-cpp-candidate
 
 COPY --from=engine-build /opt/audio.cpp/build/linux-cuda-release/bin/audiocpp_server /usr/local/bin/audiocpp_server
 

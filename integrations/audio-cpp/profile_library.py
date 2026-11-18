@@ -4,13 +4,66 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
-
 
 PROFILE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 PROFILE_PROVIDER = "qwen3tts-audiocpp"
 _HIDDEN_NAMES = {"__pycache__", ".cache", ".trash"}
+
+
+def clone_content_hash(
+    reference_audio: bytes,
+    reference_text: str,
+    excerpts: list[tuple[bytes, str]] | None = None,
+) -> str:
+    """Return the immutable conditioning identity for a Base clone.
+
+    A clone ID identifies a mutable library slot.  The audio.cpp request path
+    needs a distinct identity for the actual full-ICL material so an edit made
+    between phrases cannot silently change an answer already in progress.
+    Length-delimited fields avoid ambiguities such as ``[a, bc]`` versus
+    ``[ab, c]`` while keeping the value independent of profile presentation
+    metadata (name, description, timestamps).
+    """
+
+    digest = sha256()
+
+    def update(value: bytes) -> None:
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    update(reference_audio)
+    update(str(reference_text).encode("utf-8"))
+    for excerpt_audio, excerpt_text in excerpts or []:
+        update(excerpt_audio)
+        update(str(excerpt_text).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _profile_content_material(profile_root: Path, raw: dict[str, Any], reference: Path) -> tuple[str, list[tuple[bytes, str]]] | None:
+    """Read the exact conditioning pair(s) accepted by the supervisor."""
+
+    reference_text = str(raw.get("ref_text") or "")
+    excerpts: list[tuple[bytes, str]] = []
+    raw_excerpts = raw.get("reference_excerpts")
+    if isinstance(raw_excerpts, list):
+        for item in raw_excerpts:
+            if not isinstance(item, dict):
+                continue
+            filename = str(item.get("ref_audio_filename") or "").strip()
+            text = str(item.get("ref_text") or "").strip()
+            if not filename or Path(filename).name != filename or not text:
+                continue
+            path = profile_root / filename
+            if not path.is_file():
+                continue
+            try:
+                excerpts.append((path.read_bytes(), text))
+            except OSError:
+                return None
+    return reference_text, excerpts
 
 
 def valid_profile_id(profile_id: str) -> bool:
@@ -64,6 +117,23 @@ def canonical_profile(
     except OSError:
         return None
 
+    material = _profile_content_material(profile_root, raw, reference)
+    if material is None:
+        return None
+    reference_text, excerpts = material
+    try:
+        content_hash = clone_content_hash(reference.read_bytes(), reference_text, excerpts)
+    except OSError:
+        return None
+    raw_revision = raw.get("content_revision", 1)
+    content_revision = raw_revision if isinstance(raw_revision, int) and not isinstance(raw_revision, bool) and raw_revision > 0 else 1
+    # A file-level edit outside the normal supervisor mutation route must not
+    # retain the previous conditioning revision. Legacy profiles without a
+    # stored hash establish revision 1 on first canonicalization.
+    stored_hash = raw.get("content_hash")
+    if isinstance(stored_hash, str) and re.fullmatch(r"[0-9a-f]{64}", stored_hash) and stored_hash != content_hash:
+        content_revision += 1
+
     normalized = dict(raw)
     normalized.update(
         profile_id=profile_id,
@@ -73,11 +143,13 @@ def canonical_profile(
         language=str(raw.get("language") or "Auto"),
         voice=f"clone:{profile_id}",
         instructions=str(raw.get("instructions") or ""),
-        ref_text=str(raw.get("ref_text") or ""),
+        ref_text=reference_text,
         x_vector_only_mode=False,
         ref_audio_filename=reference_name,
         origin=str(raw.get("origin") or "audio.cpp Base clone"),
         provider=PROFILE_PROVIDER,
+        content_revision=content_revision,
+        content_hash=content_hash,
     )
     if normalize and normalized != raw:
         temporary = profile_root / ".meta.json.normalize.tmp"
