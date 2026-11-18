@@ -211,8 +211,10 @@ AudioWorklet, applies VAD and pre-roll over PCM buffers, and creates a complete
 PCM16 RIFF/WAV for every accepted turn. Lossless WAV at 16 kHz is the default;
 24 kHz and 48 kHz encodes and an explicit server-converted MP3 320 kbps A/B
 transport are available. llama.cpp input metadata always matches the bytes
-sent. A candidate restart always releases the active model process, so
-the Studio must explicitly load its selected model before its next generation.
+sent. A candidate restart always releases the active model process; the
+next generation loads the selected model again, unless the speech-while-unloaded
+policy is `refuse` or the model is held unloaded, in which case the Studio asks
+for an explicit load.
 Quality, Balanced, Low Latency, and custom tuning definitions are shared, but
 Voice Studio and Realtime persist independent active selections. Balanced is
 the fallback for either surface when it has no valid saved selection.
@@ -259,3 +261,33 @@ Full Quality WAV keeps its independent offline policy. Temporary tuning never
 edits shared saved profiles, and Voice Studio/Realtime retain separate selected
 profiles. Explicit benchmark clips and reports stay local and outside version
 control; HTTP completion alone does not certify microphone-to-speaker behavior.
+
+## Model lifecycle
+
+The supervisor loads a model on demand and releases it when idle. Nothing loads
+at container start.
+
+- `POST /v1/backend/models/ensure` is the idempotent "make sure this model is
+  loaded" call. It answers immediately with `{model, state, ready, accepted,
+  reason, message, retryable, retryAfterS, etaS, resident, engineEpoch,
+  supervisorInstanceId, gpuGuard, lifecycle}` and runs the load as a
+  supervisor-owned background task, so a client that disconnects never cancels
+  it. `reason` is `load-in-progress`, `gpu-guard`, `manual-hold`,
+  `resident-model-in-use`, or `load-failed`. A failed load is reported for 30
+  seconds before another attempt is started.
+- `POST /v1/backend/models/switch` keeps its blocking behaviour; `"wait": false`
+  answers at once like `ensure`. Both end a manual hold. `POST
+  /v1/backend/models/unload` sets the hold.
+- A speech request that arrives with no model ready follows
+  `speech_when_unloaded` (`wait`, `retry`, `refuse`), overridable per request
+  with `load_wait_s` or `X-TTS-Load-Wait-Seconds`. Speech never switches a
+  resident model to another one.
+- The idle watcher starts in `startup()` and checks every five seconds. It
+  releases the model only when both locks are free, no load is running, and the
+  quiet time has passed since the last admitted or finished request, `ensure`
+  call, or settings change.
+- Settings live in `/voices/lifecycle_settings.json` and are edited through
+  `GET`/`PUT /control/lifecycle` or Voice Studio. `/control/status` and
+  `/v1/backend/models` carry the `lifecycle` block.
+- The GPU guard and the wait for the engine process to exit run off the event
+  loop. With the guard disabled, a speech request does not query the GPU at all.

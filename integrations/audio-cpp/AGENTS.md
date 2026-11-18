@@ -176,3 +176,15 @@
   Dockerfile. It must also verify both embedded BF16 model trees, replace only
   supervisor/Studio/HF runtime sources, and retain `Dockerfile.overlay` as the
   clean pinned-engine rebuild path.
+- Model lifecycle: a model loads on demand (a speech request under the
+  `wait`/`retry` policy, or `/v1/backend/models/ensure`) and is released by the
+  idle watcher after the configured quiet time. Keep these rules: a load is a
+  supervisor-owned task that a client disconnect never cancels; `ensure` is
+  idempotent and never interrupts a generation; an idle release happens only
+  with both locks free and never during or just after use; a manual unload
+  holds until a manual load; speech never switches the resident model; start
+  background tasks only inside `startup()` because a gateway may call it
+  directly; keep blocking GPU queries and process waits off the event loop.
+  Errors raised before a model is ready carry `audio_started: false`. The
+  explicit-load-only answers stay available as the `refuse` policy and their
+  wording is unchanged.
