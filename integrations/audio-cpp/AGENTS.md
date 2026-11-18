@@ -176,3 +176,10 @@
   Dockerfile. It must also verify both embedded BF16 model trees, replace only
   supervisor/Studio/HF runtime sources, and retain `Dockerfile.overlay` as the
   clean pinned-engine rebuild path.
+- `tools/voice_bench.py` is measurement tooling, not a client contract. It may
+  call only the read routes, `/v1/tuning/resolve` and `/v1/audio/speech`; it
+  must never load, unload, switch, select or save anything, and it refuses to
+  run when no model is loaded. Its audio and reports stay under `.runtime/`
+  and outside version control. Run it against the live container only in a
+  window the user agreed to; pitch and brightness spread are proxies and do not
+  replace the listening gate.

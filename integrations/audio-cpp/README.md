@@ -259,3 +259,39 @@ Full Quality WAV keeps its independent offline policy. Temporary tuning never
 edits shared saved profiles, and Voice Studio/Realtime retain separate selected
 profiles. Explicit benchmark clips and reports stay local and outside version
 control; HTTP completion alone does not certify microphone-to-speaker behavior.
+
+## Voice benchmark
+
+`tools/voice_bench.py` measures how steady the voice is inside one reply and how
+soon audio starts. It only reads server state and sends speech requests: it
+never loads, unloads, switches or saves anything, and it stops when no model is
+loaded. It needs `numpy` and `httpx`.
+
+    python integrations/audio-cpp/tools/voice_bench.py arms
+    python integrations/audio-cpp/tools/voice_bench.py run --arms sentences-stream,sentences-whole,one-request-stream
+    python integrations/audio-cpp/tools/voice_bench.py report
+
+Each arm is one request shape. Reply `i` uses the same seed in every arm, so arms
+differ only in how the text is sent:
+
+- `sentences-stream` and `sentences-whole` send one request per sentence, as most
+  agent frameworks do, streamed or as whole-phrase PCM;
+- `one-request-stream` and `one-request-whole` send the whole reply at once and
+  give the steadiness floor;
+- `emulated-continuation` extends the clone reference with the reply's earlier
+  audio and text. It approximates continuation on a server that has none; it is
+  slower and not exact;
+- `short-stream` and `short-whole` speak one-to-three-word phrases.
+
+The report gives, per arm: time to first audio (first request, later requests,
+p95), synthesis time per second of audio, the pitch and brightness range between
+the requests of a reply and between equal thirds of the reply's audio, the
+engine's stage timings, and a fit of talker time against generated frames whose
+intercept is the fixed cost before the first frame. For streamed and whole-phrase
+arms of the same text and seed it also gives the sample-level difference and
+whether that difference concentrates at streaming block edges.
+
+Audio, `results.jsonl` and `summary.json` go under `.runtime/voice-bench` unless
+`--out` says otherwise. A finished phrase is not repeated when a run is resumed
+into the same folder. The first request of each arm warms the engine and is not
+measured. Pitch and brightness are proxies; listening remains a separate gate.
