@@ -291,6 +291,15 @@ intercept is the fixed cost before the first frame. For streamed and whole-phras
 arms of the same text and seed it also gives the sample-level difference and
 whether that difference concentrates at streaming block edges.
 
+A tuning sweep is several runs that differ in one sampling value, each into its
+own folder, for example `--override temperature=0.6 --out .runtime/voice-bench/t06`
+and `--override temperature=0.8 --out .runtime/voice-bench/t08`. Overrides ride
+in the request's `tuning` object, so they need a profile. The tool refuses to
+add results to a folder made with a different model, voice, profile, language
+or override. Compare the pitch range inside a reply and the pitch range between
+replies across the runs, then listen: a lower temperature is steadier and can
+also be flatter.
+
 Audio, `results.jsonl` and `summary.json` go under `.runtime/voice-bench` unless
 `--out` says otherwise. A finished phrase is not repeated when a run is resumed
 into the same folder. The first request of each arm warms the engine and is not

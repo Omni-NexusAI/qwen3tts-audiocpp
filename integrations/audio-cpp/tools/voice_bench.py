@@ -22,6 +22,12 @@ Usage:
     python integrations/audio-cpp/tools/voice_bench.py run --arms sentences-stream,sentences-whole
     python integrations/audio-cpp/tools/voice_bench.py report
 
+A tuning sweep is several runs that differ in one sampling value, each into its
+own folder:
+
+    python integrations/audio-cpp/tools/voice_bench.py run --override temperature=0.6 --out .runtime/voice-bench/t06
+    python integrations/audio-cpp/tools/voice_bench.py run --override temperature=0.8 --out .runtime/voice-bench/t08
+
 Audio and results are written under ``.runtime/voice-bench`` by default, which
 is outside version control.
 """
@@ -396,10 +402,35 @@ def arm_reply_count(arm: str, replies: int) -> int:
     return len(SHORT_PHRASES) if ARMS[arm]["split"] == "short" else min(replies, len(REPLIES))
 
 
+OVERRIDE_FIELDS = ("temperature", "top_k", "top_p", "repetition_penalty", "max_reference_seconds",
+                   "first_block_frames", "steady_block_frames", "left_context_frames")
+
+
+def parse_overrides(items: Iterable[str]) -> dict[str, Any]:
+    """`name=value` pairs for the tuning fields a sweep may change."""
+    found: dict[str, Any] = {}
+    for item in items:
+        name, separator, raw = item.partition("=")
+        name = name.strip()
+        if not separator or name not in OVERRIDE_FIELDS:
+            raise ValueError(f"Override `{item}` must be name=value with a name from: {', '.join(OVERRIDE_FIELDS)}.")
+        try:
+            value = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError(f"Override `{item}` needs a numeric value.") from exc
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Override `{item}` needs a numeric value.")
+        found[name] = value
+    return found
+
+
 def build_request(arm: str, text: str, *, model: str, voice: str, seed: int, profile: str | None,
-                  language: str | None, reply_id: str, reference: tuple[bytes, str] | None = None) -> dict[str, Any]:
+                  language: str | None, reply_id: str, reference: tuple[bytes, str] | None = None,
+                  overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     """The speech request body for one phrase of one arm."""
     spec = ARMS[arm]
+    if overrides and not profile:
+        raise ValueError("Sampling overrides need a tuning profile; a bare request carries only its seed.")
     body: dict[str, Any] = {
         "model": model,
         "input": text,
@@ -409,7 +440,8 @@ def build_request(arm: str, text: str, *, model: str, voice: str, seed: int, pro
     if language:
         body["language"] = language
     if profile:
-        body["tuning"] = {"provider": PROVIDER, "scope": "realtime", "profile_id": profile, "overrides": {"seed": seed}}
+        body["tuning"] = {"provider": PROVIDER, "scope": "realtime", "profile_id": profile,
+                          "overrides": {**(overrides or {}), "seed": seed}}
     else:
         body["seed"] = seed
     if spec.get("continuation") == "emulated":
@@ -503,6 +535,13 @@ def run(args: argparse.Namespace) -> int:
         print(f"Unknown arm(s): {', '.join(unknown)}. Run the `arms` command to list them.", file=sys.stderr)
         return 2
     out = Path(args.out)
+    try:
+        overrides = parse_overrides(args.override or [])
+        if overrides and args.profile == "none":
+            raise ValueError("Sampling overrides need a tuning profile; pass --profile.")
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     server = Server(args.base_url)
     try:
         status = server.status()
@@ -529,17 +568,28 @@ def run(args: argparse.Namespace) -> int:
             stored = server.voice_profile(voice.removeprefix("clone:"))
             reference = (base64.b64decode(stored["ref_audio"]), str(stored["ref_text"]))
         out.mkdir(parents=True, exist_ok=True)
+        settings = {"model": model, "voice": voice, "profile": profile, "language": args.language,
+                    "overrides": overrides}
+        run_file = out / "run.json"
+        if run_file.is_file() and load_rows(out):
+            earlier = json.loads(run_file.read_text(encoding="utf-8"))
+            changed = [key for key, value in settings.items() if earlier.get(key, {} if key == "overrides" else None) != value]
+            if changed:
+                print(f"{out} already holds results made with a different {', '.join(changed)}. "
+                      "Use another --out folder so runs are not mixed.", file=sys.stderr)
+                return 2
         done = {(row["arm"], row["reply"], row["phrase"]) for row in load_rows(out) if row.get("status") == 200}
         run_id = time.strftime("%Y%m%d-%H%M%S")
-        (out / "run.json").write_text(json.dumps({
-            "run_id": run_id, "base_url": args.base_url, "model": model, "voice": voice, "profile": profile,
-            "language": args.language, "engine_epoch": status.get("engineEpoch"), **blocks,
+        run_file.write_text(json.dumps({
+            "run_id": run_id, "base_url": args.base_url, **settings,
+            "engine_epoch": status.get("engineEpoch"), **blocks,
         }, indent=1), encoding="utf-8")
         with (out / "results.jsonl").open("a", encoding="utf-8") as results:
             for arm in arms:
                 if not args.no_warmup:
                     warm = build_request(arm, WARMUP_TEXT, model=model, voice=voice, seed=1, profile=profile,
                                          language=args.language, reply_id=f"{run_id}-{arm}-warmup",
+                                         overrides=overrides,
                                          reference=None if reference is None else
                                          (wav_bytes_from_reference(reference[0]), reference[1]))
                     server.speak(warm)
@@ -557,7 +607,7 @@ def run(args: argparse.Namespace) -> int:
                             extended = (audio, transcript)
                         body = build_request(arm, text, model=model, voice=voice, seed=seed, profile=profile,
                                              language=args.language, reply_id=f"{run_id}-{arm}-{reply}",
-                                             reference=extended)
+                                             reference=extended, overrides=overrides)
                         result = server.speak(body)
                         pcm = result.pop("pcm")
                         row = {"arm": arm, "reply": reply, "phrase": phrase, "seed": seed, "text": text,
@@ -705,7 +755,10 @@ def report(args: argparse.Namespace) -> int:
     def show(value: Any) -> str:
         return "-" if value is None else str(value)
 
-    print(f"\nmodel {meta.get('model')}  voice {meta.get('voice')}  profile {meta.get('profile')}")
+    print(f"\nmodel {meta.get('model')}  voice {meta.get('voice')}  profile {meta.get('profile')}  "
+          f"overrides {json.dumps(meta.get('overrides') or {})}")
+    print("pitch range Hz between replies: " + ", ".join(
+        f"{name} {show(arm['between_reply_pitch_range'])}" for name, arm in summary["arms"].items()))
     print("arm | requests (failed) | first audio s: first / later / p95 | "
           "pitch range Hz: per request / per segment | brightness range Hz per segment | talker fixed ms")
     for name, arm in summary["arms"].items():
@@ -738,6 +791,8 @@ def main(argv: list[str] | None = None) -> int:
     runner.add_argument("--replies", type=int, default=len(REPLIES))
     runner.add_argument("--voice", default="", help="clone:<id>; defaults to the server's selected voice.")
     runner.add_argument("--profile", default="balanced", help="Tuning profile id, or `none` for a bare request.")
+    runner.add_argument("--override", action="append", metavar="NAME=VALUE",
+                        help="Sampling value to change for this run, e.g. temperature=0.6. Repeatable.")
     runner.add_argument("--language", default="English")
     runner.add_argument("--continuation-seconds", type=float, default=12.0)
     runner.add_argument("--no-warmup", action="store_true")

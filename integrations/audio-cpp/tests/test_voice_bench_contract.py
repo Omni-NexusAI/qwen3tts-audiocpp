@@ -179,6 +179,20 @@ class VoiceBenchContractTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(emulated["ref_audio"]), b"RIFFdata")
         self.assertEqual(emulated["ref_text"], "Reference words.")
 
+    def test_sampling_overrides_ride_in_the_tuning_object_and_keep_the_seed(self) -> None:
+        overrides = self.bench.parse_overrides(["temperature=0.6", "top_k=40"])
+        self.assertEqual(overrides, {"temperature": 0.6, "top_k": 40})
+        common = dict(model="m", voice="clone:abc123", seed=42, language="English", reply_id="r")
+        body = self.bench.build_request("sentences-stream", "Hello there.", profile="balanced",
+                                        overrides={**overrides, "seed": 7}, **common)
+        self.assertEqual(body["tuning"]["overrides"], {"temperature": 0.6, "top_k": 40, "seed": 42})
+        with self.assertRaises(ValueError):
+            self.bench.build_request("sentences-stream", "Hello there.", profile=None, overrides=overrides, **common)
+        for bad in ("temperature", "speed=2", "temperature=warm", "temperature=true", "seed=5"):
+            with self.assertRaises(ValueError):
+                self.bench.parse_overrides([bad])
+        self.assertEqual(self.bench.parse_overrides([]), {})
+
     def test_continuation_reference_keeps_recent_whole_phrases_within_budget(self) -> None:
         stereo = np.stack([np.frombuffer(tone(130.0, 1.0), dtype="<i2")] * 2, axis=1).astype("<i2")
         buffer = io.BytesIO()
@@ -340,7 +354,7 @@ class _StubSpeechServer:
 
 def _run_arguments(base_url: str, out: Path, arms: str, **changes) -> argparse.Namespace:
     values = dict(base_url=base_url, arms=arms, replies=2, voice="", profile="balanced", language="English",
-                  continuation_seconds=12.0, no_warmup=False, out=str(out))
+                  continuation_seconds=12.0, no_warmup=False, out=str(out), override=None)
     values.update(changes)
     return argparse.Namespace(**values)
 
@@ -387,6 +401,26 @@ class VoiceBenchRunTests(unittest.TestCase):
         self.assertTrue(chained[1]["ref_text"].startswith("Reference words. "))
         self.assertNotIn("voice", chained[1])
         self.assertEqual({body["tuning"]["overrides"]["seed"] for body in speech[1:6]}, {self.bench.SEEDS[0]})
+
+    def test_a_sweep_run_sends_its_override_and_does_not_mix_into_another_run(self) -> None:
+        with _StubSpeechServer() as stub, tempfile.TemporaryDirectory() as temporary:
+            out = Path(temporary)
+            code = self.bench.run(_run_arguments(stub.url, out, "one-request-stream", replies=1, no_warmup=True,
+                                                 override=["temperature=0.6"]))
+            summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+            mixed = self.bench.run(_run_arguments(stub.url, out, "one-request-stream", replies=1, no_warmup=True,
+                                                  override=["temperature=0.9"]))
+            same = self.bench.run(_run_arguments(stub.url, out, "one-request-stream", replies=1, no_warmup=True,
+                                                 override=["temperature=0.6"]))
+            bare = self.bench.run(_run_arguments(stub.url, out / "bare", "one-request-stream", replies=1,
+                                                 profile="none", override=["temperature=0.6"]))
+            unknown = self.bench.run(_run_arguments(stub.url, out / "bad", "one-request-stream", replies=1,
+                                                    override=["speed=2"]))
+        self.assertEqual((code, mixed, same, bare, unknown), (0, 2, 0, 2, 2))
+        self.assertEqual(summary["run"]["overrides"], {"temperature": 0.6})
+        speech = [item[2] for item in stub.requests if item[1] == "/v1/audio/speech"]
+        self.assertEqual(len(speech), 1)  # the refused runs sent nothing and the repeat run had nothing left to do
+        self.assertEqual(speech[0]["tuning"]["overrides"], {"temperature": 0.6, "seed": self.bench.SEEDS[0]})
 
     def test_run_reports_a_refused_short_phrase_as_a_failure(self) -> None:
         with _StubSpeechServer() as stub, tempfile.TemporaryDirectory() as temporary:
