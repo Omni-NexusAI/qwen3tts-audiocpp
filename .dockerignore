@@ -1,0 +1,15 @@
+.git
+.pytest_cache
+**/.pytest_cache
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.runtime
+.voices
+voices
+*.wav
+*.pcm
+*.flac
+*.mp3
+*.aac
+*.opus

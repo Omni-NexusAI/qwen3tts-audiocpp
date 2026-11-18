@@ -16,7 +16,7 @@
  * @typedef {"idle" | "connecting" | "queued" | "your-turn" | "listening" | "user-speaking" | "processing" | "ai-speaking" | "error"} AppState
  */
 
-import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=11-voice-studio";
+import { S2sWsRealtimeClient } from "./ws/s2s-ws-client.js?v=13-config-ack";
 import { $, truncateError, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js";
 import { Account } from "./ui/account.js";
@@ -46,6 +46,7 @@ const STORAGE_KEYS = {
   noiseGate: "s2s.ws.noiseGate",
   echoGuard: "s2s.ws.echoGuard",
   echoGuardVersion: "s2s.ws.echoGuardVersion",
+  echoCalibrations: "s2s.ws.echoCalibrations",
   diagnostics: "s2s.ws.diagnostics",
   diagnosticsGeometry: "s2s.ws.diagnosticsGeometry",
   fullBufferTts: "s2s.ws.fullBufferTts",
@@ -53,6 +54,7 @@ const STORAGE_KEYS = {
   maxResponseTokens: "s2s.ws.maxResponseTokens",
   ttsBackend: "s2s.ws.ttsBackend",
   voiceByBackend: "s2s.ws.voiceByBackend",
+  ttsProfileByBackend: "s2s.ws.ttsProfileByBackend",
   modelProvider: "s2s.ws.modelProvider",
   modelUrl: "s2s.ws.modelUrl",
   modelName: "s2s.ws.modelName",
@@ -112,29 +114,34 @@ const SNAPSHOT_QUALITY = 0.7;
 function loadSettings() {
   const storedEchoGuard = localStorage.getItem(STORAGE_KEYS.echoGuard);
   const echoGuardVersion = localStorage.getItem(STORAGE_KEYS.echoGuardVersion);
-  const echoGuard =
-    echoGuardVersion === "2" && ["off", "adaptive", "strict"].includes(storedEchoGuard || "")
-      ? storedEchoGuard
-      : storedEchoGuard === "strict"
-        ? "strict"
-        : "adaptive";
-  if (echoGuardVersion !== "2") {
+  // "off" was the historical name for browser-native AEC.  Migrate it
+  // truthfully and keep Native as the safe default while AEC3 is unavailable.
+  const echoGuard = storedEchoGuard === "strict" ? "strict" :
+    storedEchoGuard === "adaptive" ? "adaptive" : "native";
+  if (echoGuardVersion !== "3") {
     localStorage.setItem(STORAGE_KEYS.echoGuard, echoGuard);
-    localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "2");
+    localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "3");
   }
   const storedTtsBackend = localStorage.getItem(STORAGE_KEYS.ttsBackend) || "faster";
   let voiceByBackend = {};
   try { voiceByBackend = JSON.parse(localStorage.getItem(STORAGE_KEYS.voiceByBackend) || "{}"); } catch (_) {}
   if (!voiceByBackend || typeof voiceByBackend !== "object") voiceByBackend = {};
-  const normalizedBackend = storedTtsBackend === "audio-cpp" ? "qwen3tts-audiocpp" : storedTtsBackend;
+  let ttsProfileByBackend = {};
+  try { ttsProfileByBackend = JSON.parse(localStorage.getItem(STORAGE_KEYS.ttsProfileByBackend) || "{}"); } catch (_) {}
+  if (!ttsProfileByBackend || typeof ttsProfileByBackend !== "object") ttsProfileByBackend = {};
+  const normalizedBackend = normalizeTtsProvider(storedTtsBackend);
+  voiceByBackend = normalizeTtsProviderMap(voiceByBackend);
+  ttsProfileByBackend = normalizeTtsProviderMap(ttsProfileByBackend);
   const storedVoice = voiceByBackend[normalizedBackend] || localStorage.getItem(STORAGE_KEYS.voice) || DEFAULT_VOICE;
   return {
     directUrl: localStorage.getItem(STORAGE_KEYS.directUrl) || "http://127.0.0.1:8765",
     voice: storedVoice,
     voiceByBackend: { faster: DEFAULT_VOICE, ...voiceByBackend, [normalizedBackend]: storedVoice },
+    ttsProfileByBackend,
     instructions: localStorage.getItem(STORAGE_KEYS.instructions) || DEFAULT_INSTRUCTIONS,
     noiseGate: loadGateThreshold(),
     echoGuard,
+    echoCalibrations: loadEchoCalibrations(),
     fullBufferTts: localStorage.getItem(STORAGE_KEYS.fullBufferTts) === "1",
     liveTranscript: localStorage.getItem(STORAGE_KEYS.liveTranscript) === "1",
     maxResponseTokens: Math.min(1024, Math.max(64, Number(localStorage.getItem(STORAGE_KEYS.maxResponseTokens)) || 384)),
@@ -168,12 +175,14 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.instructions, s.instructions);
   localStorage.setItem(STORAGE_KEYS.noiseGate, String(s.noiseGate));
   localStorage.setItem(STORAGE_KEYS.echoGuard, s.echoGuard);
-  localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "2");
+  localStorage.setItem(STORAGE_KEYS.echoGuardVersion, "3");
+  localStorage.setItem(STORAGE_KEYS.echoCalibrations, JSON.stringify(s.echoCalibrations || {}));
   localStorage.setItem(STORAGE_KEYS.fullBufferTts, s.fullBufferTts ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.liveTranscript, s.liveTranscript ? "1" : "0");
   localStorage.setItem(STORAGE_KEYS.maxResponseTokens, String(s.maxResponseTokens));
   localStorage.setItem(STORAGE_KEYS.ttsBackend, s.ttsBackend);
   localStorage.setItem(STORAGE_KEYS.voiceByBackend, JSON.stringify(s.voiceByBackend));
+  localStorage.setItem(STORAGE_KEYS.ttsProfileByBackend, JSON.stringify(s.ttsProfileByBackend || {}));
   localStorage.setItem(STORAGE_KEYS.modelProvider, s.modelProvider);
   localStorage.setItem(STORAGE_KEYS.modelUrl, s.modelUrl);
   localStorage.setItem(STORAGE_KEYS.modelName, s.modelName);
@@ -191,14 +200,25 @@ function saveSettings(s) {
   }).catch((error) => ({ ok: false, error: error instanceof Error ? error.message : String(error) }));
 }
 
+function loadEchoCalibrations() {
+  try {
+    const value = JSON.parse(localStorage.getItem(STORAGE_KEYS.echoCalibrations) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
 function publicSettingsPayload(s) {
   return {
     directUrl: s.directUrl,
     voice: s.voice,
     voiceByBackend: s.voiceByBackend,
+    ttsProfileByBackend: s.ttsProfileByBackend || {},
     instructions: s.instructions,
     noiseGate: s.noiseGate,
     echoGuard: s.echoGuard,
+    echoCalibrations: s.echoCalibrations || {},
     fullBufferTts: s.fullBufferTts,
     liveTranscript: s.liveTranscript,
     maxResponseTokens: s.maxResponseTokens,
@@ -217,7 +237,13 @@ async function restorePersistentSettings() {
     if (!payload?.settings || typeof payload.settings !== "object") return;
     // Preserve any page-session-only API key already present in this browser.
     settings = { ...settings, ...payload.settings, modelApiKey: settings.modelApiKey };
-    settings.voiceByBackend = payload.settings.voiceByBackend || settings.voiceByBackend || {};
+    settings.ttsBackend = normalizeTtsProvider(settings.ttsBackend);
+    settings.voiceByBackend = normalizeTtsProviderMap(
+      payload.settings.voiceByBackend || settings.voiceByBackend || {},
+    );
+    settings.ttsProfileByBackend = normalizeTtsProviderMap(
+      payload.settings.ttsProfileByBackend || settings.ttsProfileByBackend || {},
+    );
     settings.voice = settings.voiceByBackend[settings.ttsBackend] || settings.voice || DEFAULT_VOICE;
     await saveSettings(settings);
     if (settings.modelProvider === "local") void refreshLocalPipeline();
@@ -321,6 +347,471 @@ const diagnosticsSummary = $("#diagnostics-summary");
 const diagnosticsGraph = $("#diagnostics-graph");
 const diagnosticsWaterfall = $("#diagnostics-waterfall");
 const diagnosticsWarning = $("#diagnostics-warning");
+const diagnosticsTtsProfile = $("#diagnostics-tts-profile");
+const diagnosticsTtsProfileApply = $("#diagnostics-tts-profile-apply");
+const diagnosticsTtsProfileName = $("#diagnostics-tts-profile-name");
+const diagnosticsTtsProfileSaveAs = $("#diagnostics-tts-profile-save-as");
+const diagnosticsAudioSummary = $("#diagnostics-audio-summary");
+const diagnosticsAudioStatus = $("#diagnostics-audio-status");
+const diagnosticsAudioMetrics = $("#diagnostics-audio-metrics");
+const diagnosticsEchoDevicePair = $("#diagnostics-echo-device-pair");
+const diagnosticsEchoOutputLatency = $("#diagnostics-echo-output-latency");
+const diagnosticsEchoSave = $("#diagnostics-echo-save");
+const diagnosticsEchoUseMeasured = $("#diagnostics-echo-use-measured");
+const diagnosticsEchoInputs = Array.from(document.querySelectorAll("[data-echo-calibration-key]"));
+let latestEchoStatus = null;
+const diagnosticsTuningStatus = $("#diagnostics-tuning-status");
+const diagnosticsTuningWarnings = $("#diagnostics-tuning-warnings");
+const diagnosticsTuningApply = $("#diagnostics-tuning-apply");
+const diagnosticsTuningClear = $("#diagnostics-tuning-clear");
+const diagnosticsTuningInputs = Array.from(document.querySelectorAll("[data-tuning-key]"));
+const diagnosticsTuningNamedValues = $("#diagnostics-tuning-named-values");
+const diagnosticsTuningOverrideValues = $("#diagnostics-tuning-override-values");
+const diagnosticsTuningEffectiveValues = $("#diagnostics-tuning-effective-values");
+const diagnosticsTuningContextUnlock = $("#tuning-context-unlock");
+const diagnosticsTuningContext = $("#tuning-left-context-frames");
+const diagnosticsContextWarning = $("#diagnostics-context-warning");
+let candidateTuningResolved = null;
+let candidateTuningProfileDocument = null;
+let candidateInactiveTuningFields = new Set();
+const AUDIO_CPP_PROVIDER = "qwen3tts-audiocpp";
+/** Page-session-only selections and overrides, isolated by TTS provider. */
+let realtimeTuningByBackend = {};
+
+function normalizeTtsProvider(provider) {
+  return provider === "audio-cpp" ? AUDIO_CPP_PROVIDER : provider;
+}
+
+function normalizeTtsProviderMap(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const normalized = { ...value };
+  if (normalized["audio-cpp"] !== undefined && normalized[AUDIO_CPP_PROVIDER] === undefined) {
+    normalized[AUDIO_CPP_PROVIDER] = normalized["audio-cpp"];
+  }
+  delete normalized["audio-cpp"];
+  return normalized;
+}
+
+function realtimeTuningState(backend = settings.ttsBackend) {
+  const current = realtimeTuningByBackend[backend];
+  const savedProfile = settings.ttsProfileByBackend?.[backend] || "balanced";
+  if (current && typeof current === "object") {
+    return {
+      profile_id: current.profile_id || savedProfile,
+      overrides: { ...(current.overrides || {}) },
+    };
+  }
+  return { profile_id: savedProfile, overrides: {} };
+}
+
+function setRealtimeTuningState(backend, profileId, overrides = {}) {
+  realtimeTuningByBackend = {
+    ...realtimeTuningByBackend,
+    [backend]: { profile_id: profileId || "balanced", overrides: { ...overrides } },
+  };
+  return realtimeTuningByBackend[backend];
+}
+
+const SAFE_TUNING_KEYS = [
+  "model",
+  "max_reference_seconds",
+  "first_block_frames",
+  "steady_block_frames",
+  "left_context_frames",
+  "text_lookahead",
+  "phrase_flush_ms",
+  "temperature",
+  "top_k",
+  "top_p",
+  "repetition_penalty",
+  "seed",
+];
+
+function effectiveCandidateTuning(resolved = candidateTuningResolved) {
+  if (!resolved || typeof resolved !== "object") return {};
+  return {
+    ...(resolved.profile || {}),
+    ...(resolved.effective || {}),
+    ...(resolved.temporaryOverrides || {}),
+  };
+}
+
+function tuningProfileSlug(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+function compactTuningSummary(values, keys = SAFE_TUNING_KEYS) {
+  const present = keys.filter((key) => values?.[key] !== undefined && values?.[key] !== null && values?.[key] !== "");
+  if (!present.length) return "none";
+  const preview = present.slice(0, 4).map((key) => `${key}=${values[key]}`).join(" · ");
+  return present.length > 4 ? `${preview} · +${present.length - 4} more` : preview;
+}
+
+function syncDecoderContextUnlock() {
+  if (!diagnosticsTuningContext || !diagnosticsTuningContextUnlock) return;
+  const available = settings.ttsBackend === AUDIO_CPP_PROVIDER
+    && !candidateInactiveTuningFields.has("left_context_frames");
+  diagnosticsTuningContextUnlock.disabled = !available;
+  diagnosticsTuningContext.disabled = !available || !diagnosticsTuningContextUnlock.checked;
+  diagnosticsContextWarning?.classList.toggle("active", available && diagnosticsTuningContextUnlock.checked);
+}
+
+function resolvedCandidatePhraseQueue(resolved = candidateTuningResolved) {
+  if (!resolved || typeof resolved !== "object") return null;
+  const effective = effectiveCandidateTuning(resolved);
+  const textLookahead = Number(effective.text_lookahead);
+  const phraseFlushMs = Number(effective.phrase_flush_ms);
+  if (!Number.isFinite(textLookahead) || !Number.isFinite(phraseFlushMs)) return null;
+  return { text_lookahead: textLookahead, phrase_flush_ms: phraseFlushMs };
+}
+
+function candidateRestTuningPayload(
+  overrides = realtimeTuningState(AUDIO_CPP_PROVIDER).overrides,
+  resolved = candidateTuningResolved,
+  profileId = diagnosticsTtsProfile?.value || realtimeTuningState(AUDIO_CPP_PROVIDER).profile_id,
+) {
+  const payload = {
+    provider: AUDIO_CPP_PROVIDER,
+    scope: "realtime",
+    profile_id: profileId || "balanced",
+    overrides,
+  };
+  const phraseQueue = resolved?.profile?.id === profileId
+    ? resolvedCandidatePhraseQueue(resolved)
+    : null;
+  if (phraseQueue) payload.resolved = phraseQueue;
+  return payload;
+}
+
+function activeTtsTuning(backend = settings.ttsBackend) {
+  if (normalizeTtsProvider(backend) !== AUDIO_CPP_PROVIDER) return null;
+  const state = realtimeTuningState(backend);
+  const payload = candidateRestTuningPayload(state.overrides, candidateTuningResolved, state.profile_id);
+  // `scope` belongs only to the candidate supervisor's REST API.  The Realtime
+  // WebSocket has a deliberately smaller, strict session schema.
+  const { scope: _restScope, ...sessionTuning } = payload;
+  return sessionTuning;
+}
+
+function updateRealtimeAudioSummary() {
+  if (!diagnosticsAudioSummary) return;
+  const backend = settings.ttsBackend || "no provider";
+  const backendStatus = ttsBackendStatuses?.[backend];
+  const provider = backendStatus?.displayName || backend;
+  const state = realtimeTuningState(backend);
+  const profile = backend === AUDIO_CPP_PROVIDER
+    ? candidateTuningResolved?.profile?.name || state.profile_id || "Balanced"
+    : "provider defaults";
+  const latestFirst = [...pipelineMetrics].reverse().find((metric) => metric.stage === "tts" && metric.status === "first_audio");
+  const latestTts = [...pipelineMetrics].reverse().find((metric) => metric.stage === "tts" && ["request_start", "done"].includes(metric.status));
+  const mode = latestTts?.detail?.mode || latestTts?.detail?.streaming_mode || (
+    backend === AUDIO_CPP_PROVIDER
+      ? backendStatus?.nativeStreaming ? "native PCM" : "buffered fallback"
+      : "provider managed"
+  );
+  const firstPcm = latestFirst?.detail?.first_pcm_ms ?? latestFirst?.elapsed_ms;
+  diagnosticsAudioSummary.textContent = `${provider} · ${profile} · ${mode} · first PCM ${Number.isFinite(Number(firstPcm)) ? `${Math.round(Number(firstPcm))} ms` : "pending"}`;
+}
+
+function setCandidateTuningEnabled(enabled) {
+  diagnosticsTtsProfile.disabled = !enabled;
+  diagnosticsTtsProfileApply.disabled = !enabled;
+  diagnosticsTtsProfileName.disabled = !enabled;
+  diagnosticsTtsProfileSaveAs.disabled = !enabled;
+  diagnosticsTuningApply.disabled = !enabled;
+  diagnosticsTuningClear.disabled = !enabled;
+  if (!enabled) {
+    diagnosticsTuningInputs.forEach((input) => { input.disabled = true; });
+    candidateInactiveTuningFields = new Set();
+  }
+  syncDecoderContextUnlock();
+}
+
+function tuningOverridesFromControls() {
+  const overrides = {};
+  for (const input of diagnosticsTuningInputs) {
+    if (input.disabled) continue;
+    const value = input.value.trim();
+    if (value === "") continue;
+    overrides[input.dataset.tuningKey] = input.dataset.tuningType === "string" ? value : Number(value);
+  }
+  return overrides;
+}
+
+async function resolveCandidateTuning(
+  overrides = realtimeTuningState(AUDIO_CPP_PROVIDER).overrides,
+  profileId = diagnosticsTtsProfile?.value || realtimeTuningState(AUDIO_CPP_PROVIDER).profile_id,
+) {
+  const response = await fetch("/api/audio-cpp/tuning/resolve", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(candidateRestTuningPayload(overrides, null, profileId)),
+    cache: "no-store",
+  });
+  const resolved = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = typeof resolved.detail === "string" ? resolved.detail : JSON.stringify(resolved.detail || resolved);
+    throw new Error(detail || "Candidate tuning could not be resolved");
+  }
+  candidateTuningResolved = resolved;
+  setRealtimeTuningState(AUDIO_CPP_PROVIDER, profileId, overrides);
+  const effective = effectiveCandidateTuning(resolved);
+  const inactive = new Set(resolved.inactiveFields || []);
+  candidateInactiveTuningFields = inactive;
+  for (const input of diagnosticsTuningInputs) {
+    const key = input.dataset.tuningKey;
+    input.value = effective[key] ?? "";
+    input.disabled = inactive.has(key);
+    input.dataset.namedValue = String(resolved.profile?.[key] ?? "");
+    input.dataset.effectiveValue = String(effective[key] ?? "");
+    input.classList.toggle("has-temporary-override", Object.hasOwn(resolved.temporaryOverrides || {}, key));
+    input.title = inactive.has(key)
+      ? `${key} is inactive in the running candidate`
+      : `Named: ${resolved.profile?.[key] ?? "unset"}; effective: ${effective[key] ?? "unset"}`;
+  }
+  syncDecoderContextUnlock();
+  const firstMs = Number(effective.first_block_frames || 0) * 80;
+  const steadyMs = Number(effective.steady_block_frames || 0) * 80;
+  const native = !!resolved.capabilities?.native_incremental_pcm;
+  diagnosticsTuningStatus.textContent = `${resolved.profile?.name || resolved.profile?.id || "Profile"} · ${native ? "native incremental PCM" : "buffered fallback"} · first/steady ${firstMs}/${steadyMs} ms · 24 kHz PCM16.`;
+  diagnosticsTuningNamedValues.textContent = `${resolved.profile?.name || profileId} · ${compactTuningSummary(resolved.profile || {})}`;
+  diagnosticsTuningOverrideValues.textContent = compactTuningSummary(resolved.temporaryOverrides || {});
+  diagnosticsTuningEffectiveValues.textContent = compactTuningSummary(effective);
+  diagnosticsTuningWarnings.textContent = (resolved.warnings || []).join(" ");
+  updateRealtimeAudioSummary();
+  return resolved;
+}
+
+function applyCandidateTuningToLiveSession() {
+  const tuning = activeTtsTuning();
+  if (client && LIVE_STATES.has(currentState) && tuning) {
+    client.updateLocalPipeline({
+      tts_backend: AUDIO_CPP_PROVIDER,
+      tts_tuning: tuning,
+    });
+  }
+}
+
+async function refreshCandidateTuningProfiles() {
+  if (settings.ttsBackend !== AUDIO_CPP_PROVIDER) {
+    diagnosticsTtsProfile.replaceChildren();
+    candidateTuningResolved = null;
+    candidateTuningProfileDocument = null;
+    setCandidateTuningEnabled(false);
+    diagnosticsTuningStatus.textContent = "The selected provider manages its own synthesis settings; audio.cpp controls are not sent.";
+    diagnosticsTuningNamedValues.textContent = "not applicable";
+    diagnosticsTuningOverrideValues.textContent = "none";
+    diagnosticsTuningEffectiveValues.textContent = "provider managed";
+    updateRealtimeAudioSummary();
+    return;
+  }
+  const response = await fetch("/api/audio-cpp/tuning/profiles", { cache: "no-store" });
+  if (!response.ok) throw new Error("Candidate tuning profiles are unavailable");
+  const profileDocument = await response.json();
+  candidateTuningProfileDocument = profileDocument;
+  diagnosticsTtsProfile.replaceChildren(...Object.values(profileDocument.profiles || {}).map((profile) => {
+    const option = window.document.createElement("option"); option.value = profile.id; option.textContent = `${profile.name} (${profile.first_block_frames * 80}/${profile.steady_block_frames * 80} ms)`; return option;
+  }));
+  const profileIds = new Set(Object.keys(profileDocument.profiles || {}));
+  const current = realtimeTuningState(AUDIO_CPP_PROVIDER);
+  const canonicalSelected = profileDocument.selections?.realtime?.[AUDIO_CPP_PROVIDER];
+  const selectedId = profileIds.has(canonicalSelected)
+    ? canonicalSelected
+    : profileIds.has(current.profile_id)
+      ? current.profile_id
+      : profileIds.has("balanced") ? "balanced" : [...profileIds][0] || "";
+  diagnosticsTtsProfile.value = selectedId;
+  const overrides = current.profile_id === selectedId ? current.overrides : {};
+  setRealtimeTuningState(AUDIO_CPP_PROVIDER, selectedId, overrides);
+  settings.ttsProfileByBackend = { ...(settings.ttsProfileByBackend || {}), [AUDIO_CPP_PROVIDER]: selectedId };
+  setCandidateTuningEnabled(true);
+  await resolveCandidateTuning(overrides, selectedId);
+}
+
+diagnosticsTtsProfileApply?.addEventListener("click", async () => {
+  try {
+    const profileId = diagnosticsTtsProfile.value;
+    setRealtimeTuningState(AUDIO_CPP_PROVIDER, profileId, {});
+    settings.ttsProfileByBackend = { ...(settings.ttsProfileByBackend || {}), [AUDIO_CPP_PROVIDER]: profileId };
+    await resolveCandidateTuning({}, profileId);
+    const selected = await fetch("/api/audio-cpp/tuning/selection", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ provider: AUDIO_CPP_PROVIDER, scope: "realtime", profile_id: profileId }),
+    });
+    if (!selected.ok) {
+      const detail = await selected.json().catch(() => ({}));
+      throw new Error(detail.detail || "Candidate Realtime profile selection could not be saved");
+    }
+    const saved = await saveSettings(settings);
+    if (!saved.ok) throw new Error(saved.error || "Realtime profile selection could not be saved");
+    applyCandidateTuningToLiveSession();
+    diagnosticsTuningStatus.textContent += " Saved for Realtime only; Voice Studio keeps its own active selection.";
+  } catch (error) {
+    diagnosticsTuningStatus.textContent = `Profile apply failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+});
+
+diagnosticsTtsProfileSaveAs?.addEventListener("click", async () => {
+  try {
+    const name = diagnosticsTtsProfileName.value.trim();
+    const id = tuningProfileSlug(name);
+    if (!name || !id) throw new Error("Enter a profile name containing letters or numbers");
+    if (!candidateTuningResolved) await resolveCandidateTuning();
+    const effective = effectiveCandidateTuning();
+    const values = Object.fromEntries(
+      SAFE_TUNING_KEYS
+        .filter((key) => effective[key] !== undefined)
+        .map((key) => [key, effective[key]]),
+    );
+    const response = await fetch("/api/audio-cpp/tuning/profiles", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id,
+        name,
+        clone_from: diagnosticsTtsProfile.value,
+        values,
+        scope: "realtime",
+        select: true,
+      }),
+    });
+    const created = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const detail = typeof created.detail === "string" ? created.detail : JSON.stringify(created.detail || created);
+      throw new Error(detail || "Profile could not be created");
+    }
+    const createdId = created.profile?.id || created.created?.id || id;
+    setRealtimeTuningState(AUDIO_CPP_PROVIDER, createdId, {});
+    settings.ttsProfileByBackend = { ...(settings.ttsProfileByBackend || {}), [AUDIO_CPP_PROVIDER]: createdId };
+    const saved = await saveSettings(settings);
+    if (!saved.ok) throw new Error(saved.error || "Created profile selection could not be saved");
+    diagnosticsTtsProfileName.value = "";
+    await refreshCandidateTuningProfiles();
+    applyCandidateTuningToLiveSession();
+    diagnosticsTuningStatus.textContent += " Saved as a new Realtime profile; Voice Studio selection remains unchanged.";
+  } catch (error) {
+    diagnosticsTuningStatus.textContent = `Save As failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+});
+
+diagnosticsTtsProfile?.addEventListener("change", () => {
+  const profileId = diagnosticsTtsProfile.value;
+  setRealtimeTuningState(AUDIO_CPP_PROVIDER, profileId, {});
+  void resolveCandidateTuning({}, profileId).catch((error) => {
+    diagnosticsTuningStatus.textContent = `Profile resolve failed: ${error instanceof Error ? error.message : String(error)}`;
+  });
+});
+
+diagnosticsTuningContextUnlock?.addEventListener("change", syncDecoderContextUnlock);
+
+diagnosticsTuningApply?.addEventListener("click", async () => {
+  try {
+    const overrides = tuningOverridesFromControls();
+    const profileId = diagnosticsTtsProfile.value;
+    await resolveCandidateTuning(overrides, profileId);
+    setRealtimeTuningState(AUDIO_CPP_PROVIDER, profileId, overrides);
+    applyCandidateTuningToLiveSession();
+    diagnosticsTuningStatus.textContent += " Temporary overrides are active for this page session only.";
+  } catch (error) {
+    diagnosticsTuningStatus.textContent = `Override rejected: ${error instanceof Error ? error.message : String(error)}`;
+  }
+});
+
+diagnosticsTuningClear?.addEventListener("click", async () => {
+  try {
+    const profileId = diagnosticsTtsProfile.value;
+    setRealtimeTuningState(AUDIO_CPP_PROVIDER, profileId, {});
+    await resolveCandidateTuning({}, profileId);
+    applyCandidateTuningToLiveSession();
+    diagnosticsTuningStatus.textContent += " Temporary overrides cleared.";
+  } catch (error) {
+    diagnosticsTuningStatus.textContent = `Could not clear overrides: ${error instanceof Error ? error.message : String(error)}`;
+  }
+});
+
+function echoCalibrationFromControls() {
+  const calibration = {};
+  for (const input of diagnosticsEchoInputs) {
+    const number = Number(input.value);
+    if (Number.isFinite(number)) calibration[input.dataset.echoCalibrationKey] = number;
+  }
+  return {
+    delayMs: Math.max(0, Math.min(500, Number(calibration.delayMs) || 0)),
+    suppressionStrength: Math.max(0, Math.min(1, Number(calibration.suppressionStrength) || 0)),
+    leakageThreshold: Math.max(0.05, Math.min(1, Number(calibration.leakageThreshold) || 0.65)),
+    doubleTalkSensitivity: Math.max(0, Math.min(1, Number(calibration.doubleTalkSensitivity) || 0)),
+    echoTailMs: Number(latestEchoStatus?.calibration?.echoTailMs) || 350,
+  };
+}
+
+function paintEchoStatus(status) {
+  if (!status || typeof status !== "object") return;
+  latestEchoStatus = status;
+  const calibration = status.calibration || {};
+  for (const input of diagnosticsEchoInputs) {
+    const value = calibration[input.dataset.echoCalibrationKey];
+    if (Number.isFinite(Number(value))) input.value = String(value);
+  }
+  diagnosticsEchoDevicePair.textContent = status.devicePair || "device pair pending";
+  diagnosticsEchoOutputLatency.textContent =
+    `Output latency: ${Number(status.outputLatencyMs || 0).toFixed(1)} ms`;
+  const requested = status.requestedMode || settings.echoGuard;
+  const effective = status.effectiveMode || (requested === "strict" ? "strict-fallback" : "native");
+  const engine = status.available
+    ? status.engine || "AEC3"
+    : status.error || status.loaderReason || "Native browser AEC fallback";
+  diagnosticsAudioStatus.textContent =
+    `Requested/effective echo: ${requested}/${effective} · reference ${status.referenceWired === false ? "missing" : "wired"} · ${engine}.`;
+  setDiagnosticWarning(
+    "aec3",
+    requested === "adaptive" && !status.available
+      ? "Adaptive requested, but the verified AEC3 module is unavailable; Native browser AEC is active."
+      : "",
+  );
+}
+
+async function saveActiveEchoCalibration({ useMeasuredDelay = false } = {}) {
+  const pair = latestEchoStatus?.devicePair;
+  if (!pair) {
+    diagnosticsAudioStatus.textContent = "Start a conversation before saving device-pair calibration.";
+    return;
+  }
+  if (useMeasuredDelay) {
+    const echo = [...pipelineMetrics].reverse().find((metric) => metric.stage === "echo_guard");
+    const measured = Number(echo?.detail?.lag_ms);
+    const outputLatency = Number(latestEchoStatus?.outputLatencyMs || 0);
+    if (!Number.isFinite(measured)) {
+      diagnosticsAudioStatus.textContent = "No stable AEC3 delay measurement is available yet.";
+      return;
+    }
+    const delayInput = diagnosticsEchoInputs.find(
+      (input) => input.dataset.echoCalibrationKey === "delayMs",
+    );
+    if (delayInput) delayInput.value = String(Math.max(0, Math.round(measured - outputLatency)));
+  }
+  const calibration = echoCalibrationFromControls();
+  settings.echoCalibrations = { ...(settings.echoCalibrations || {}), [pair]: calibration };
+  client?.setEchoCalibration(calibration);
+  const saved = await saveSettings(settings);
+  if (!saved.ok) {
+    diagnosticsAudioStatus.textContent = `Calibration save failed: ${saved.error}`;
+    return;
+  }
+  paintEchoStatus({ ...latestEchoStatus, calibration });
+}
+
+diagnosticsEchoSave?.addEventListener("click", () => {
+  void saveActiveEchoCalibration();
+});
+diagnosticsEchoUseMeasured?.addEventListener("click", () => {
+  void saveActiveEchoCalibration({ useMeasuredDelay: true });
+});
 /** @type {HTMLButtonElement} */
 const toolsBtn = $("#tools-btn");
 /** @type {HTMLDialogElement} */
@@ -431,7 +922,7 @@ let voiceInventoryRequest = 0;
 let diagnosticsOpen = localStorage.getItem(STORAGE_KEYS.diagnostics) === "1";
 /** @type {Array<any>} */
 let pipelineMetrics = [];
-const EXPECTED_UI_API_VERSION = 14;
+const EXPECTED_UI_API_VERSION = 20;
 const EXPECTED_BACKEND_API_VERSION = 7;
 const DIAGNOSTIC_STAGES = ["mic", "echo_guard", "vad", "transcription", "gemma", "context", "tool", "tts", "playback"];
 const DIAGNOSTIC_STAGE_LABELS = { echo_guard: "Echo Guard" };
@@ -575,10 +1066,16 @@ function setCaption(text, kind = "") {
 
 function openSettings() {
   syncConnectionUi();
-  renderVoiceOptions();
-  inputVoice.value = settings.voice;
   renderTtsBackendOptions();
   inputTtsBackend.value = settings.ttsBackend;
+  // Always bind the selector to a fresh inventory for the currently selected
+  // backend. In particular, do not reuse the last provider's in-memory list
+  // when Settings opens after server-managed preferences were restored.
+  void (async () => {
+    await Promise.all([fetchVoiceProfiles(), refreshTtsBackends()]);
+    await refreshFasterModelInventory();
+    renderSelectedTtsBackendStatus();
+  })();
   inputModelProvider.value = settings.modelProvider;
   inputModelUrl.value = settings.modelUrl;
   inputModelName.value = settings.modelName;
@@ -586,6 +1083,7 @@ function openSettings() {
   syncModelProviderUi();
   inputInstructions.value = settings.instructions;
   inputEchoGuard.value = settings.echoGuard;
+  void refreshCandidateTuningProfiles().catch((error) => console.warn("candidate tuning refresh failed", error));
   inputFullBufferTts.checked = settings.fullBufferTts;
   inputLiveTranscript.checked = settings.liveTranscript;
   inputMaxResponseTokens.value = String(settings.maxResponseTokens);
@@ -598,7 +1096,7 @@ function renderVoiceOptions() {
   inputVoice.replaceChildren();
   if (!voiceProfiles.length) {
     const option = document.createElement("option");
-    option.value = settings.voice || defaultVoice;
+    option.value = "";
     option.textContent = "No live Base clone profiles found for this backend";
     option.disabled = true;
     option.selected = true;
@@ -623,6 +1121,21 @@ function renderVoiceOptions() {
     option.selected = profile.voice === settings.voice;
     inputVoice.append(option);
   }
+  syncSelectedProfileEditor();
+}
+
+function clearVoiceProfileOptions(backend, message = `Loading live Base clone profiles for ${backend}…`) {
+  voiceProfiles = [];
+  profileLibraryWritable = false;
+  defaultVoice = "";
+  inputVoice.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = message;
+  placeholder.disabled = true;
+  placeholder.selected = true;
+  inputVoice.append(placeholder);
+  inputVoice.disabled = true;
   syncSelectedProfileEditor();
 }
 
@@ -657,7 +1170,7 @@ async function qwen3Json(url, options = {}) {
 }
 
 function applyVoiceProfilePayload(payload, backend = settings.ttsBackend) {
-  if (backend !== settings.ttsBackend) return;
+  if (backend !== settings.ttsBackend || (payload.backend && payload.backend !== backend)) return;
   defaultVoice = payload.defaultVoice || DEFAULT_VOICE;
   voiceProfiles = Array.isArray(payload.voices) ? payload.voices : [];
   profileLibraryWritable = !!payload.writable;
@@ -678,20 +1191,42 @@ async function selectVoiceProfile() {
   if (!profile) return;
   settings.voice = profile.voice;
   settings.voiceByBackend = { ...(settings.voiceByBackend || {}), [settings.ttsBackend]: profile.voice };
-  saveSettings(settings);
-  if (settings.ttsBackend === "qwen3tts-audiocpp") {
-    const validation = ttsBackendStatuses[settings.ttsBackend]?.validation;
-    if (validation?.voice !== profile.voice) {
-      audioCppStatus.textContent = `Needs validation for ${profile.name || profile.voice}. Use Validate selected TTS backend before starting a conversation.`;
+  const saved = await saveSettings(settings);
+  if (!saved.ok) {
+    profileLibraryStatus.textContent = `Could not save selected voice: ${saved.error}`;
+  }
+  if (profileLibraryWritable) {
+    try {
+      const payload = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/profiles/${encodeURIComponent(profile.id)}/select`, { method: "POST", body: JSON.stringify({}) });
+      applyVoiceProfilePayload(payload);
+    } catch (err) {
+      profileLibraryStatus.textContent = `Could not persist selection: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
-  if (!profileLibraryWritable) return;
-  try {
-    const payload = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/profiles/${encodeURIComponent(profile.id)}/select`, { method: "POST", body: JSON.stringify({}) });
-    applyVoiceProfilePayload(payload);
-  } catch (err) {
-    profileLibraryStatus.textContent = `Could not persist selection: ${err instanceof Error ? err.message : String(err)}`;
+  // Validation is scoped to provider + resident model + clone.  Refresh only
+  // after the selected clone has reached server-backed settings; otherwise the
+  // status endpoint necessarily reports the previous clone and blocks Start.
+  await refreshTtsBackends();
+  renderSelectedTtsBackendStatus(profile);
+}
+
+function renderSelectedTtsBackendStatus(profile = selectedProfile()) {
+  const status = ttsBackendStatuses[settings.ttsBackend];
+  const name = status?.displayName || settings.ttsBackend;
+  if (!status?.reachable) {
+    audioCppStatus.textContent = `${name} is unavailable. Start it externally, then refresh or reopen Settings.`;
+    return;
   }
+  if (status.explicitValidation) {
+    const validation = status.validation;
+    audioCppStatus.textContent = validation?.speech && validation.voice === profile?.voice
+      ? `${profile.name || profile.voice} (${profile.voice}) is validated for the resident ${name} model.`
+      : `Needs validation for ${profile?.name || profile?.voice || "the selected clone"}. Use Validate selected TTS backend before starting a conversation.`;
+    return;
+  }
+  audioCppStatus.textContent = status.ready && profile
+    ? `${name} is ready with ${profile.name || profile.voice} (${profile.voice}).`
+    : `${name} is reachable but its selected Base clone is not ready.`;
 }
 
 /** dB position (clamped to the slider axis) as a 0..1 fraction of the track.
@@ -1207,6 +1742,37 @@ function renderDiagnostics() {
   if (!diagnosticsList || !diagnosticsSummary || !diagnosticsGraph || !diagnosticsWaterfall) return;
   const turnStart = pipelineMetrics.map((m) => `${m.stage}.${m.status}`).lastIndexOf("mic.speaking");
   const visibleMetrics = turnStart >= 0 ? pipelineMetrics.slice(turnStart) : pipelineMetrics;
+  const ttsStart = [...visibleMetrics].reverse().find((m) => m.stage === "tts" && m.status === "request_start");
+  const ttsFirst = [...visibleMetrics].reverse().find((m) => m.stage === "tts" && m.status === "first_audio");
+  const ttsDone = [...visibleMetrics].reverse().find((m) => m.stage === "tts" && m.status === "done");
+  const llmFirstPhrase = [...visibleMetrics].reverse().find((m) => m.stage === "gemma" && m.status === "first_stable_phrase");
+  const firstPlayback = [...visibleMetrics].reverse().find((m) => m.stage === "playback" && m.status === "first_audio");
+  const responseDone = [...visibleMetrics].reverse().find((m) => m.stage === "response" && m.status === "done");
+  if (diagnosticsAudioMetrics && (ttsStart || ttsFirst || ttsDone || llmFirstPhrase || firstPlayback || responseDone)) {
+    const start = ttsStart?.detail || {}; const first = ttsFirst?.detail || {}; const done = ttsDone?.detail || {};
+    const selectedTtsStatus = ttsBackendStatuses[settings.ttsBackend];
+    const gpu = done.gpu || selectedTtsStatus?.health?.backend?.runtime?.gpu_now;
+    const gpuText = gpu && typeof gpu === "object"
+      ? `${gpu.freeMiB ?? "unknown"} MiB free / ${gpu.utilizationPercent ?? "unknown"}% utilization`
+      : gpu ?? "unknown";
+    const firstPhraseMs = llmFirstPhrase?.elapsed_ms ?? llmFirstPhrase?.detail?.first_stable_phrase_ms ?? "unknown";
+    const firstPlaybackMs = firstPlayback?.elapsed_ms ?? firstPlayback?.detail?.first_playback_ms ?? "unknown";
+    const endToEndMs = responseDone?.elapsed_ms ?? responseDone?.detail?.end_to_end_ms ?? "unknown";
+    const referenceSeconds = (value) => Number.isFinite(Number(value)) ? `${Number(value).toFixed(3)} s` : "unknown";
+    const referenceLimit = done.reference_limit_applied == null
+      ? "limit status unknown"
+      : done.reference_limit_applied ? "limit applied" : "limit not applied";
+    const referencePairing = done.reference_pairing ?? "unknown pairing";
+    diagnosticsAudioMetrics.textContent = `Profile ${done.profile_id ?? start.tts_profile_id ?? "unknown"} · ${done.model ?? start.model ?? "unknown model"}\nMode: ${done.delivery_mode ?? done.mode ?? start.streaming_mode ?? "unknown"}\nLLM first stable phrase: ${firstPhraseMs} ms\nTTS first PCM: ${first.first_pcm_ms ?? ttsFirst?.elapsed_ms ?? "unknown"} ms · First playback: ${firstPlaybackMs} ms\nSynthesis RTF: ${done.rtf ?? "unknown"} · End-to-end: ${endToEndMs} ms\nGeneration: ${done.generation_ms ?? "unknown"} ms · Audio: ${done.audio_duration_ms ?? "unknown"} ms · GPU: ${gpuText}\nReference: source ${referenceSeconds(done.reference_source_seconds)} · requested ${referenceSeconds(done.reference_requested_limit_seconds)} · used ${referenceSeconds(done.reference_used_seconds)} · ${referenceLimit} · ${referencePairing}`;
+  }
+  const echo = [...visibleMetrics].reverse().find((m) => m.stage === "echo_guard");
+  if (echo && diagnosticsAudioStatus) {
+    const detail = echo.detail || {};
+    const requested = detail.requested_mode || latestEchoStatus?.requestedMode || settings.echoGuard;
+    const effective = detail.effective_mode || latestEchoStatus?.effectiveMode || "native";
+    const doubleTalk = detail.double_talk == null ? "unknown" : detail.double_talk ? "yes" : "no";
+    diagnosticsAudioStatus.textContent = `Requested/effective echo: ${requested}/${effective} · AEC3 ${detail.module_available ? "ready" : "fallback"} · reference ${detail.playback_active ? "active" : "idle"} · delay ${detail.lag_ms ?? "unknown"} ms · confidence ${detail.prediction_confidence ?? detail.correlation ?? "unknown"} · double-talk ${doubleTalk}.`;
+  }
   const latestByStage = new Map();
   for (const metric of visibleMetrics) latestByStage.set(metric.stage, metric);
   const measured = visibleMetrics.filter((m) => typeof m.elapsed_ms === "number" && m.elapsed_ms >= 0);
@@ -1266,6 +1832,7 @@ function renderDiagnostics() {
     row.append(label, value);
     diagnosticsList.append(row);
   }
+  updateRealtimeAudioSummary();
 }
 
 async function refreshLocalPipeline() {
@@ -1290,10 +1857,14 @@ async function refreshTtsBackends() {
     ttsBackendStatuses = {};
   }
   renderTtsBackendOptions();
+  updateRealtimeAudioSummary();
 }
 
 async function assertTtsBackendReady() {
   await refreshTtsBackends();
+  // Candidate startup requires a live supervisor profile resolve.  Do not let
+  // a stale cached profile reach the WebSocket and fail after the mic starts.
+  await refreshCandidateTuningProfiles();
   await fetchVoiceProfiles();
   const status = ttsBackendStatuses[settings.ttsBackend];
   const selectedExists = voiceProfiles.some((profile) => profile.voice === settings.voice);
@@ -1303,7 +1874,7 @@ async function assertTtsBackendReady() {
     throw new Error("Groxaxo is unavailable or has no 0.6B-Base/1.7B-Base model loaded in Voice Studio.");
   }
   if (settings.ttsBackend === "qwen3tts-audiocpp" || settings.ttsBackend === "audio-cpp") {
-    throw new Error(status?.error || "audio.cpp is not loaded, profile-compatible, or validated for progressive PCM.");
+    throw new Error(status?.error || "audio.cpp is not loaded, profile-compatible, or validated for native PCM or the buffered fallback.");
   }
   throw new Error("FasterQwen3TTS is unavailable or its 1.7B-Base clone model is not ready.");
 }
@@ -1331,7 +1902,7 @@ function renderLocalPipeline() {
   const selectedTtsName = settings.ttsBackend === "groxaxo"
     ? "Groxaxo candidate"
     : (settings.ttsBackend === "qwen3tts-audiocpp" || settings.ttsBackend === "audio-cpp")
-      ? "Qwen3TTS audio.cpp (progressive PCM)"
+      ? `Qwen3TTS audio.cpp (${selectedTts?.nativeStreaming ? "native PCM" : "buffered fallback"})`
       : "FasterQwen3TTS";
   const selectedTtsLabel = selectedTts
     ? `${selectedTtsName} ${selectedTts.currentModel || "Base model"} (${selectedTts.ready ? "online" : "unavailable"})`
@@ -1380,20 +1951,15 @@ async function fetchConfig() {
 }
 
 async function fetchVoiceProfiles() {
-  const backend = settings.ttsBackend || "faster";
+  const backend = settings.ttsBackend;
   const request = ++voiceInventoryRequest;
   // Do not leave a previous provider's clones visible while the selected
   // provider is loading or unavailable.
-  voiceProfiles = [];
-  profileLibraryWritable = false;
-  defaultVoice = DEFAULT_VOICE;
-  inputVoice.replaceChildren();
-  const loading = document.createElement("option");
-  loading.textContent = `Loading live Base clone profiles for ${backend}…`;
-  loading.disabled = true;
-  loading.selected = true;
-  inputVoice.append(loading);
-  inputVoice.disabled = true;
+  if (!backend) {
+    clearVoiceProfileOptions("", "Select a TTS backend to load its live clone profiles");
+    return;
+  }
+  clearVoiceProfileOptions(backend);
   try {
     const res = await fetch(`api/tts/backends/${encodeURIComponent(backend)}/voices`, { cache: "no-store" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1430,7 +1996,7 @@ async function runFasterModelOperation(action) {
 
 async function validateAudioCppCandidate() {
   validateAudioCppBtn.disabled = true;
-  audioCppStatus.textContent = "Checking the loaded Voice Studio model, selected clone, and buffered speech compatibility…";
+  audioCppStatus.textContent = "Checking the loaded Voice Studio model, selected clone, native PCM, and buffered fallback…";
   try {
     const profile = selectedProfile();
     const status = await qwen3Json(`api/tts/backends/${encodeURIComponent(settings.ttsBackend)}/validate`, {
@@ -1438,8 +2004,12 @@ async function validateAudioCppCandidate() {
       body: JSON.stringify({ voice: profile?.voice || settings.voice }),
     });
     const limitations = Array.isArray(status.limitations) ? status.limitations.join(" ") : "";
+    const probe = status.speechProbe || {};
+    const probeDetail = probe.bytes
+      ? `; ${probe.bytes} bytes in ${probe.chunks || 1} chunk(s)${probe.firstChunkMs != null ? `, first in ${probe.firstChunkMs} ms` : ""}`
+      : "";
     audioCppStatus.textContent = status.ready
-      ? `${status.displayName || settings.ttsBackend} is verified for ${profile?.name || settings.voice}${status.speechProbe?.bytes ? `; ${status.speechProbe.bytes} speech bytes in ${status.speechProbe.elapsedMs} ms` : ""}.`
+      ? `${status.displayName || settings.ttsBackend} is verified for ${profile?.name || settings.voice}; mode ${status.mode || status.deliveryMode || "unknown"}${probeDetail}. ${limitations}`.trim()
       : `${status.error || "Selected backend is not ready."} ${limitations}`.trim();
   } catch (err) {
     audioCppStatus.textContent = `Backend validation failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -1453,12 +2023,28 @@ inputVoice.addEventListener("change", () => { void selectVoiceProfile(); });
 inputTtsBackend.addEventListener("change", async () => {
   const previous = settings.ttsBackend;
   settings.voiceByBackend = { ...(settings.voiceByBackend || {}), [previous]: settings.voice };
-  settings.ttsBackend = inputTtsBackend.value || "faster";
-  settings.voice = settings.voiceByBackend[settings.ttsBackend] || (settings.ttsBackend === "faster" ? DEFAULT_VOICE : "");
-  await fetchVoiceProfiles();
+  settings.ttsBackend = normalizeTtsProvider(inputTtsBackend.value);
+  settings.voice = settings.voiceByBackend[settings.ttsBackend] || "";
+  // The previous provider's profile resolution is never valid for the newly
+  // selected backend.  Clear it synchronously before any inventory request.
+  candidateTuningResolved = null;
+  // Invalidate any older provider request and remove its identities before the
+  // first await; stale clones must never remain selectable during a switch.
+  voiceInventoryRequest += 1;
+  clearVoiceProfileOptions(settings.ttsBackend || "", settings.ttsBackend
+    ? `Loading live Base clone profiles for ${settings.ttsBackend}…`
+    : "Select a TTS backend to load its live clone profiles");
+  audioCppStatus.textContent = `Loading ${settings.ttsBackend} status…`;
+  await Promise.all([
+    refreshCandidateTuningProfiles().catch((error) => console.warn("candidate tuning refresh failed", error)),
+    fetchVoiceProfiles(),
+  ]);
+  const saved = await saveSettings(settings);
+  if (!saved.ok) profileLibraryStatus.textContent = `Could not save selected backend: ${saved.error}`;
   await refreshTtsBackends();
   await refreshFasterModelInventory();
-  saveSettings(settings);
+  renderSelectedTtsBackendStatus();
+  updateRealtimeAudioSummary();
 });
 profileCreateBtn.addEventListener("click", async () => {
   const source = selectedProfile();
@@ -1587,11 +2173,14 @@ function readSettingsFromForm() {
     voiceByBackend: { ...(settings.voiceByBackend || {}), [backend]: voice },
     instructions: inputInstructions.value.trim() || DEFAULT_INSTRUCTIONS,
     noiseGate: readGateThreshold(),
-    echoGuard: ["off", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "adaptive",
+    echoGuard: ["native", "adaptive", "strict"].includes(inputEchoGuard.value) ? inputEchoGuard.value : "native",
+    echoCalibrations: settings.echoCalibrations || {},
     fullBufferTts: inputFullBufferTts.checked,
     liveTranscript: inputLiveTranscript.checked,
     maxResponseTokens: Math.min(1024, Math.max(64, Number(inputMaxResponseTokens.value) || 384)),
     ttsBackend: backend,
+    ttsProfileByBackend: { ...(settings.ttsProfileByBackend || {}) },
+    tts_tuning: backend === AUDIO_CPP_PROVIDER ? activeTtsTuning(backend) : undefined,
     modelProvider: inputModelProvider.value === "remote" ? "remote" : "local",
     modelUrl: inputModelUrl.value.trim(),
     modelName: inputModelName.value.trim(),
@@ -1693,11 +2282,14 @@ settingsForm.addEventListener("submit", async (event) => {
   // Voice + instructions can apply to a live session without reconnecting; a
   // changed connection URL only takes effect on the next restart.
   if (client && LIVE_STATES.has(currentState)) {
+    const tuning = activeTtsTuning(settings.ttsBackend);
     client.updateSession({ voice: settings.voice, instructions: effectiveInstructions() });
     client.updateLocalPipeline({
       full_buffer_tts: settings.fullBufferTts,
       live_transcription: settings.liveTranscript,
       max_response_tokens: settings.maxResponseTokens,
+      tts_backend: settings.ttsBackend,
+      ...(tuning ? { tts_tuning: tuning } : {}),
     });
     client.setEchoGuard(settings.echoGuard);
   }
@@ -1915,11 +2507,15 @@ async function doStart(audioContext = null) {
     tools: activeToolDefs(),
     noiseGate: gateParams(settings.noiseGate),
     echoGuard: settings.echoGuard,
+    echoCalibrations: settings.echoCalibrations,
     pipelineConfig: {
       full_buffer_tts: settings.fullBufferTts,
       live_transcription: settings.liveTranscript,
       max_response_tokens: settings.maxResponseTokens,
       tts_backend: settings.ttsBackend,
+      ...(activeTtsTuning(settings.ttsBackend)
+        ? { tts_tuning: activeTtsTuning(settings.ttsBackend) }
+        : {}),
       model_endpoint: modelEndpointConfig(settings),
     },
     ...(audioContext ? { audioContext } : {}),
@@ -2012,6 +2608,10 @@ async function doStart(audioContext = null) {
     if (client !== c) return;
     const { rms } = /** @type {CustomEvent<{ rms: number }>} */ (e).detail;
     paintInputLevel(rms);
+  });
+  c.addEventListener("echo-status", (e) => {
+    if (client !== c) return;
+    paintEchoStatus(/** @type {CustomEvent<any>} */ (e).detail);
   });
   c.addEventListener("pipeline-metric", (e) => {
     if (client !== c) return;
@@ -2213,21 +2813,34 @@ async function teardown() {
 /** @param {unknown} err */
 function onFatalError(err) {
   console.error("[main] fatal:", err);
-  setState("error");
   const message = err instanceof Error ? err.message : String(err);
-  setCaption(truncateError(message), "error");
-  void teardown().catch(() => {
+  const showError = () => {
     setState("error");
     setCaption(truncateError(message), "error");
-  });
+  };
+  showError();
+  // teardown() intentionally returns normal stops to Idle. A fatal startup
+  // failure must still release every resource, but it must remain visible once
+  // cleanup completes instead of silently landing back on the idle orb.
+  void teardown().then(showError, showError);
+}
+
+async function initializeApp() {
+  // Restore the managed backend/voice selection before the first inventory
+  // request. Starting both operations concurrently allowed a Faster request
+  // to win while the UI later displayed audio.cpp, leaving a foreign or empty
+  // clone list attached to the selected provider.
+  await restorePersistentSettings();
+  await fetchConfig();
+  await refreshCandidateTuningProfiles().catch((error) => console.warn("candidate tuning refresh failed", error));
+  await fetchVoiceProfiles();
+  if (settings.modelProvider === "local") void refreshLocalPipeline();
 }
 
 setState("idle");
 chat.renderEmptyState();
 initGateArc();
-void fetchConfig();
-if (settings.modelProvider === "local") void refreshLocalPipeline();
-void restorePersistentSettings();
+void initializeApp();
 // Restore an already-enabled camera after a reload. Browsers only prompt if the
 // user has not yet made a permission choice.
 void autoStartCamera();

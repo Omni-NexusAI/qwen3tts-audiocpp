@@ -4,15 +4,27 @@
 FROM nvidia/cuda:12.6.3-devel-ubuntu22.04 AS build
 
 ARG AUDIO_CPP_REPOSITORY=https://github.com/0xShug0/audio.cpp.git
-ARG AUDIO_CPP_REF=main
+ARG AUDIO_CPP_REF=238ab6a9e321c17de8e120559f57efeedaeb1345
+# Docker build stages do not see the host GPU, so CMake otherwise accepts
+# nvcc's compiler-default architecture (observed as 52).  This isolated
+# candidate is validated for the RTX 3080 Laptop GPU (sm_86); set CUDAARCHS
+# before the first configure so CMake caches the intended target.
+ARG AUDIO_CPP_CUDA_ARCHITECTURES=86
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        ca-certificates cmake git ninja-build build-essential python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --branch "${AUDIO_CPP_REF}" "${AUDIO_CPP_REPOSITORY}" /opt/audio.cpp
+RUN git clone --no-checkout "${AUDIO_CPP_REPOSITORY}" /opt/audio.cpp \
+    && cd /opt/audio.cpp \
+    && git fetch --depth 1 origin "${AUDIO_CPP_REF}" \
+    && git checkout --detach "${AUDIO_CPP_REF}"
+COPY integrations/audio-cpp/patches/qwen3-native-pcm-streaming.patch /tmp/qwen3-native-pcm-streaming.patch
 WORKDIR /opt/audio.cpp
-RUN bash scripts/build_linux.sh --backend cuda --deployment-build \
+RUN git apply --check /tmp/qwen3-native-pcm-streaming.patch \
+    && git apply /tmp/qwen3-native-pcm-streaming.patch
+RUN test -n "$AUDIO_CPP_CUDA_ARCHITECTURES" \
+    && CUDAARCHS="$AUDIO_CPP_CUDA_ARCHITECTURES" bash scripts/build_linux.sh --backend cuda --deployment-build \
     --model-set custom --models qwen3_tts --target audiocpp_server
 
 FROM build AS model-stage
@@ -53,7 +65,9 @@ ARG VOICE_STUDIO_SOURCE_REV=voice-studio-ui-and-hfrt-reliability-20260801
 RUN test -n "$VOICE_STUDIO_SOURCE_REV"
 COPY web/hf-realtime-voice/ .
 COPY integrations/audio-cpp/gradio_voice_studio.py /opt/voice-studio/gradio_voice_studio.py
+COPY integrations/audio-cpp/profile_library.py /opt/voice-studio/profile_library.py
 COPY integrations/audio-cpp/supervisor.py /opt/audio-cpp-supervisor.py
+COPY integrations/audio-cpp/profile_library.py /opt/profile_library.py
 COPY integrations/audio-cpp/entrypoint.sh /usr/local/bin/audio-cpp-candidate
 RUN chmod +x /usr/local/bin/audio-cpp-candidate
 
