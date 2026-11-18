@@ -86,9 +86,12 @@ For another GPU generation, add
 command.
 
 Open [http://127.0.0.1:8891/voice-studio/](http://127.0.0.1:8891/voice-studio/),
-choose a model under **Settings & candidate model controls**, and click
-**Load selected model**. Loading is explicit: starting or recreating the
-container does not leave a model resident automatically.
+and choose a model under **Settings & candidate model controls**. The container
+starts with no model loaded. The model loads the first time speech is requested,
+or when you click **Load selected model**, and is released after 15 minutes
+without speech so the GPU is free when nothing is speaking. A model you unload
+by hand stays unloaded until you load one again. Change any of this under
+**Model loading and idle unload**.
 
 You can confirm the service before generating audio:
 
@@ -212,7 +215,9 @@ Useful endpoints include:
 | `GET /v1/models` | Both bundled model IDs and current selection |
 | `GET /v1/backend/models` | Model lifecycle and single-resident status |
 | `POST /v1/backend/models/switch` | Load or switch the active model |
-| `POST /v1/backend/models/unload` | Release the current model |
+| `POST /v1/backend/models/ensure` | Make sure a model is loaded; answers at once and loads in the background |
+| `POST /v1/backend/models/unload` | Release the current model and hold it unloaded |
+| `GET` / `PUT /control/lifecycle` | Read or change the keep-loaded switch, the idle time, and the speech-while-unloaded policy |
 | `GET /v1/voices` | Live candidate-local Base clones |
 | `GET /v1/voices/profiles` | Editable voice-profile inventory |
 | `GET /v1/tuning/profiles` | Built-in and custom tuning definitions |
@@ -251,6 +256,52 @@ is the separately labeled buffered fallback.
 Reference-pairing headers report source duration, requested limit, used
 duration, whether the limit was applied, pairing type, and delivery mode. They
 never include the transcript content.
+
+## Loading on demand and idle unload
+
+Any client can use the service without loading a model first.
+
+- **A plain speech request loads the model.** When `POST /v1/audio/speech`
+  arrives with nothing loaded, the service loads the model and then speaks. It
+  waits up to 90 seconds by default; the load usually takes about a minute. A
+  client with a shorter timeout can retry: the load keeps going in the
+  background and is never cancelled by a client that gave up.
+- **A client can ask first.** `POST /v1/backend/models/ensure` with
+  `{"model": "<id>"}` (or an empty body for the default model) answers at once:
+
+  ```json
+  {"model": "qwen3-tts-1.7b-base-bf16", "state": "loading", "ready": false,
+   "accepted": true, "reason": "load-in-progress", "retryAfterS": 5, "etaS": 41}
+  ```
+
+  Call it again until `ready` is `true`; repeating it never starts a second
+  load. When `accepted` is `false`, `reason` says why: `gpu-guard` (with the
+  measured numbers in `gpuGuard`), `manual-hold` (the model was unloaded by hand
+  in Voice Studio), `resident-model-in-use` (the other model was used within the
+  last two minutes), `load-in-progress`, or `load-failed`.
+- **The model is released when idle.** After 15 minutes without speech the
+  service unloads it. It never unloads during a request, and the idle time
+  starts again when a request finishes. Turn this off with **Keep the model
+  loaded**.
+- **A request can choose how long to wait.** Send `"load_wait_s": 0` in the body,
+  or the header `X-TTS-Load-Wait-Seconds: 0`, to get an immediate answer
+  instead of waiting: `503` with a `Retry-After` header while the model loads.
+
+The policy for speech that arrives while unloaded is one of `wait` (default),
+`retry` (always answer `503` with `Retry-After` and load in the background), or
+`refuse` (require an explicit load, the earlier behaviour). Every error raised
+while a model is not ready carries `"audio_started": false` and the header
+`X-TTS-Audio-Started: false`: nothing was spoken.
+
+`GET /control/status` reports all of this in a `lifecycle` block: whether the
+model is kept loaded, the idle time, how long it has been idle, when it will
+unload, any load in progress with its estimated time left, and why it was last
+unloaded. Defaults can also be set with `AUDIO_CPP_IDLE_UNLOAD_SECONDS`,
+`AUDIO_CPP_KEEP_LOADED`, `AUDIO_CPP_SPEECH_WHEN_UNLOADED`, and
+`AUDIO_CPP_LOAD_WAIT_SECONDS`; values saved in Voice Studio take precedence.
+
+Clients that send `expected_engine_epoch` should read it again after a reload:
+each load increments it.
 
 ## Diagnostics and failure reporting
 

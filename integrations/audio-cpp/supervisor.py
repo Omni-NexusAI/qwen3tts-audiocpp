@@ -89,6 +89,22 @@ MAX_SYNTHESIS_BUSY_PERCENT = 95
 GPU_GUARD_SETTINGS_PATH = VOICE_LIBRARY_DIR / "candidate_gpu_guard.json"
 VOICE_STUDIO_SETTINGS_PATH = VOICE_LIBRARY_DIR / "voice_studio_settings.json"
 TUNING_PROFILES_PATH = VOICE_LIBRARY_DIR / "tts_profiles.json"
+LIFECYCLE_SETTINGS_PATH = VOICE_LIBRARY_DIR / "lifecycle_settings.json"
+# Model lifecycle: load on demand and unload when idle.  A plain speech request
+# that arrives with no model loaded is handled by `speech_when_unloaded`:
+# "wait" loads and then speaks, "retry" starts the load and answers 503 with
+# Retry-After, "refuse" keeps the explicit-load-only behaviour.
+SPEECH_WHEN_UNLOADED_MODES = {"wait", "retry", "refuse"}
+IDLE_UNLOAD_SECONDS_RANGE = (60, 86400)
+LOAD_WAIT_SECONDS_RANGE = (0, 600)
+IDLE_WATCH_INTERVAL_SECONDS = 5.0
+# A resident model that was used this recently is not switched away by an
+# `ensure` call for the other model; a reply in progress keeps its engine.
+SWITCH_GRACE_SECONDS = 120.0
+DEFAULT_LOAD_ETA_SECONDS = 60.0
+# After a load fails, `ensure` reports the failure for this long instead of
+# starting another attempt on every poll.  A manual load is not held back.
+LOAD_RETRY_COOLDOWN_SECONDS = 30.0
 GPU_GUARD_MODES = {"enforced", "custom", "disabled"}
 TUNING_PROVIDER = "qwen3tts-audiocpp"
 TUNING_SCOPES = {"voice-studio", "realtime"}
@@ -133,6 +149,7 @@ def _begin_request_outcome(payload: dict[str, Any], model: str, mode: str) -> st
     # being stored in this deliberately content-free diagnostic lookup.
     request_id = uuid4().hex
     payload["_outcome_id"] = request_id
+    _touch_activity()
     REQUEST_OUTCOMES[request_id] = {
         "requestId": request_id, "model": model, "mode": mode,
         "state": "pending", "reason": None, "generatedFrames": None,
@@ -152,6 +169,8 @@ def _finish_request_outcome(request_id: str, status: str, reason: str | None = N
                "promptMs", "prefillMs", "talkerMs", "decodeMs"}
     record.update({key: value for key, value in fields.items() if key in allowed})
     record.update(state=status, reason=reason, _updated=time.monotonic())
+    if status != "producing":
+        _touch_activity()  # the quiet time before an idle unload starts when speech ends
     _prune_request_outcomes()
 
 
@@ -321,6 +340,147 @@ def _save_gpu_guard_settings() -> None:
     temporary = GPU_GUARD_SETTINGS_PATH.with_suffix(".tmp")
     temporary.write_text(json.dumps(gpu_guard_settings, indent=2, sort_keys=True), encoding="utf-8")
     temporary.replace(GPU_GUARD_SETTINGS_PATH)
+
+
+def _environment_integer(name: str, default: int, bounds: tuple[int, int]) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if bounds[0] <= value <= bounds[1] else default
+
+
+def _default_lifecycle_settings() -> dict[str, Any]:
+    mode = os.environ.get("AUDIO_CPP_SPEECH_WHEN_UNLOADED", "wait").strip().lower()
+    return {
+        "keep_loaded": os.environ.get("AUDIO_CPP_KEEP_LOADED", "false").lower() == "true",
+        "idle_unload_seconds": _environment_integer("AUDIO_CPP_IDLE_UNLOAD_SECONDS", 900, IDLE_UNLOAD_SECONDS_RANGE),
+        "speech_when_unloaded": mode if mode in SPEECH_WHEN_UNLOADED_MODES else "wait",
+        "load_wait_seconds": _environment_integer("AUDIO_CPP_LOAD_WAIT_SECONDS", 90, LOAD_WAIT_SECONDS_RANGE),
+        "wake_on_health": False,
+    }
+
+
+def _validated_lifecycle_settings(payload: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    """Return `base` updated by `payload`; raise ValueError naming a bad field."""
+    updated = dict(base)
+    aliases = {
+        "keepLoaded": "keep_loaded", "idleUnloadSeconds": "idle_unload_seconds",
+        "speechWhenUnloaded": "speech_when_unloaded", "loadWaitSeconds": "load_wait_seconds",
+        "wakeOnHealth": "wake_on_health",
+    }
+    for key, value in payload.items():
+        name = aliases.get(key, key)
+        if name in {"keep_loaded", "wake_on_health"}:
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} must be true or false.")
+            updated[name] = value
+        elif name in {"idle_unload_seconds", "load_wait_seconds"}:
+            low, high = IDLE_UNLOAD_SECONDS_RANGE if name == "idle_unload_seconds" else LOAD_WAIT_SECONDS_RANGE
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value:
+                raise ValueError(f"{key} must be a whole number of seconds.")
+            if not low <= int(value) <= high:
+                raise ValueError(f"{key} must be between {low} and {high} seconds.")
+            updated[name] = int(value)
+        elif name == "speech_when_unloaded":
+            if value not in SPEECH_WHEN_UNLOADED_MODES:
+                raise ValueError(f"{key} must be wait, retry, or refuse.")
+            updated[name] = value
+    return updated
+
+
+def _load_lifecycle_settings() -> dict[str, Any]:
+    settings = _default_lifecycle_settings()
+    try:
+        saved = json.loads(LIFECYCLE_SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return settings
+    if isinstance(saved, dict):
+        try:
+            return _validated_lifecycle_settings({key: saved[key] for key in settings if key in saved}, settings)
+        except ValueError:
+            return settings
+    return settings
+
+
+lifecycle_settings: dict[str, Any] = _load_lifecycle_settings()
+# Runtime lifecycle facts.  None of this is persisted: a restart starts with
+# nothing loaded, no hold, and a fresh idle clock.
+lifecycle: dict[str, Any] = {
+    "last_activity": time.monotonic(),
+    "manual_hold": False,
+    "last_unload_reason": None,
+    "load_task": None,
+    "load_model": None,
+    "load_started": None,
+    "load_started_at": None,
+    "last_load_error": None,
+    "load_failed_at": None,
+    "watch_task": None,
+}
+
+
+def _save_lifecycle_settings() -> None:
+    """Atomically persist the load-on-demand and idle-unload preferences."""
+    VOICE_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = LIFECYCLE_SETTINGS_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(lifecycle_settings, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(LIFECYCLE_SETTINGS_PATH)
+
+
+def _lifecycle_now() -> float:
+    return time.monotonic()
+
+
+def _touch_activity() -> None:
+    """Restart the idle clock: a request was admitted, finished, or asked for the model."""
+    lifecycle["last_activity"] = _lifecycle_now()
+
+
+def _load_in_progress() -> bool:
+    task = lifecycle.get("load_task")
+    return task is not None and not task.done()
+
+
+def _load_eta_seconds() -> int:
+    """Seconds a background load is still expected to take, from the last measured load."""
+    typical = float(state.get("lastLoadElapsedS") or DEFAULT_LOAD_ETA_SECONDS)
+    started = lifecycle.get("load_started")
+    elapsed = _lifecycle_now() - started if started is not None and _load_in_progress() else 0.0
+    return max(1, int(math.ceil(typical - elapsed)))
+
+
+def _lifecycle_status() -> dict[str, Any]:
+    loaded = state["state"] == "loaded"
+    busy = generation_lock.locked() or switch_lock.locked()
+    idle = max(0.0, _lifecycle_now() - float(lifecycle["last_activity"]))
+    unloads = loaded and not lifecycle_settings["keep_loaded"]
+    load = None
+    if _load_in_progress():
+        load = {
+            "model": lifecycle["load_model"],
+            "phase": "warming" if state["state"] == "warming" else "loading",
+            "startedAt": lifecycle["load_started_at"],
+            "elapsedS": round(_lifecycle_now() - float(lifecycle["load_started"]), 1),
+            "etaS": _load_eta_seconds(),
+        }
+    return {
+        "keepLoaded": bool(lifecycle_settings["keep_loaded"]),
+        "idleUnloadSeconds": int(lifecycle_settings["idle_unload_seconds"]),
+        "idleForS": round(idle, 1) if loaded else None,
+        "unloadInS": (
+            round(max(0.0, int(lifecycle_settings["idle_unload_seconds"]) - idle), 1)
+            if unloads and not busy else None
+        ),
+        "speechWhenUnloaded": lifecycle_settings["speech_when_unloaded"],
+        "loadWaitSeconds": int(lifecycle_settings["load_wait_seconds"]),
+        "wakeOnHealth": bool(lifecycle_settings["wake_on_health"]),
+        "manualHold": bool(lifecycle["manual_hold"]),
+        "busy": busy,
+        "load": load,
+        "lastUnloadReason": lifecycle["last_unload_reason"],
+        "lastLoadError": lifecycle["last_load_error"],
+    }
 
 
 def _read_voice_studio_settings() -> dict[str, Any]:
@@ -584,6 +744,16 @@ def gpu_guard(
     operation: str = "load",
     apply_policy: bool = True,
 ) -> dict[str, Any]:
+    if apply_policy and operation == "synthesis" and str(gpu_guard_settings["mode"]) == "disabled":
+        # Every speech request passes through here.  With the guard disabled
+        # the reading could not change the answer, so skip the subprocess.
+        return {
+            "ok": True,
+            "bypassed": True,
+            "reason": "GPU guard manually disabled by candidate user; load or synthesis may still fail if VRAM is exhausted.",
+            "operation": operation,
+            "guardMode": "disabled",
+        }
     try:
         line = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.free,utilization.gpu", "--format=csv,noheader,nounits"], text=True, timeout=5).strip().splitlines()[0]
         free_mib, utilization = (int(value.strip()) for value in line.split(",")[:2])
@@ -638,6 +808,11 @@ def gpu_guard(
     if utilization >= utilization_limit:
         return {"ok": False, "reason": f"GPU busy: {utilization}% utilization meets or exceeds the {utilization_limit}% limit; operation was not attempted.", **details}
     return {"ok": True, **details}
+
+
+async def gpu_guard_async(model_id: str, **options: Any) -> dict[str, Any]:
+    """Run the GPU guard off the event loop so a PCM relay in flight is not stalled."""
+    return await asyncio.to_thread(gpu_guard, model_id, **options)
 
 
 def _reconcile_engine() -> None:
@@ -765,7 +940,7 @@ async def switch_model(model_id: str) -> dict[str, Any]:
                 warmupRetry=True,
             )
             return {**state, "singleResident": True, "events": list(EVENTS)}
-        guard = gpu_guard(model_id, operation="load")
+        guard = await gpu_guard_async(model_id, operation="load")
         if not guard["ok"]:
             state.update(reason=guard["reason"], lastError=guard["reason"])
             _record_event("gpu-blocked-load", model_id=model_id, gpu=guard)
@@ -775,7 +950,9 @@ async def switch_model(model_id: str) -> dict[str, Any]:
         async with generation_lock:
             _record_event("load-requested", model_id=model_id, gpu=guard)
             if engine is not None:
-                _stop_engine(action="old-model-released")  # release old model before the new child exists
+                # Release the old model before the new child exists.  The wait
+                # for the child to exit runs off the event loop.
+                await asyncio.to_thread(_stop_engine, action="old-model-released")
             started = time.monotonic()
             _start_engine(model_id)
             for _ in range(120):
@@ -783,7 +960,7 @@ async def switch_model(model_id: str) -> dict[str, Any]:
                     break
                 await asyncio.sleep(0.25)
             else:
-                _stop_engine(action="load-failed-release")
+                await asyncio.to_thread(_stop_engine, action="load-failed-release")
                 message = "audio.cpp did not become healthy after the model switch."
                 state.update(activeModel=model_id, state="error", reason=message, lastError=message)
                 raise HTTPException(status_code=503, detail={"state": "error", "message": message})
@@ -816,21 +993,209 @@ async def switch_model(model_id: str) -> dict[str, Any]:
         return {**state, "singleResident": True, "events": list(EVENTS)}
 
 
+async def _background_load(model_id: str) -> None:
+    """Load `model_id` for an `ensure` call or a waiting speech request.
+
+    The task belongs to the supervisor, not to the request that started it, so
+    a client that disconnects or times out never cancels a load.
+    """
+    try:
+        await switch_model(model_id)
+        lifecycle.update(last_load_error=None, load_failed_at=None)
+    except HTTPException as exc:
+        detail = exc.detail
+        message = (detail.get("reason") or detail.get("message")) if isinstance(detail, dict) else detail
+        lifecycle.update(last_load_error=str(message or "The model could not be loaded."),
+                         load_failed_at=_lifecycle_now())
+    except asyncio.CancelledError:
+        lifecycle["last_load_error"] = "The load was cancelled because the service is shutting down."
+        raise
+    except Exception as exc:  # a load must never leave the state stuck on "loading"
+        message = f"The model could not be loaded: {type(exc).__name__}: {exc}"
+        lifecycle.update(last_load_error=message, load_failed_at=_lifecycle_now())
+        state.update(state="error", reason=message, lastError=message)
+        _record_event("load-failed", model_id=model_id, error=message)
+    finally:
+        _touch_activity()
+
+
+def _ensure_answer(model_id: str, *, accepted: bool, reason: str | None = None, message: str | None = None,
+                   retryable: bool = True, retry_after: float | None = None,
+                   guard: dict[str, Any] | None = None) -> dict[str, Any]:
+    loading = _load_in_progress() and lifecycle["load_model"] == model_id
+    resident = str(state["activeModel"]) if state["state"] in {"loaded", "warming"} else None
+    ready = state["state"] == "loaded" and state["activeModel"] == model_id and not loading
+    if ready:
+        current = "loaded"
+    elif loading:
+        current = "warming" if state["state"] == "warming" else "loading"
+    else:
+        current = "unloaded" if resident is not None else str(state["state"])
+    return {
+        "model": model_id,
+        "state": current,
+        "ready": ready,
+        "accepted": accepted,
+        "reason": reason,
+        "message": message,
+        "retryable": retryable,
+        "retryAfterS": None if ready else (None if retry_after is None else max(1, int(math.ceil(retry_after)))),
+        "etaS": _load_eta_seconds() if loading else None,
+        "resident": resident,
+        "engineEpoch": int(state.get("engineEpoch") or 0),
+        "supervisorInstanceId": SUPERVISOR_INSTANCE_ID,
+        "gpuGuard": guard,
+        "lifecycle": _lifecycle_status(),
+    }
+
+
+async def ensure_model(model_id: str | None = None, *, switch: str = "when-idle",
+                       manual: bool = False) -> dict[str, Any]:
+    """Make sure `model_id` is loaded, without waiting for the load.
+
+    Safe to call repeatedly: a loaded model answers `ready`, a load already in
+    progress is reported rather than restarted, and a refusal says why.  A
+    generation in progress is never interrupted; `switch_model` queues behind
+    it.  `manual` marks a request made by the user in Voice Studio, which
+    clears a manual hold and may replace a recently used resident model.
+    """
+    target = str(model_id or state["activeModel"])
+    if target not in _models():
+        raise HTTPException(status_code=404, detail="Unknown candidate model.")
+    if switch not in {"when-idle", "never"}:
+        raise HTTPException(status_code=422, detail="switch must be when-idle or never.")
+    _reconcile_engine()
+    if manual:
+        lifecycle.update(manual_hold=False, load_failed_at=None)
+    if _load_in_progress():
+        if lifecycle["load_model"] == target:
+            return _ensure_answer(target, accepted=True, reason="load-in-progress",
+                                  retry_after=min(5.0, _load_eta_seconds()))
+        return _ensure_answer(
+            target, accepted=False, reason="load-in-progress",
+            message=f"{lifecycle['load_model']} is loading; only one model can be resident.",
+            retry_after=_load_eta_seconds())
+    if switch_lock.locked():
+        # Voice Studio is loading or unloading a model right now.  Which model
+        # is not known until it finishes, so do not queue a second change.
+        return _ensure_answer(target, accepted=False, reason="load-in-progress",
+                              message="A model load or unload is already in progress.", retry_after=5.0)
+    if state["state"] == "loaded" and state["activeModel"] == target:
+        _touch_activity()
+        return _ensure_answer(target, accepted=True)
+    if lifecycle["manual_hold"]:
+        return _ensure_answer(
+            target, accepted=False, reason="manual-hold", retryable=False,
+            message="The model was unloaded in Voice Studio and stays unloaded until it is loaded there.")
+    failed_at = lifecycle.get("load_failed_at")
+    if failed_at is not None and _lifecycle_now() - float(failed_at) < LOAD_RETRY_COOLDOWN_SECONDS:
+        return _ensure_answer(
+            target, accepted=False, reason="load-failed",
+            message=str(lifecycle["last_load_error"] or "The last load failed."),
+            retry_after=LOAD_RETRY_COOLDOWN_SECONDS - (_lifecycle_now() - float(failed_at)))
+    if state["state"] in {"loaded", "warming"} and not manual:
+        idle = _lifecycle_now() - float(lifecycle["last_activity"])
+        busy = generation_lock.locked() or switch_lock.locked()
+        if switch == "never" or busy or idle < SWITCH_GRACE_SECONDS:
+            return _ensure_answer(
+                target, accepted=False, reason="resident-model-in-use", retryable=switch != "never",
+                message=f"{state['activeModel']} is resident and was used recently; it is not switched away.",
+                retry_after=None if switch == "never" else max(5.0, SWITCH_GRACE_SECONDS - idle))
+    guard = await gpu_guard_async(target, operation="load")
+    if not guard["ok"]:
+        _record_event("gpu-blocked-load", model_id=target, gpu=guard)
+        return _ensure_answer(target, accepted=False, reason="gpu-guard", message=str(guard.get("reason") or ""),
+                              retry_after=15.0, guard=guard)
+    if _load_in_progress():  # another caller started a load while the guard was measuring
+        return await ensure_model(target, switch=switch, manual=manual)
+    lifecycle.update(
+        load_model=target,
+        load_started=_lifecycle_now(),
+        load_started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        last_load_error=None,
+        load_failed_at=None,
+    )
+    _record_event("ensure-load-started", model_id=target, manual=manual)
+    lifecycle["load_task"] = asyncio.create_task(_background_load(target))
+    return _ensure_answer(target, accepted=True, reason="load-in-progress",
+                          retry_after=min(5.0, _load_eta_seconds()), guard=guard)
+
+
+async def _release_model(*, action: str, reason: str, manual: bool, only_if_idle: bool = False) -> bool:
+    """Stop the engine and report `unloaded`.  Returns False when an idle release was called off."""
+    if only_if_idle and (switch_lock.locked() or generation_lock.locked()):
+        return False
+    async with switch_lock:
+        async with generation_lock:
+            if only_if_idle and not _idle_unload_due():
+                return False
+            await asyncio.to_thread(_stop_engine, action=action)
+            state.update(state="unloaded", reason=reason, lastError=None)
+    lifecycle.update(manual_hold=manual, last_unload_reason="manual" if manual else "idle")
+    return True
+
+
+def _idle_unload_due() -> bool:
+    if state["state"] != "loaded" or lifecycle_settings["keep_loaded"] or _load_in_progress():
+        return False
+    idle = _lifecycle_now() - float(lifecycle["last_activity"])
+    return idle >= int(lifecycle_settings["idle_unload_seconds"])
+
+
+async def _idle_tick() -> bool:
+    """One pass of the idle watcher.  Returns True when the model was released."""
+    if generation_lock.locked() or switch_lock.locked():
+        # Speech or a load is in progress: that is use, so the quiet time
+        # starts again when it ends.
+        _touch_activity()
+        return False
+    if not _idle_unload_due():
+        return False
+    quiet = int(lifecycle_settings["idle_unload_seconds"])
+    return await _release_model(
+        action="idle-unload", manual=False, only_if_idle=True,
+        reason=f"Model released after {quiet} seconds without speech; it loads again on demand.")
+
+
+async def _idle_watch() -> None:
+    while True:
+        await asyncio.sleep(IDLE_WATCH_INTERVAL_SECONDS)
+        try:
+            await _idle_tick()
+        except Exception:  # the watcher must survive a failed release
+            logger.exception("candidate idle watcher failed")
+
+
 @app.on_event("startup")
 async def startup() -> None:
-    # The engine is deliberately not started until Voice Studio explicitly
-    # loads a model. This makes the initial resident set truthful and empty.
+    # The engine is not started here. A model loads when Voice Studio or a
+    # client asks for one, so the initial resident set is truthful and empty.
     state["state"] = "unloaded"
+    _touch_activity()
+    lifecycle["watch_task"] = asyncio.create_task(_idle_watch())
     _record_event("supervisor-started", model_id=ACTIVE_MODEL)
 
 
 @app.on_event("shutdown")
-async def shutdown() -> None: _stop_engine(action="supervisor-shutdown")
+async def shutdown() -> None:
+    for name in ("watch_task", "load_task"):
+        task = lifecycle.get(name)
+        if task is not None and not task.done():
+            task.cancel()
+        lifecycle[name] = None
+    _stop_engine(action="supervisor-shutdown")
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
     _reconcile_engine()
+    if lifecycle_settings["wake_on_health"] and state["state"] in {"unloaded", "evicted"}:
+        # Opt-in: a client that only polls health and never loads a model
+        # starts a background load by asking.  Refusals are left to `ensure`.
+        try:
+            await ensure_model(None, switch="never")
+        except HTTPException:
+            pass
     loaded = state["state"] == "loaded" and await _engine_ready()
     return {
         "status": "ok",
@@ -886,11 +1251,37 @@ async def control_status() -> dict[str, Any]:
         "events": list(EVENTS),
         "gpu_guard": dict(gpu_guard_settings),
         "enforced_gpu_policy": _enforced_gpu_policy(),
+        "lifecycle": _lifecycle_status(),
     }
 
 
 @app.post("/control/switch")
-async def control_switch(payload: dict[str, str]) -> dict[str, Any]: return await switch_model(str(payload.get("model") or ""))
+async def control_switch(payload: dict[str, Any]) -> dict[str, Any]:
+    # An explicit load is the user's decision: it ends a manual hold.
+    lifecycle["manual_hold"] = False
+    return await switch_model(str(payload.get("model") or ""))
+
+
+@app.get("/control/lifecycle")
+async def control_lifecycle() -> dict[str, Any]:
+    return {"lifecycle": _lifecycle_status()}
+
+
+@app.put("/control/lifecycle")
+@app.post("/control/lifecycle")
+async def control_lifecycle_update(payload: dict[str, Any]) -> dict[str, Any]:
+    """Save the keep-loaded switch, the quiet time, and the speech-while-unloaded policy."""
+    try:
+        updated = _validated_lifecycle_settings(payload, lifecycle_settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    lifecycle_settings.clear()
+    lifecycle_settings.update(updated)
+    _save_lifecycle_settings()
+    # A changed quiet time counts from now, so shortening it cannot unload at once.
+    _touch_activity()
+    _record_event("lifecycle-updated", settings=dict(lifecycle_settings))
+    return {"lifecycle": _lifecycle_status()}
 
 
 def _update_gpu_guard(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1377,7 +1768,7 @@ async def backend_models() -> dict[str, Any]:
         "runtime": {
             "last_load_elapsed_s": state["lastLoadElapsedS"],
             "gpu": state["gpu"],
-            "gpu_now": gpu_guard(active, minimum_free_mib=0, apply_policy=False),
+            "gpu_now": await gpu_guard_async(active, minimum_free_mib=0, apply_policy=False),
             "load_headroom_mib": _guard_policy(active, "load")[0],
             "synthesis_headroom_mib": _guard_policy(active, "synthesis")[0],
             "enforced_gpu_policy": _enforced_gpu_policy(),
@@ -1400,21 +1791,42 @@ async def backend_models() -> dict[str, Any]:
         "engineEpoch": int(state.get("engineEpoch") or 0),
         "supervisorInstanceId": SUPERVISOR_INSTANCE_ID,
         "singleResident": True,
+        "lifecycle": _lifecycle_status(),
     }
 
 
 @app.post("/v1/backend/models/switch")
-async def backend_switch(payload: dict[str, str]) -> dict[str, Any]:
-    return await switch_model(str(payload.get("model_key") or ""))
+async def backend_switch(payload: dict[str, Any]) -> dict[str, Any]:
+    model_id = str(payload.get("model_key") or "")
+    if payload.get("wait") is False:
+        # Same explicit load, answered at once; poll the status for completion.
+        return await ensure_model(model_id or None, manual=True)
+    # An explicit load is the user's decision: it ends a manual hold.
+    lifecycle["manual_hold"] = False
+    return await switch_model(model_id)
+
+
+@app.post("/v1/backend/models/ensure")
+async def backend_ensure(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Idempotent "make sure this model is loaded" for any client.
+
+    Answers at once with the state; the load runs in the background.  Poll
+    until `ready` is true.  `accepted: false` carries the `reason`.
+    """
+    payload = payload or {}
+    model_id = payload.get("model") or payload.get("model_key")
+    if model_id is not None and not isinstance(model_id, str):
+        raise HTTPException(status_code=422, detail="model must be a model id or null.")
+    return await ensure_model(model_id or None, switch=str(payload.get("switch") or "when-idle"))
 
 
 @app.post("/v1/backend/models/unload")
 async def backend_unload() -> dict[str, Any]:
-    async with switch_lock:
-        async with generation_lock:
-            _stop_engine(action="explicit-unload")
-            state.update(state="unloaded", reason="Model released by Voice Studio.", lastError=None)
-        return {"current": state["activeModel"], "state": "unloaded", "loaded_models": [], "singleResident": True, "events": list(EVENTS)}
+    # An explicit unload holds: load-on-demand does not undo the user's choice
+    # until a model is loaded again in Voice Studio.
+    await _release_model(action="explicit-unload", reason="Model released by Voice Studio.", manual=True)
+    return {"current": state["activeModel"], "state": "unloaded", "loaded_models": [], "singleResident": True,
+            "events": list(EVENTS), "lifecycle": _lifecycle_status()}
 
 
 def _apply_clone_profile(payload: dict[str, Any]) -> None:
@@ -1800,14 +2212,105 @@ def _render_master_wav(master_wav: bytes, requested_format: str) -> tuple[bytes,
         return output.read_bytes(), media_type, extension, metadata
 
 
+NOT_SPOKEN_HEADERS = {"X-TTS-Audio-Started": "false"}
+
+
+def _load_wait_header(request: Any) -> str | None:
+    """`X-TTS-Load-Wait-Seconds`, for clients that cannot add a body field."""
+    headers = getattr(request, "headers", None)
+    return headers.get("x-tts-load-wait-seconds") if headers is not None else None
+
+
+def _requested_load_wait(payload: dict[str, Any]) -> float | None:
+    """Per-request seconds to wait for a load: body `load_wait_s`, else the header value."""
+    raw = payload.pop("load_wait_s", None)
+    header = payload.pop("_load_wait_s", None)
+    if raw is None:
+        raw = header
+    if raw is None or raw == "":
+        return None
+    try:
+        if isinstance(raw, bool):
+            raise ValueError
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="load_wait_s must be a number of seconds.") from exc
+    if not LOAD_WAIT_SECONDS_RANGE[0] <= value <= LOAD_WAIT_SECONDS_RANGE[1]:
+        raise HTTPException(
+            status_code=422,
+            detail=f"load_wait_s must be between {LOAD_WAIT_SECONDS_RANGE[0]} and {LOAD_WAIT_SECONDS_RANGE[1]} seconds.",
+        )
+    return value
+
+
+async def _load_for_speech(model_id: str, wait_override: float | None) -> None:
+    """Load on demand for a speech request that arrived with no model ready.
+
+    Returns when the request may continue through normal admission.  Raises
+    503 with Retry-After while the model is still loading.  Every error here
+    is raised before any audio exists, and says so.
+    """
+    mode = str(lifecycle_settings["speech_when_unloaded"])
+    if mode == "refuse" or model_id not in _models():
+        return  # the explicit-load-only answers in admission apply
+    if state["state"] == "loaded" and state["activeModel"] != model_id and not _load_in_progress():
+        return  # another model is resident: speech never switches models
+    answer = await ensure_model(model_id, switch="never")
+    if answer["ready"]:
+        return
+    if answer["reason"] == "manual-hold":
+        return
+    if answer["reason"] == "gpu-guard":
+        raise HTTPException(
+            status_code=409,
+            detail={"state": "blocked", "audio_started": False, **(answer["gpuGuard"] or {})},
+            headers=NOT_SPOKEN_HEADERS,
+        )
+    wait = wait_override if wait_override is not None else (
+        float(lifecycle_settings["load_wait_seconds"]) if mode == "wait" else 0.0
+    )
+    deadline = _lifecycle_now() + wait
+    while wait > 0 and _lifecycle_now() < deadline:
+        if state["state"] == "loaded" and state["activeModel"] == model_id and not _load_in_progress():
+            return
+        if not _load_in_progress() and not switch_lock.locked():
+            break  # the load ended without a ready model
+        await asyncio.sleep(0.2)
+    if state["state"] == "loaded" and state["activeModel"] == model_id and not _load_in_progress():
+        return
+    if not _load_in_progress() and not switch_lock.locked():
+        message = str(lifecycle["last_load_error"] or state.get("lastError") or "The model could not be loaded.")
+        raise HTTPException(
+            status_code=503,
+            detail={"state": "error", "message": message, "audio_started": False},
+            headers=NOT_SPOKEN_HEADERS,
+        )
+    retry_after = _load_eta_seconds() if _load_in_progress() else 5
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "state": "loading",
+            "reason": "load-in-progress",
+            "message": "The model is loading; retry shortly.",
+            "retryAfterS": retry_after,
+            "audio_started": False,
+        },
+        headers={"Retry-After": str(retry_after), **NOT_SPOKEN_HEADERS},
+    )
+
+
 async def _assert_synthesis_ready(payload: dict[str, Any]) -> str:
     """Check candidate admission before returning a buffered or chunked response."""
+    _touch_activity()
+    wait_override = _requested_load_wait(payload)
     model_id = str(payload.get("model") or state["activeModel"])
+    if state["state"] != "loaded" or _load_in_progress():
+        await _load_for_speech(model_id, wait_override)
     if model_id != state["activeModel"]:
         raise HTTPException(status_code=409, detail="Selected model is not active; switch it in Voice Studio before synthesis.")
     if state["state"] != "loaded":
         raise HTTPException(status_code=409, detail="No candidate model is loaded. Use Voice Studio model controls first.")
-    guard = gpu_guard(model_id, operation="synthesis")
+    guard = await gpu_guard_async(model_id, operation="synthesis")
     if not guard["ok"]:
         state.update(reason=guard["reason"], lastError=guard["reason"])
         _record_event("gpu-blocked-synthesis", model_id=model_id, gpu=guard)
@@ -2026,6 +2529,7 @@ async def speech(request: Request) -> Response:
     payload = await request.json()
     payload.setdefault("response_format", "wav")
     payload.setdefault("stream", False)
+    payload["_load_wait_s"] = _load_wait_header(request)
     payload["_tuning_snapshot"] = _resolve_request_tuning(payload)
     _apply_clone_profile(payload)
     model_id = await _assert_synthesis_ready(payload)
@@ -2055,6 +2559,7 @@ async def voice_clone(request: Request) -> Response:
     payload = await request.json()
     payload.setdefault("response_format", "wav")
     payload.setdefault("stream", False)
+    payload["_load_wait_s"] = _load_wait_header(request)
     # This endpoint is the Studio's format-independent full-quality contract.
     # Even PCM means raw frames extracted from one completed offline WAV master,
     # never the buffered or incremental streaming decoder.

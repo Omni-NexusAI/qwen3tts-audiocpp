@@ -955,6 +955,42 @@ def build_app(initial_base_url: str, initial_library_dir: Path) -> gr.Blocks:
                         gpu_synthesis_utilization = gr.Number(label="Synthesis max GPU utilization (%)", value=95, precision=0, minimum=1, maximum=100)
                     gpu_guard_save_btn = gr.Button("Apply GPU guard settings", variant="secondary")
                     gpu_guard_status_md = gr.Markdown("", elem_classes=["small"])
+                with gr.Accordion("Model loading and idle unload", open=False):
+                    gr.Markdown(
+                        "The model loads when speech needs it and is released after a quiet period, so the GPU is free "
+                        "when nothing is speaking. **Load selected model** and **Unload model** above still work; "
+                        "a model you unload by hand stays unloaded until you load one here again."
+                    )
+                    lifecycle_keep_loaded = gr.Checkbox(
+                        label="Keep the model loaded",
+                        value=False,
+                        info="Never release it for being idle.",
+                    )
+                    with gr.Row():
+                        lifecycle_idle_minutes = gr.Number(
+                            label="Unload after this many minutes without speech",
+                            value=15, precision=0, minimum=1, maximum=1440,
+                        )
+                        lifecycle_load_wait = gr.Number(
+                            label="Longest a speech request waits for a load (seconds)",
+                            value=90, precision=0, minimum=0, maximum=600,
+                        )
+                    lifecycle_speech_mode = gr.Radio(
+                        ["wait", "retry", "refuse"],
+                        label="When speech arrives and no model is loaded",
+                        value="wait",
+                        info="wait: load, then speak. retry: start loading and answer that it is loading. "
+                             "refuse: require an explicit load, as before.",
+                    )
+                    lifecycle_wake_on_health = gr.Checkbox(
+                        label="Also start loading when a client checks /health",
+                        value=False,
+                        info="For clients that only poll health and never ask for a load.",
+                    )
+                    with gr.Row():
+                        lifecycle_save_btn = gr.Button("Apply loading settings", variant="secondary")
+                        lifecycle_refresh_btn = gr.Button("Refresh loading status", variant="secondary")
+                    lifecycle_status_md = gr.Markdown("", elem_classes=["small"])
 
         # Global log output
         with gr.Row():
@@ -3852,6 +3888,8 @@ if (typeof Alpine === 'undefined') {
                 err = data.get("last_error")
                 runtime = data.get("runtime") or {}
                 last_load_s = runtime.get("last_load_elapsed_s")
+                lifecycle_info = data.get("lifecycle") or {}
+                on_demand = can_load_on_demand(lifecycle_info) and state in {"unloaded", "evicted", "warming"}
 
                 # State line: loading / ready / error
                 if state == "loading":
@@ -3860,8 +3898,12 @@ if (typeof Alpine === 'undefined') {
                     status_parts = ["**State:** ✅ Loaded — generation enabled"]
                 elif state == "error":
                     status_parts = ["**State:** ❌ Error — load a model before generating"]
+                elif on_demand:
+                    status_parts = [f"**State:** `{state}` — the model loads by itself when you generate"]
                 else:
                     status_parts = [f"**State:** `{state}` — load a model to enable generation"]
+                if lifecycle_info:
+                    status_parts.append(lifecycle_summary(lifecycle_info))
 
                 status_parts.append(f"**Selected (dropdown):** `{current or 'none'}`")
                 status_parts.append(f"**In memory:** `{', '.join(loaded) if loaded else 'none'}`")
@@ -3891,7 +3933,8 @@ if (typeof Alpine === 'undefined') {
                 if err:
                     status_parts.append(f"**Last error:** `{err}`")
 
-                model_ready = state == "loaded"
+                model_ready = state == "loaded" or on_demand or (
+                    state == "loading" and can_load_on_demand(lifecycle_info))
                 # region agent log
                 _debug_log(
                     run_id,
@@ -3990,6 +4033,98 @@ if (typeof Alpine === 'undefined') {
             except Exception as exc:
                 raise gr.Error(f"Could not save GPU guard settings: {exc}")
 
+        def can_load_on_demand(info: Dict[str, Any]) -> bool:
+            """True when the supervisor will load a model for a speech request by itself."""
+            return bool(info) and info.get("speechWhenUnloaded") != "refuse" and not info.get("manualHold")
+
+        def lifecycle_summary(info: Dict[str, Any], note: str = "") -> str:
+            """One paragraph on what the model will do next, from the supervisor's lifecycle block."""
+            load = info.get("load") or {}
+            if load:
+                line = f"**Loading:** `{load.get('model')}` — about {load.get('etaS', '?')} s left"
+            elif info.get("manualHold"):
+                line = "**Loading:** held — unloaded by hand, so it stays unloaded until you load a model here"
+            elif info.get("keepLoaded"):
+                line = "**Idle unload:** off — the model stays loaded"
+            elif info.get("unloadInS") is not None:
+                minutes = float(info["unloadInS"]) / 60.0
+                line = f"**Idle unload:** in about {minutes:.0f} min if nothing speaks"
+            elif info.get("busy"):
+                line = "**Idle unload:** paused while speech or a load is in progress"
+            else:
+                quiet = int(info.get("idleUnloadSeconds") or 0) // 60
+                line = f"**Idle unload:** after {quiet} min without speech, once a model is loaded"
+            mode = info.get("speechWhenUnloaded")
+            if mode == "wait":
+                line += f" | **Speech while unloaded:** loads, then speaks (waits up to {info.get('loadWaitSeconds')} s)"
+            elif mode == "retry":
+                line += " | **Speech while unloaded:** starts loading and answers that it is loading"
+            elif mode == "refuse":
+                line += " | **Speech while unloaded:** refused until a model is loaded here"
+            if info.get("lastUnloadReason") == "idle":
+                line += " | last unload: idle"
+            if info.get("lastLoadError"):
+                line += f"\n\n**Last load problem:** `{info['lastLoadError']}`"
+            if note:
+                line += f"\n\n{note}"
+            return line
+
+        def load_lifecycle_settings(base_url: str):
+            try:
+                response = httpx.get(f"{base_url.rstrip('/')}/control/lifecycle", timeout=10.0)
+                response.raise_for_status()
+                info = response.json().get("lifecycle") or {}
+                return (
+                    gr.update(value=bool(info.get("keepLoaded"))),
+                    gr.update(value=max(1, int(info.get("idleUnloadSeconds", 900)) // 60)),
+                    gr.update(value=int(info.get("loadWaitSeconds", 90))),
+                    gr.update(value=info.get("speechWhenUnloaded", "wait")),
+                    gr.update(value=bool(info.get("wakeOnHealth"))),
+                    lifecycle_summary(info),
+                )
+            except Exception as exc:
+                return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                        f"Could not load the loading settings: `{exc}`")
+
+        def save_lifecycle_settings(base_url: str, keep_loaded: bool, idle_minutes: float, load_wait: float,
+                                    speech_mode: str, wake_on_health: bool):
+            payload = {
+                "keepLoaded": bool(keep_loaded),
+                "idleUnloadSeconds": int(idle_minutes) * 60,
+                "loadWaitSeconds": int(load_wait),
+                "speechWhenUnloaded": speech_mode,
+                "wakeOnHealth": bool(wake_on_health),
+            }
+            try:
+                response = httpx.put(f"{base_url.rstrip('/')}/control/lifecycle", json=payload, timeout=10.0)
+                if response.status_code != 200:
+                    raise gr.Error(str(response.json().get("detail", response.text)))
+                return lifecycle_summary(response.json().get("lifecycle") or {}, "Saved to the private persistent storage.")
+            except gr.Error:
+                raise
+            except Exception as exc:
+                raise gr.Error(f"Could not save the loading settings: {exc}")
+
+        def wait_for_backend_model(base_url: str, model_key: str, timeout_s: float = 240.0) -> str:
+            """Ask the supervisor to load the model and wait until it is ready to generate."""
+            ensure_url = f"{base_url.rstrip('/')}/v1/backend/models/ensure"
+            deadline = time.monotonic() + timeout_s
+            while True:
+                try:
+                    response = httpx.post(ensure_url, json={"model": model_key, "switch": "never"}, timeout=15.0)
+                    answer = response.json()
+                except Exception as exc:
+                    raise gr.Error(f"Could not load `{model_key}`: {exc}")
+                if response.status_code != 200:
+                    raise gr.Error(f"Could not load `{model_key}`: {answer.get('detail', response.text)}")
+                if answer.get("ready"):
+                    return model_key
+                if not answer.get("accepted") and answer.get("reason") != "load-in-progress":
+                    raise gr.Error(f"`{model_key}` was not loaded: {answer.get('message') or answer.get('reason')}")
+                if time.monotonic() >= deadline:
+                    raise gr.Error(f"`{model_key}` is still loading. Try again in a moment.")
+                time.sleep(min(2.0, float(answer.get("retryAfterS") or 2)))
+
         def do_switch_backend_model(base_url: str, model_key: Optional[str]):
             """POST switch model; return updated dropdown, status text, and Generate button interactive state."""
             if not model_key:
@@ -4051,6 +4186,8 @@ if (typeof Alpine === 'undefined') {
             state = data.get("state")
             if current == model_key and state == "loaded" and model_key in loaded:
                 return model_key
+            if not loaded and can_load_on_demand(data.get("lifecycle") or {}):
+                return wait_for_backend_model(base_url, model_key)
             if state == "unloaded" or not loaded:
                 raise gr.Error(f"`{model_key}` is selected but no model is loaded. Click Load selected model first.")
             raise gr.Error(
@@ -4741,6 +4878,18 @@ if (typeof Alpine === 'undefined') {
                 gpu_guard_status_md,
             ],
         )
+        demo.load(
+            fn=load_lifecycle_settings,
+            inputs=[base_url_in],
+            outputs=[
+                lifecycle_keep_loaded,
+                lifecycle_idle_minutes,
+                lifecycle_load_wait,
+                lifecycle_speech_mode,
+                lifecycle_wake_on_health,
+                lifecycle_status_md,
+            ],
+        )
         tuning_form_outputs = [tuning_profile_dropdown, tuning_profile_status, tuning_name, tuning_revision, tuning_first, tuning_steady, tuning_context, tuning_reference_s, tuning_model, tuning_lookahead, tuning_flush_ms, tuning_temperature, tuning_top_k, tuning_top_p, tuning_repetition, tuning_seed]
         demo.load(fn=tuning_profile_form, inputs=[base_url_in], outputs=tuning_form_outputs)
         tuning_profile_dropdown.change(fn=tuning_profile_form, inputs=[base_url_in, tuning_profile_dropdown], outputs=tuning_form_outputs).then(
@@ -4791,6 +4940,34 @@ if (typeof Alpine === 'undefined') {
             fn=load_backend_models,
             inputs=[base_url_in],
             outputs=[backend_model_column, backend_model_dropdown, backend_models_status_md, play_generate_btn, clone_generate_btn],
+        )
+        lifecycle_save_btn.click(
+            fn=save_lifecycle_settings,
+            inputs=[
+                base_url_in,
+                lifecycle_keep_loaded,
+                lifecycle_idle_minutes,
+                lifecycle_load_wait,
+                lifecycle_speech_mode,
+                lifecycle_wake_on_health,
+            ],
+            outputs=[lifecycle_status_md],
+        ).then(
+            fn=load_backend_models,
+            inputs=[base_url_in],
+            outputs=[backend_model_column, backend_model_dropdown, backend_models_status_md, play_generate_btn, clone_generate_btn],
+        )
+        lifecycle_refresh_btn.click(
+            fn=load_lifecycle_settings,
+            inputs=[base_url_in],
+            outputs=[
+                lifecycle_keep_loaded,
+                lifecycle_idle_minutes,
+                lifecycle_load_wait,
+                lifecycle_speech_mode,
+                lifecycle_wake_on_health,
+                lifecycle_status_md,
+            ],
         )
         switch_model_btn.click(
             fn=do_switch_backend_model,
