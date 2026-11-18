@@ -80,6 +80,11 @@ docker compose `
 Remove-Item Env:AUDIO_CPP_IMAGE
 ```
 
+The engine is compiled for CUDA architecture `86` (RTX 30-series) by default.
+For another GPU generation, add
+`--build-arg AUDIO_CPP_CUDA_ARCHITECTURES=<value>` to the `docker build`
+command.
+
 Open [http://127.0.0.1:8891/voice-studio/](http://127.0.0.1:8891/voice-studio/),
 choose a model under **Settings & candidate model controls**, and click
 **Load selected model**. Loading is explicit: starting or recreating the
@@ -92,9 +97,10 @@ Invoke-RestMethod http://127.0.0.1:8890/health
 Invoke-RestMethod http://127.0.0.1:8890/v1/backend/models
 ```
 
-The quick start above enables experimental native PCM because it is the
-lowest-latency supported configuration. To begin with the dependable
-buffered/offline runtime instead, omit the native override:
+The quick start above enables experimental native PCM so it can be selected.
+Buffered phrase PCM stays the Studio's default playback mode until native
+streaming passes its latency, continuity, cancellation, and listening gates. To
+run only the dependable buffered/offline runtime, omit the native override:
 
 ```powershell
 $env:AUDIO_CPP_IMAGE = 'local/audio-cpp-qwen3-tts-voice-studio:native-development'
@@ -154,7 +160,7 @@ MP3 and AAC use 320 kbps final encodes, and Opus uses 256 kbps without
 resampling or downmixing.
 
 Native playback uses one continuous AudioWorklet queue across the assistant
-turn, waits for an initial two-block buffer, and rejects late audio after
+turn, starts after the selected first block, and rejects late audio after
 cancellation. If native mode is not enabled at runtime, the interface labels
 the result as buffered fallback rather than calling it native streaming.
 
@@ -172,7 +178,8 @@ Profiles expose only runtime-safe controls:
 - first and steady native PCM block sizes;
 - text look-ahead and safe phrase-flush timing;
 - temperature, top-k, top-p, repetition penalty, and optional uint32 seed; and
-- decoder context, which should remain at the model-required 72 frames.
+- decoder context, which should remain at the model-required 25 frames
+  (2 seconds).
 
 Reducing decoder context is an explicitly warned experiment because it can
 degrade a long native stream. Output transport stays fixed at model-native
@@ -212,6 +219,8 @@ Useful endpoints include:
 | `POST /v1/tuning/resolve` | Resolve effective profile behavior and inactive fields |
 | `POST /v1/audio/speech` | OpenAI-style speech synthesis and native/buffered PCM |
 | `POST /v1/audio/voice-clone` | Full-quality offline clone synthesis in all six formats |
+| `GET /v1/audio/outcomes/{id}` | Final result of one speech request, by its `X-TTS-Request-Id` |
+| `GET /control/status` | Model state, load timing, engine epoch, recent events, and GPU guard |
 
 After replacing `PROFILE_ID` with a live clone ID and loading the selected
 model, this PowerShell request writes a complete full-quality WAV:
@@ -242,6 +251,28 @@ is the separately labeled buffered fallback.
 Reference-pairing headers report source duration, requested limit, used
 duration, whether the limit was applied, pairing type, and delivery mode. They
 never include the transcript content.
+
+## Diagnostics and failure reporting
+
+- Every speech response carries an opaque `X-TTS-Request-Id`. After audio has
+  been delivered, `GET /v1/audio/outcomes/{id}` reports whether that request
+  `completed`, was `cancelled`, hit its length `limited` cap, or ended in
+  `error`. Outcomes hold no text or audio, expire after ten minutes, and at
+  most 256 are kept.
+- Live native and buffered phrases are bounded by a per-request frame cap
+  sized from the text and by a 180-second wall-clock deadline. A request that
+  reaches the cap without a natural end fails with `generation-limit`; it is
+  never returned as a complete clip.
+- Responses carry `X-TTS-Engine-Epoch` and `X-TTS-Supervisor-Instance-Id`. A
+  client may send `expected_engine_epoch` and
+  `expected_supervisor_instance_id` so a request is refused when the model was
+  reloaded or the service restarted in between.
+- A client may freeze the exact clone reference for a whole reply by sending a
+  `clone_snapshot`, and the exact tuning by sending `tuning.effective` with its
+  `profile_revision`.
+- When a client disconnects, the service drops its engine request and releases
+  its generation lock. A native stream stops at the engine's next audio block;
+  a buffered phrase already running inside the engine finishes there first.
 
 ## Known limitations
 
@@ -310,7 +341,12 @@ never remove an image that a container references.
 Existing deployments can use `integrations/audio-cpp/Dockerfile.overlay` to
 compile the current pinned engine and copy only the binary and control-plane
 sources onto a validated model-bearing base image. The overlay avoids
-downloading the checkpoints again; it is not the first-install path.
+downloading the checkpoints again; it is not the first-install path. Its base
+image has no default: pass `--build-arg AUDIO_CPP_BASE_IMAGE=<tag>` and
+`--build-arg AUDIO_CPP_BASE_IMAGE_ID=<image id>`. When only the Python or
+browser sources changed, `integrations/audio-cpp/Dockerfile.runtime-overlay`
+replaces just those, and refuses to build unless the base image's engine binary
+matches its recorded SHA-256.
 
 ## Development
 

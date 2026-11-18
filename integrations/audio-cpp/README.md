@@ -16,12 +16,17 @@ the `qwen3-tts-faster` container.
   Native development is enabled only by adding `compose.native.yml`; buffered
   phrase PCM and complete WAV remain available in that same candidate. The
   override only changes the runtime flag on the exact image selected through
-  `AUDIO_CPP_IMAGE`; the current tag is `native-development`, and the sole
-  retained recovery image is `rollback-pre-native-profile-fix-20260805`.
-- The native override disables per-shape CUDA graph capture because changing
-  conversational prompt shapes otherwise reintroduces a multi-second first-block
-  capture. Explicit **Load** therefore includes one private, discarded native
-  warmup using a live paired clone before the model reports `loaded`. Status
+  `AUDIO_CPP_IMAGE`. Record and retain one explicit rollback tag before a live
+  candidate recreation.
+- Docker engine builds explicitly set `CUDAARCHS=86` before their first CMake
+  configure.  Builder stages do not see the host GPU and otherwise inherit an
+  nvcc default (previously observed as sm_52); `86` is the RTX 3080 Laptop
+  target used by this isolated candidate.
+- The pinned engine currently exposes no supported CUDA-graph runtime switch;
+  it runs engine-default graph behavior and reports that control as unavailable
+  rather than pretending an environment variable changes it. Explicit **Load**
+  includes one private, discarded native warmup using a live paired clone before
+  the model reports `loaded`. Status
   exposes `warming`, elapsed time, profile ID, timeout, and retryable
   skipped/failed results; the warmup never appears as a user generation metric.
 - The container supervisor keeps exactly one model process/configuration active.
@@ -36,7 +41,7 @@ the `qwen3-tts-faster` container.
   **Disabled** so the expected chat LLM plus one audio.cpp model can coexist.
   Enforced and Custom remain explicit opt-ins. For 0.6B,
   Enforced admission uses the observed ~5,630 MiB load delta rounded up to a
-  6,000 MiB model/graph reserve plus the unchanged 2,048 MiB synthesis floor:
+  6,000 MiB measured model-residency reserve plus the unchanged 2,048 MiB synthesis floor:
   8,048 MiB free before load at 85% maximum utilization. For 1.7B, Enforced
   keeps the existing 10,500 MiB **total** threshold until a real residency
   delta is measured; it does not invent and add a second 2,048 MiB reserve.
@@ -64,10 +69,42 @@ the `qwen3-tts-faster` container.
    checkpoint:
 
    ```powershell
-   docker build -f integrations/audio-cpp/Dockerfile.overlay -t local/audio-cpp-qwen3-tts-voice-studio:native-development .
-   $env:AUDIO_CPP_IMAGE = 'local/audio-cpp-qwen3-tts-voice-studio:native-development'
+   $candidateContainer = 'audio-cpp-qwen3-tts-voice-studio'
+   $imageRepository = 'local/audio-cpp-qwen3-tts-voice-studio'
+   $currentImageId = docker inspect --format '{{.Image}}' $candidateContainer
+   if (-not $currentImageId) { throw 'Candidate container has no deployed image ID.' }
+   $rollbackTag = "${imageRepository}:rollback-$(Get-Date -Format yyyyMMdd-HHmmss)"
+   docker image tag $currentImageId $rollbackTag
+   $rollbackImageId = docker image inspect --format '{{.Id}}' $rollbackTag
+   if ($rollbackImageId -ne $currentImageId) { throw 'Rollback tag does not match the deployed candidate image.' }
+
+   $releaseTag = "${imageRepository}:stream-reliability-$(Get-Date -Format yyyyMMdd-HHmmss)"
+   docker build -f integrations/audio-cpp/Dockerfile.overlay `
+     --build-arg AUDIO_CPP_BASE_IMAGE=$rollbackTag `
+     --build-arg AUDIO_CPP_BASE_IMAGE_ID=$currentImageId `
+     -t $releaseTag .
+   $env:AUDIO_CPP_IMAGE = $releaseTag
    docker compose -p audio-cpp -f integrations/audio-cpp/compose.candidate.yml -f integrations/audio-cpp/compose.native.yml --profile audio-cpp-candidate up -d --no-build --no-deps --force-recreate audio-cpp-candidate
    Remove-Item Env:AUDIO_CPP_IMAGE
+   ```
+
+   Do not reuse an older tag by name. The sequence above first resolves the
+   exact image ID deployed by the candidate container, creates and verifies a
+   new rollback tag for that ID, passes both into the build, and records the
+   parent ID in the final image's `io.omninexus.rollback.base` label.
+
+   When the running model-bearing image already contains the exact validated
+   native engine hash asserted by `Dockerfile.runtime-overlay`, a supervisor or
+   Studio-only repair may use that narrower Dockerfile instead. It verifies the
+   inherited engine binary and both BF16 model trees, then overlays only the
+   current runtime sources; it is not a substitute for the pinned-engine build
+   when C++ changes are involved:
+
+   ```powershell
+    docker build -f integrations/audio-cpp/Dockerfile.runtime-overlay `
+      --build-arg AUDIO_CPP_BASE_IMAGE=local/audio-cpp-qwen3-tts-voice-studio:<rollback-tag> `
+      --build-arg AUDIO_CPP_BASE_IMAGE_ID=sha256:<verified-deployed-image-id> `
+      -t local/audio-cpp-qwen3-tts-voice-studio:<runtime-overlay-tag> .
    ```
 
    Keep project name `audio-cpp`; it preserves the existing container and
@@ -77,7 +114,7 @@ the `qwen3-tts-faster` container.
    rollback does not trigger a build:
 
    ```powershell
-   $env:AUDIO_CPP_IMAGE = 'local/audio-cpp-qwen3-tts-voice-studio:rollback-pre-native-profile-fix-20260805'
+    $env:AUDIO_CPP_IMAGE = 'local/audio-cpp-qwen3-tts-voice-studio:<rollback-tag>'
    docker compose -p audio-cpp -f integrations/audio-cpp/compose.candidate.yml --profile audio-cpp-candidate up -d --no-build --no-deps --force-recreate audio-cpp-candidate
    Remove-Item Env:AUDIO_CPP_IMAGE
    ```
@@ -119,16 +156,26 @@ The live
 Playground surface can test microphone selection, browser VAD, pre-roll,
 cancellation, llama.cpp turn flow, and progressive phrase PCM playback through
 same-origin candidate proxies. The normal candidate stays buffered: each phrase
-completes before playback and is not labeled native streaming. The development
-override enables the pinned eight-file engine patch, keeps one model resident,
-and relays model-incremental 24 kHz PCM16 chunks through `/v1/audio/speech` with
-`stream:true` and `response_format:"pcm"`. Stop/new-turn cancellation closes the
-browser proxy and supervisor streams so the engine resets without stale tail
-playback. When that native runtime is enabled, Native incremental PCM is the
-Playground default; buffered phrase PCM and full WAV stay selectable. This
-native mode is live-validated independently with both raw models for
-multi-chunk delivery, cancellation/recovery, timing, and single-resident GPU
-behavior; select buffered phrase PCM for immediate rollback. Physical
+uses one completed `offline_full` decoder pass before playback and is not labeled
+native streaming. It retains the selected profile's sampler and phrase-queue
+policy while requiring result-derived `offline-full-decoder` proof, so a native
+block loop cannot be silently buffered behind the fallback label. The development
+override enables the pinned nine-file engine patch, keeps one model resident,
+and makes **Native incremental PCM (experimental)** selectable through
+`/v1/audio/speech` with `stream:true` and `response_format:"pcm"`. Buffered
+phrase PCM remains the Playground default until native passes the live timing,
+continuity, cancellation, and listening gates; Full WAV stays selectable as the
+offline reference path. Stop/new-turn cancellation closes the browser proxy and
+supervisor streams so the engine resets without stale tail playback. Native
+promotion requires independent multi-chunk, cancellation/recovery, timing, and
+single-resident GPU validation for each raw model. The default clone cache
+reuses encoded reference conditioning and speaker embeddings. The engine's
+talker-prefix cache defaults to zero slots; the explicit native-development
+override configures four experimental slots for the exact immutable leading
+clone, language, control, and reference KV state. Each request restores that
+prefix, replays every phrase-dependent suffix row, and keeps generated speech
+state request-local. Native first-PCM latency therefore remains an
+explicit performance gate rather than a solved capability. Physical
 speaker-loopback AEC3 suppression and human double-talk preservation remain
 user-owned acoustic validation.
 The streaming Playground starts by default for evaluation. Non-streaming uses
@@ -143,15 +190,17 @@ returned unchanged from that completed master, raw PCM is extracted directly,
  FLAC is lossless, MP3 and AAC are post-encoded at 320 kbps, and Opus uses the
  codec's maximum supported 256 kbps without resampling or downmixing.
  `/v1/audio/speech` with `stream:false` plus PCM remains
-the separately labeled buffered fallback; `/v1/audio/voice-clone` is always the
-full offline policy regardless of export format.
+the separately labeled buffered fallback and uses the completed offline decoder;
+`/v1/audio/voice-clone` is always the Full Quality offline policy regardless of
+export format.
 Native and buffered streaming use the selected Voice Studio profile directly.
 Punctuation-complete text dispatches immediately; incomplete text uses the
 profile look-ahead and idle-flush values, cuts only on safe word/clause
 boundaries, and has a profile-derived hard cap. Browser-local legacy phrase
 values never override the selected profile. One turn-scoped AudioWorklet queue
-spans every phrase, waits for the first-plus-steady native duration before its
-initial start, reports underruns/drain, and rejects late PCM after cancellation.
+spans every phrase. Native playback releases after the selected first block
+only, then uses measured steady-block cadence solely for bounded underrun
+re-priming; it reports underruns/drain and rejects late PCM after cancellation.
 Non-secret Studio controls (LLM endpoint/model/prompt, selected microphone,
 VAD, and selected tuning identity) are atomically retained in the private volume, so they
 survive candidate recreation. API keys intentionally remain browser-only. A
@@ -171,10 +220,11 @@ Built-ins are immutable; editing starts by cloning one. Realtime Save As sends
 the complete effective safe schema and can atomically select the new profile
 only for the Realtime scope, without changing Voice Studio's selection. Custom
 updates require their current revision and reject stale writes.
-All built-ins retain the model-required 72 decoder-context frames. A smaller
+All built-ins retain the model-required 25 decoder-context frames (2 seconds).
+A smaller
 custom or temporary value is an explicitly warned Advanced experiment because
 reduced causal history can progressively degrade a long native stream. The
-pinned native engine patch uses the same 72-frame fallback for direct internal
+ pinned native engine patch uses the same 25-frame causal-context fallback for direct internal
 requests, so bypassing profile resolution cannot silently restore the older
 quality-degrading context.
 Seed accepts null or an unsigned 32-bit integer: blank and Gradio's `-1`
@@ -182,3 +232,30 @@ sentinel omit the field for engine randomness, while explicit values are
 forwarded. Temperature must be greater than zero. x-vector-only clone mode and
 crossfade remain inactive. Full ICL clone reference audio plus its transcript
 remains required.
+
+## Diagnostic and failure contracts
+
+The mounted Studio freezes each response through same-origin, uncached tuning,
+model-state and clone-snapshot routes. Model/clone reads are GET-only and do not
+expose lifecycle mutations. Its explicit local WAV diagnostic picker exercises
+the normal LLM/snapshot/TTS path without recording a microphone; physical VAD,
+voice identity and prosody remain separate listening gates.
+
+Native experimental and buffered live phrases share request-local codec-frame
+bounds and a separate wall-clock deadline. The engine reports generated frames,
+capacity, EOS/limit termination and stage timings; cycle observation is not an
+automatic acoustic-degeneration detector. A valid EOS exactly at the frame cap
+is complete. Limit/error termination is not a successful clip and cannot be
+automatically retried through another delivery mode.
+
+Every candidate speech response carries an opaque `X-TTS-Request-Id`. Clients
+check `/v1/audio/outcomes/{id}` after PCM delivery so a late failure can clear
+only the affected response queue. Outcomes contain no text or audio, expire in
+ten minutes, and retain at most 256 entries. Native response headers remain held
+until the same iterator proves decoder mode and two PCM events; diagnostics
+report that validation hold separately from engine first-PCM latency.
+
+Full Quality WAV keeps its independent offline policy. Temporary tuning never
+edits shared saved profiles, and Voice Studio/Realtime retain separate selected
+profiles. Explicit benchmark clips and reports stay local and outside version
+control; HTTP completion alone does not certify microphone-to-speaker behavior.
