@@ -1,11 +1,11 @@
 diff --git a/app/server/runtime.cpp b/app/server/runtime.cpp
-index 33027e9..75e13da 100644
+index 33027e9..b22a01d 100644
 --- a/app/server/runtime.cpp
 +++ b/app/server/runtime.cpp
-@@ -404,6 +404,77 @@ std::unordered_map<std::string, std::string> timing_headers(
+@@ -404,6 +404,104 @@ std::unordered_map<std::string, std::string> timing_headers(
      };
  }
-
+ 
 +std::optional<std::string> qwen3_decode_mode_artifact(
 +    const std::vector<engine::runtime::VoiceArtifact> & artifacts) {
 +    for (const auto & artifact : artifacts) {
@@ -45,6 +45,12 @@ index 33027e9..75e13da 100644
 +    std::string prefill_ms;
 +    std::string talker_ms;
 +    std::string decoder_ms;
++    // Stage detail added later; absent on older artifacts.
++    std::string prompt_rows = "0";
++    std::string prompt_prefill_ms = "0";
++    std::string prompt_import_ms = "0";
++    std::string first_frame_ms = "0";
++    std::string stream_decoder;
 +};
 +
 +std::optional<Qwen3GenerationTelemetry> qwen3_generation_telemetry(
@@ -62,9 +68,19 @@ index 33027e9..75e13da 100644
 +            termination == artifact.meta.end() || prompt_ms == artifact.meta.end() ||
 +            prefill_ms == artifact.meta.end() || talker_ms == artifact.meta.end() ||
 +            decoder_ms == artifact.meta.end()) return std::nullopt;
-+        return Qwen3GenerationTelemetry{
++        Qwen3GenerationTelemetry telemetry{
 +            frames->second, cap->second, termination->second, prompt_ms->second,
 +            prefill_ms->second, talker_ms->second, decoder_ms->second};
++        const auto optional_meta = [&](const char * key, std::string & out) {
++            const auto found = artifact.meta.find(key);
++            if (found != artifact.meta.end()) out = found->second;
++        };
++        optional_meta("prompt_rows", telemetry.prompt_rows);
++        optional_meta("prompt_prefill_ms", telemetry.prompt_prefill_ms);
++        optional_meta("prompt_import_ms", telemetry.prompt_import_ms);
++        optional_meta("first_frame_ms", telemetry.first_frame_ms);
++        optional_meta("stream_decoder", telemetry.stream_decoder);
++        return telemetry;
 +    }
 +    return std::nullopt;
 +}
@@ -75,12 +91,23 @@ index 33027e9..75e13da 100644
 +    response.headers.emplace("X-AudioCPP-Generated-Frames", telemetry->generated_frames);
 +    response.headers.emplace("X-AudioCPP-Generation-Cap", telemetry->generation_cap);
 +    response.headers.emplace("X-AudioCPP-Termination", telemetry->termination);
++    // Completed responses have no event channel, so stage timings travel as
++    // headers.  They are the same values the stream reports in
++    // speech.generation.
++    response.headers.emplace("X-AudioCPP-Prompt-Ms", telemetry->prompt_ms);
++    response.headers.emplace("X-AudioCPP-Prefill-Ms", telemetry->prefill_ms);
++    response.headers.emplace("X-AudioCPP-Talker-Ms", telemetry->talker_ms);
++    response.headers.emplace("X-AudioCPP-Decode-Ms", telemetry->decoder_ms);
++    response.headers.emplace("X-AudioCPP-Prompt-Rows", telemetry->prompt_rows);
++    response.headers.emplace("X-AudioCPP-Prompt-Prefill-Ms", telemetry->prompt_prefill_ms);
++    response.headers.emplace("X-AudioCPP-Prompt-Import-Ms", telemetry->prompt_import_ms);
++    response.headers.emplace("X-AudioCPP-First-Frame-Ms", telemetry->first_frame_ms);
 +}
 +
  std::string task_result_json_with_timing(
      const engine::runtime::TaskResult & result,
      const std::string & timing) {
-@@ -1017,15 +1088,20 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
+@@ -1017,15 +1115,20 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
      const auto wav = encode_pcm16_wav(audio);
      const auto response_format = engine::io::json::optional_string(body, "response_format", "wav");
      if (response_format == "json" || response_format == "b64_json") {
@@ -101,9 +128,9 @@ index 33027e9..75e13da 100644
 +    attach_qwen3_generation_headers(response, timed_result.result);
      return response;
  }
-
-@@ -1047,12 +1123,30 @@ HttpResponse ServerState::handle_speech_stream(
-
+ 
+@@ -1047,12 +1150,30 @@ HttpResponse ServerState::handle_speech_stream(
+ 
      const auto busy_timeout_ms = parse_busy_timeout_override(body);
      LoadedModel * model_ptr = &model;
 -    auto stream_body = [this, model_ptr, request, busy_timeout_ms](HttpStreamWriter & writer) {
@@ -134,7 +161,7 @@ index 33027e9..75e13da 100644
                  std::vector<engine::runtime::AudioBuffer> buffers;
                  if (event.audio_output.has_value()) {
                      buffers.push_back(*event.audio_output);
-@@ -1074,11 +1168,39 @@ HttpResponse ServerState::handle_speech_stream(
+@@ -1074,11 +1195,44 @@ HttpResponse ServerState::handle_speech_stream(
          if (!wrote_audio) {
              throw std::runtime_error("streaming speech model produced no audio delta events");
          }
@@ -160,6 +187,11 @@ index 33027e9..75e13da 100644
 +                    ",\"prefill_ms\":" + generation->prefill_ms +
 +                    ",\"talker_ms\":" + generation->talker_ms +
 +                    ",\"decode_ms\":" + generation->decoder_ms +
++                    ",\"prompt_rows\":" + generation->prompt_rows +
++                    ",\"prompt_prefill_ms\":" + generation->prompt_prefill_ms +
++                    ",\"prompt_import_ms\":" + generation->prompt_import_ms +
++                    ",\"first_frame_ms\":" + generation->first_frame_ms +
++                    ",\"stream_decoder\":" + json_quote(generation->stream_decoder) +
 +                    ",\"complete\":" + (complete ? "true" : "false") + "}");
 +        }
 +        std::string done =
@@ -183,7 +215,7 @@ index be6213c..3c22d7c 100644
 --- a/include/engine/models/qwen3_tts/session.h
 +++ b/include/engine/models/qwen3_tts/session.h
 @@ -20,7 +20,8 @@ namespace engine::models::qwen3_tts {
-
+ 
  class Qwen3TTSSession final
      : public runtime::RuntimeSessionBase
 -    , public runtime::IOfflineVoiceTaskSession {
@@ -204,12 +236,12 @@ index be6213c..3c22d7c 100644
 +    void reset() override;
 +    runtime::StreamEvent process_audio_chunk(const runtime::AudioChunk & chunk) override;
 +    runtime::TaskResult finalize() override;
-
+ 
  private:
      struct VoicePromptCacheKey {
 @@ -52,6 +61,8 @@ private:
      };
-
+ 
      Qwen3TTSRequest make_request(const runtime::TaskRequest & request) const;
 +    runtime::TaskResult run_offline_request(const runtime::TaskRequest & request);
 +    runtime::TaskResult run_streaming_base_request(const runtime::TaskRequest & request);
@@ -232,14 +264,14 @@ index be6213c..3c22d7c 100644
 +    std::optional<runtime::TaskResult> streaming_result_;
 +    bool streaming_started_ = false;
  };
-
+ 
  }  // namespace engine::models::qwen3_tts
 diff --git a/include/engine/models/qwen3_tts/talker.h b/include/engine/models/qwen3_tts/talker.h
-index 70ca372..e3ed347 100644
+index 70ca372..7fd869c 100644
 --- a/include/engine/models/qwen3_tts/talker.h
 +++ b/include/engine/models/qwen3_tts/talker.h
 @@ -6,6 +6,7 @@
-
+ 
  #include <cstddef>
  #include <cstdint>
 +#include <functional>
@@ -249,7 +281,7 @@ index 70ca372..e3ed347 100644
 @@ -19,6 +20,19 @@ enum class Qwen3TalkerPromptMode {
      CustomVoice,
  };
-
+ 
 +// This is deliberately source-material identity rather than a profile label.
 +// The talker runtime is already scoped to one loaded model/engine epoch, while
 +// this identity makes cached clone prompt material invalid when the reference
@@ -266,7 +298,7 @@ index 70ca372..e3ed347 100644
  struct Qwen3TalkerPrefill {
      Qwen3TalkerPromptMode prompt_mode = Qwen3TalkerPromptMode::VoiceClone;
      std::vector<int32_t> input_ids;
-@@ -30,11 +44,17 @@ struct Qwen3TalkerPrefill {
+@@ -30,11 +44,24 @@ struct Qwen3TalkerPrefill {
      std::string language = "Auto";
      bool icl_mode = false;
      bool x_vector_only_mode = false;
@@ -275,17 +307,24 @@ index 70ca372..e3ed347 100644
 +    // key too, so this hash never becomes the only safety boundary.
 +    std::optional<Qwen3TalkerCloneCacheIdentity> clone_cache_identity = std::nullopt;
  };
-
+ 
  struct Qwen3TalkerCodes {
      Qwen3SpeechCodes generated_codes;
      Qwen3SpeechCodes decoder_input_codes;
 +    Qwen3GenerationTermination termination = Qwen3GenerationTermination::MaxGeneratedFrames;
 +    int64_t generation_cap = 0;
++    // Where the time before the first generated frame went.  `prompt_rows` is
++    // the prompt length; the prefill time is zero when the same prompt was
++    // prefilled by the previous request.
++    int64_t prompt_rows = 0;
++    double prompt_prefill_ms = 0.0;
++    double prompt_import_ms = 0.0;
++    double first_frame_ms = 0.0;
  };
-
+ 
  class Qwen3TalkerWeightsRuntime;
-@@ -42,6 +62,12 @@ class Qwen3TalkerStepRuntime;
-
+@@ -42,6 +69,12 @@ class Qwen3TalkerStepRuntime;
+ 
  class Qwen3TalkerStepRuntime {
  public:
 +    // The talker produces one 12 Hz multi-codebook frame per autoregressive
@@ -297,7 +336,7 @@ index 70ca372..e3ed347 100644
      class Impl;
      explicit Qwen3TalkerStepRuntime(std::unique_ptr<Impl> impl);
      ~Qwen3TalkerStepRuntime();
-@@ -49,7 +75,8 @@ public:
+@@ -49,7 +82,8 @@ public:
      Qwen3TalkerCodes generate(
          const Qwen3TalkerPrefill & prefill,
          const Qwen3TTSGenerationOptions & options,
@@ -305,34 +344,62 @@ index 70ca372..e3ed347 100644
 +        float repetition_penalty = 1.05F,
 +        GeneratedFrameCallback on_generated_frame = {});
      int64_t release_cached_step_graph();
-
+ 
  private:
-@@ -76,7 +103,8 @@ public:
+@@ -76,7 +110,8 @@ public:
      std::shared_ptr<Qwen3TalkerStepRuntime> create_step_runtime(
          std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
          int64_t prompt_capacity,
 -        int64_t generation_capacity) const;
 +        int64_t generation_capacity,
-+        std::size_t immutable_prefix_cache_slots = 0) const;
-
++        std::size_t prompt_material_cache_slots = 0) const;
+ 
  private:
      Qwen3TTSTalkerConfig config_;
 diff --git a/include/engine/models/qwen3_tts/tokenizer_speech_decoder.h b/include/engine/models/qwen3_tts/tokenizer_speech_decoder.h
-index 3515ba6..ba58356 100644
+index 3515ba6..4fb42c7 100644
 --- a/include/engine/models/qwen3_tts/tokenizer_speech_decoder.h
 +++ b/include/engine/models/qwen3_tts/tokenizer_speech_decoder.h
-@@ -33,6 +33,11 @@ public:
+@@ -33,6 +33,23 @@ public:
      ~Qwen3SpeechTokenizerDecoderRuntime();
-
+ 
      runtime::AudioBuffer decode(const Qwen3SpeechCodes & codec_codes) const;
 +    // Decode a short causal block through a fixed-capacity graph.  Codes after
 +    // codec_codes.frames are zero padded; callers retain only valid frames.
 +    runtime::AudioBuffer decode_padded(
 +        const Qwen3SpeechCodes & codec_codes,
 +        int64_t graph_capacity_frames) const;
++    // Decode only the last `target_frames` of `history` and return the same
++    // samples decode(history) produces for them.  `history` starts at the
++    // first frame the offline decode would see (the clone reference).  The
++    // transformer stage covers the offline window; the vocoder stage runs on
++    // the new frames plus vocoder_context_frames() of look-back, in pieces of
++    // at most `max_block_frames`.
++    runtime::AudioBuffer decode_streaming_block(
++        const Qwen3SpeechCodes & history,
++        int64_t target_frames,
++        int64_t max_block_frames) const;
++    // Codec frames of look-back the convolutional vocoder stage needs.
++    int64_t vocoder_context_frames() const;
      runtime::AudioBuffer decode_and_trim_reference(
          const Qwen3SpeechCodes & reference_codes,
          const Qwen3SpeechCodes & generated_codes) const;
+@@ -42,9 +59,15 @@ private:
+     core::ExecutionContext * execution_context_ = nullptr;
+     std::shared_ptr<const Qwen3SpeechTokenizerDecoderWeights> weights_;
+     size_t graph_arena_bytes_ = 0;
++    size_t constant_context_bytes_ = 0;
+     Qwen3TTSPerfMode perf_mode_ = Qwen3TTSPerfMode::Standard;
+     std::unique_ptr<core::ConstantTensorCache> constants_;
+     mutable std::unique_ptr<Qwen3SpeechTokenizerDecoderGraph> graph_;
++    // Streaming keeps the two decoder stages in separate fixed-size graphs.
++    mutable std::unique_ptr<core::ConstantTensorCache> transformer_constants_;
++    mutable std::unique_ptr<core::ConstantTensorCache> vocoder_constants_;
++    mutable std::unique_ptr<Qwen3SpeechTokenizerDecoderGraph> transformer_graph_;
++    mutable std::unique_ptr<Qwen3SpeechTokenizerDecoderGraph> vocoder_graph_;
+ };
+ 
+ }  // namespace qwen3_tts
 diff --git a/include/engine/models/qwen3_tts/types.h b/include/engine/models/qwen3_tts/types.h
 index 9ad66d9..8c6d294 100644
 --- a/include/engine/models/qwen3_tts/types.h
@@ -340,7 +407,7 @@ index 9ad66d9..8c6d294 100644
 @@ -20,6 +20,11 @@ enum class Qwen3TTSPerfMode {
      FlashAttention,
  };
-
+ 
 +enum class Qwen3GenerationTermination {
 +    Eos,
 +    MaxGeneratedFrames,
@@ -350,7 +417,7 @@ index 9ad66d9..8c6d294 100644
      int64_t max_new_tokens = 2048;
      bool do_sample = true;
 diff --git a/src/models/qwen3_tts/loader.cpp b/src/models/qwen3_tts/loader.cpp
-index 8077210..9d80b98 100644
+index 8077210..bbc390d 100644
 --- a/src/models/qwen3_tts/loader.cpp
 +++ b/src/models/qwen3_tts/loader.cpp
 @@ -34,7 +34,7 @@ runtime::CapabilitySet capabilities(const Qwen3TTSAssets & assets) {
@@ -366,7 +433,7 @@ index 8077210..9d80b98 100644
          {"qwen3_tts.mem_saver", "true|false", "Release the talker cached-step graph after each request; default false."},
          {"qwen3_tts.perf_mode", "off|flash_attention", "Q8_0-only attention performance mode; default off keeps the exact-safe path."},
          {"qwen3_tts.voice_prompt_cache_slots", "n", "Voice prompt cache slots; default 1."},
-+        {"qwen3_tts.talker_prefix_cache_slots", "n", "Opt-in immutable talker-prefix KV cache slots; default 0 and disabled by mem_saver."},
++        {"qwen3_tts.talker_prefix_cache_slots", "n", "Host-side clone prompt material cache slots (no talker KV state is cached); default 0 and disabled by mem_saver."},
      };
      return out;
  }
@@ -398,11 +465,11 @@ index 8077210..9d80b98 100644
          throw std::runtime_error("Qwen3 voice design model only supports the VoiceDesign task");
      }
 diff --git a/src/models/qwen3_tts/session.cpp b/src/models/qwen3_tts/session.cpp
-index 970aed6..e770c78 100644
+index 970aed6..f46b937 100644
 --- a/src/models/qwen3_tts/session.cpp
 +++ b/src/models/qwen3_tts/session.cpp
-@@ -18,6 +18,95 @@ namespace {
-
+@@ -18,6 +18,140 @@ namespace {
+ 
  using Clock = std::chrono::steady_clock;
  constexpr int64_t kDefaultTextChunkSize = 8192;
 +constexpr const char * kDecodeModeOption = "qwen3_tts.decode_mode";
@@ -411,6 +478,9 @@ index 970aed6..e770c78 100644
 +constexpr const char * kDecodeModeArtifactId = "qwen3_tts.decode_mode";
 +constexpr const char * kMaxGeneratedFramesOption = "qwen3_tts.max_generated_frames";
 +constexpr const char * kGenerationArtifactId = "qwen3_tts.generation";
++constexpr const char * kStreamDecoderOption = "qwen3_tts.stream_decoder";
++constexpr const char * kOfflineMatchedStreamDecoder = "offline_matched";
++constexpr const char * kWindowedStreamDecoder = "windowed";
 +
 +enum class Qwen3RequestDecodeMode {
 +    NativeIncremental,
@@ -428,6 +498,40 @@ index 970aed6..e770c78 100644
 +    throw std::runtime_error(
 +        "qwen3_tts.decode_mode must be native_incremental or offline_full");
 +}
++
++enum class Qwen3StreamDecoder {
++    // Blocks carry the samples the offline decode produces for the same codes.
++    OfflineMatched,
++    // Previous behaviour: every block is decoded from a short fixed window.
++    Windowed,
++};
++
++Qwen3StreamDecoder stream_decoder_from_request(const runtime::TaskRequest & request) {
++    const auto value = runtime::find_option(request.options, {kStreamDecoderOption});
++    if (!value.has_value() || *value == kOfflineMatchedStreamDecoder) {
++        return Qwen3StreamDecoder::OfflineMatched;
++    }
++    if (*value == kWindowedStreamDecoder) {
++        return Qwen3StreamDecoder::Windowed;
++    }
++    throw std::runtime_error("qwen3_tts.stream_decoder must be offline_matched or windowed");
++}
++
++struct TalkerStageTimings {
++    int64_t prompt_rows = 0;
++    double prompt_prefill_ms = 0.0;
++    double prompt_import_ms = 0.0;
++    double first_frame_ms = 0.0;
++
++    void add(const Qwen3TalkerCodes & codes) {
++        if (prompt_rows == 0) {
++            first_frame_ms = codes.first_frame_ms;
++        }
++        prompt_rows = std::max(prompt_rows, codes.prompt_rows);
++        prompt_prefill_ms += codes.prompt_prefill_ms;
++        prompt_import_ms += codes.prompt_import_ms;
++    }
++};
 +
 +std::optional<int64_t> max_generated_frames_from_request(
 +    const runtime::TaskRequest & request,
@@ -465,7 +569,8 @@ index 970aed6..e770c78 100644
 +void attach_generation_telemetry(
 +    runtime::TaskResult & result, int64_t generated_frames, int64_t generation_cap,
 +    Qwen3GenerationTermination termination, double prompt_ms, double prefill_ms,
-+    double talker_ms, double decoder_ms) {
++    double talker_ms, double decoder_ms, const TalkerStageTimings & stages,
++    const char * stream_decoder = nullptr) {
 +    runtime::VoiceArtifact artifact;
 +    artifact.kind = runtime::ArtifactKind::Custom;
 +    artifact.id = kGenerationArtifactId;
@@ -476,6 +581,13 @@ index 970aed6..e770c78 100644
 +    artifact.meta.emplace("prefill_ms", std::to_string(prefill_ms));
 +    artifact.meta.emplace("talker_ms", std::to_string(talker_ms));
 +    artifact.meta.emplace("decoder_ms", std::to_string(decoder_ms));
++    artifact.meta.emplace("prompt_rows", std::to_string(stages.prompt_rows));
++    artifact.meta.emplace("prompt_prefill_ms", std::to_string(stages.prompt_prefill_ms));
++    artifact.meta.emplace("prompt_import_ms", std::to_string(stages.prompt_import_ms));
++    artifact.meta.emplace("first_frame_ms", std::to_string(stages.first_frame_ms));
++    if (stream_decoder != nullptr) {
++        artifact.meta.emplace("stream_decoder", stream_decoder);
++    }
 +    result.output_artifacts.push_back(std::move(artifact));
 +}
 +
@@ -494,10 +606,10 @@ index 970aed6..e770c78 100644
 +    artifact.meta.emplace("mode", mode);
 +    event.output_artifacts.push_back(std::move(artifact));
 +}
-
+ 
  std::shared_ptr<const Qwen3TTSAssets> require_assets(std::shared_ptr<const Qwen3TTSAssets> assets) {
      if (assets == nullptr) {
-@@ -37,6 +126,9 @@ Qwen3TTSGenerationOptions generation_options_from_request(
+@@ -37,6 +171,9 @@ Qwen3TTSGenerationOptions generation_options_from_request(
          }
          options.max_new_tokens = *value;
      }
@@ -507,10 +619,10 @@ index 970aed6..e770c78 100644
      if (const auto value = runtime::find_option(request.options, {"do_sample"})) {
          options.do_sample = runtime::parse_bool_option(*value, "do_sample");
      }
-@@ -98,6 +190,19 @@ uint64_t hash_audio_samples(const runtime::AudioBuffer & audio) {
+@@ -98,6 +235,19 @@ uint64_t hash_audio_samples(const runtime::AudioBuffer & audio) {
      return hash;
  }
-
+ 
 +void attach_clone_cache_identity(
 +    Qwen3TalkerPrefill & prefill,
 +    const Qwen3VoiceCloneInput & input) {
@@ -527,10 +639,10 @@ index 970aed6..e770c78 100644
  core::BackendConfig voice_prompt_backend_config(const runtime::SessionOptions & options) {
      core::BackendConfig config = options.backend;
      // Voice-clone prompt codes are discrete argmax outputs; keep this stage on CPU so CUDA TF32 math
-@@ -148,6 +253,19 @@ std::size_t voice_prompt_cache_slots_from_options(const runtime::SessionOptions
+@@ -148,6 +298,19 @@ std::size_t voice_prompt_cache_slots_from_options(const runtime::SessionOptions
      return static_cast<std::size_t>(slots);
  }
-
+ 
 +std::size_t talker_prefix_cache_slots_from_options(const runtime::SessionOptions & options) {
 +    constexpr int64_t kDefaultCacheSlots = 0;
 +    const int64_t slots = runtime::parse_i64_option(options.options, {"qwen3_tts.talker_prefix_cache_slots"})
@@ -547,7 +659,7 @@ index 970aed6..e770c78 100644
  void validate_talker_weight_storage(engine::assets::TensorStorageType storage_type) {
      if (storage_type == engine::assets::TensorStorageType::Native ||
          storage_type == engine::assets::TensorStorageType::F32 ||
-@@ -200,6 +318,7 @@ Qwen3TTSSession::Qwen3TTSSession(
+@@ -200,6 +363,7 @@ Qwen3TTSSession::Qwen3TTSSession(
        task_(task),
        assets_(require_assets(std::move(assets))),
        mem_saver_(mem_saver_from_options(options)),
@@ -555,7 +667,7 @@ index 970aed6..e770c78 100644
        perf_mode_(perf_mode_from_options(options)),
        text_tokenizer_(assets_),
        talker_(assets_->config.talker),
-@@ -261,6 +380,7 @@ Qwen3TTSSession::Qwen3TTSSession(
+@@ -261,6 +425,7 @@ Qwen3TTSSession::Qwen3TTSSession(
              key != "qwen3_tts.speech_encoder_weight_type" &&
              key != "qwen3_tts.speech_decoder_weight_type" &&
              key != "qwen3_tts.voice_prompt_cache_slots" &&
@@ -563,7 +675,7 @@ index 970aed6..e770c78 100644
              key != "qwen3_tts.perf_mode" &&
              key != "qwen3_tts.mem_saver") {
              throw std::runtime_error("unknown Qwen3 TTS session option: " + key);
-@@ -279,7 +399,8 @@ Qwen3TTSSession::Qwen3TTSSession(
+@@ -279,7 +444,8 @@ Qwen3TTSSession::Qwen3TTSSession(
      talker_step_ = talker_.create_step_runtime(
          talker_weights_,
          assets_->config.talker.max_position_embeddings,
@@ -573,7 +685,7 @@ index 970aed6..e770c78 100644
      speech_decoder_ = std::make_unique<Qwen3SpeechTokenizerDecoderRuntime>(
          assets_,
          execution_context(),
-@@ -288,8 +409,8 @@ Qwen3TTSSession::Qwen3TTSSession(
+@@ -288,8 +454,8 @@ Qwen3TTSSession::Qwen3TTSSession(
          speech_decoder_weight_storage_type_,
          conv_weight_storage_type_,
          perf_mode_);
@@ -584,7 +696,7 @@ index 970aed6..e770c78 100644
      }
      if (assets_->config.variant == Qwen3TTSVariant::Base && task_.task != runtime::VoiceTaskKind::Tts) {
          throw std::runtime_error("Qwen3 base TTS model only supports the Tts task");
-@@ -300,6 +421,9 @@ Qwen3TTSSession::Qwen3TTSSession(
+@@ -300,6 +466,9 @@ Qwen3TTSSession::Qwen3TTSSession(
      if (assets_->config.variant == Qwen3TTSVariant::CustomVoice && task_.task != runtime::VoiceTaskKind::Tts) {
          throw std::runtime_error("Qwen3 custom voice model only supports the Tts task");
      }
@@ -594,10 +706,10 @@ index 970aed6..e770c78 100644
      if (assets_->config.variant == Qwen3TTSVariant::Base) {
          speech_encoder_ = std::make_unique<Qwen3SpeechTokenizerEncoderRuntime>(
              assets_,
-@@ -333,9 +457,280 @@ void Qwen3TTSSession::prepare(const runtime::SessionPreparationRequest & request
+@@ -333,9 +502,298 @@ void Qwen3TTSSession::prepare(const runtime::SessionPreparationRequest & request
      mark_prepared();
  }
-
+ 
 +runtime::StreamingPolicy Qwen3TTSSession::streaming_policy() const {
 +    runtime::StreamingPolicy policy;
 +    // TTS receives complete text but emits output as the autoregressive talker
@@ -716,10 +828,14 @@ index 970aed6..e770c78 100644
 +    };
 +    const int64_t first_block_frames = parse_block_frames("qwen3_tts.stream_first_block_frames", 4);
 +    const int64_t steady_block_frames = parse_block_frames("qwen3_tts.stream_steady_block_frames", 12);
-+    // The decoder's causal receptive field is 25 complete codec frames (2 s at
-+    // 80 ms/frame).  Keep this aligned with tokenizer_speech_decoder.cpp: a
-+    // wider default only delays first PCM and is not additional model context.
++    // Only the windowed decoder uses this context.  25 frames is upstream's
++    // chunk overlap, not the decoder's reach: the decoder transformer attends
++    // 72 frames back in each of its layers, which is why a windowed block
++    // never equals the offline decode.  The default decoder below does not
++    // window the transformer at all.
 +    const int64_t left_context_frames = parse_block_frames("qwen3_tts.stream_left_context_frames", 25);
++    const auto stream_decoder = stream_decoder_from_request(request);
++    const int64_t max_block_frames = std::max(first_block_frames, steady_block_frames);
 +    const int64_t decoder_capacity_frames = left_context_frames + std::max(
 +        first_block_frames, steady_block_frames);
 +    if (decoder_capacity_frames > 300) {
@@ -762,6 +878,13 @@ index 970aed6..e770c78 100644
 +        }
 +        runtime::AudioBuffer audio;
 +        const auto decoder_start = Clock::now();
++        if (stream_decoder == Qwen3StreamDecoder::OfflineMatched) {
++            // `accumulated` is the reference codes followed by every frame
++            // generated so far, which is exactly what the offline path hands
++            // to decode_and_trim_reference.  The decoder returns the offline
++            // samples for the pending frames without decoding the rest again.
++            audio = speech_decoder_->decode_streaming_block(accumulated, pending.frames, max_block_frames);
++        } else {
 +        // First, steady, and EOS-tail blocks use one padded causal decoder
 +        // capacity.  Only the final causal reference window is decoded; the
 +        // exact context samples are discarded after decoding.
@@ -783,6 +906,7 @@ index 970aed6..e770c78 100644
 +            throw std::runtime_error("Qwen3 native PCM stream decoder context exceeds output");
 +        }
 +        audio.samples.erase(audio.samples.begin(), audio.samples.begin() + static_cast<std::ptrdiff_t>(drop_samples));
++        }
 +        emitted_first_block = true;
 +        decoder_ms += engine::debug::elapsed_ms(decoder_start, Clock::now());
 +        runtime::append_audio_buffer(merged_audio, audio);
@@ -838,10 +962,16 @@ index 970aed6..e770c78 100644
 +    runtime::TaskResult result;
 +    result.audio_output = std::move(merged_audio);
 +    record_generation_metrics(codes, decoder_ms);
++    TalkerStageTimings stages;
++    stages.add(codes);
 +    attach_generation_telemetry(
 +        result, codes.generated_codes.frames, codes.generation_cap, codes.termination,
-+        prompt_ms, prefill_ms, talker_ms, decoder_ms);
++        prompt_ms, prefill_ms, talker_ms, decoder_ms, stages,
++        stream_decoder == Qwen3StreamDecoder::OfflineMatched ? "offline-matched" : "windowed");
 +    debug::timing_log_scalar("qwen3_tts.native_streaming", 1.0);
++    debug::timing_log_scalar(
++        "qwen3_tts.stream_decoder_offline_matched",
++        stream_decoder == Qwen3StreamDecoder::OfflineMatched ? 1.0 : 0.0);
 +    debug::timing_log_scalar("qwen3_tts.stream_blocks", static_cast<double>(emitted_blocks));
 +    debug::timing_log_scalar("qwen3_tts.stream_first_block_frames", static_cast<double>(first_block_frames));
 +    debug::timing_log_scalar("qwen3_tts.stream_steady_block_frames", static_cast<double>(steady_block_frames));
@@ -875,12 +1005,13 @@ index 970aed6..e770c78 100644
      auto release_talker_cached_step_graph = [&]() {
          if (mem_saver_) {
              const auto release_start = Clock::now();
-@@ -436,13 +831,27 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
+@@ -436,13 +894,28 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
      double talker_ms = 0.0;
      double decoder_ms = 0.0;
      runtime::AudioBuffer merged_audio;
 +    int64_t generated_frames = 0;
 +    int64_t generation_cap = 0;
++    TalkerStageTimings stages;
 +    Qwen3GenerationTermination termination = Qwen3GenerationTermination::Eos;
      for (const auto & chunk_request : chunk_requests) {
 -        const Qwen3TTSRequest qwen_request = make_request(chunk_request);
@@ -905,10 +1036,11 @@ index 970aed6..e770c78 100644
          prefill_ms += engine::debug::elapsed_ms(prefill_start, Clock::now());
          if (!voice_prompt.reference_codes.has_value()) {
              throw std::runtime_error("Qwen3 base TTS talker currently requires ICL reference codes");
-@@ -453,6 +862,18 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
+@@ -453,6 +926,19 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
              qwen_request.generation,
              qwen_request.generation.repetition_penalty);
          talker_ms += engine::debug::elapsed_ms(talker_start, Clock::now());
++        stages.add(codes);
 +        generated_frames += codes.generated_codes.frames;
 +        generation_cap += codes.generation_cap;
 +        if (codes.termination != Qwen3GenerationTermination::Eos) {
@@ -924,7 +1056,7 @@ index 970aed6..e770c78 100644
          const auto decoder_start = Clock::now();
          runtime::append_audio_buffer(
              merged_audio,
-@@ -464,6 +885,17 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
+@@ -464,6 +950,18 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
      release_talker_cached_step_graph();
      runtime::TaskResult result;
      result.audio_output = std::move(merged_audio);
@@ -938,12 +1070,31 @@ index 970aed6..e770c78 100644
 +        prompt_ms,
 +        prefill_ms,
 +        talker_ms,
-+        decoder_ms);
++        decoder_ms,
++        stages);
      debug::timing_log_scalar("qwen3_tts.voice_prompt_ms", prompt_ms);
      debug::timing_log_scalar("qwen3_tts.prefill_build_ms", prefill_ms);
      debug::timing_log_scalar("qwen3_tts.talker_ms", talker_ms);
+diff --git a/src/models/qwen3_tts/speaker_encoder.cpp b/src/models/qwen3_tts/speaker_encoder.cpp
+index 45183b5..4033aff 100644
+--- a/src/models/qwen3_tts/speaker_encoder.cpp
++++ b/src/models/qwen3_tts/speaker_encoder.cpp
+@@ -395,7 +395,12 @@ public:
+     }
+ 
+     bool matches(const Qwen3SpeakerEncoderWeights & weights, int64_t frames, ggml_backend_t backend, int threads) const {
+-        return weights_.get() == &weights && frames_ >= frames && backend_ == backend && compute_threads_ == std::max(1, threads);
++        // The graph must be built for exactly this many frames.  Its pooling
++        // takes statistics over every graph frame, so running a shorter
++        // reference through a larger graph zero-pads the features and changes
++        // the speaker embedding: the same reference would then give a
++        // different voice once a longer one had been encoded.
++        return weights_.get() == &weights && frames_ == frames && backend_ == backend && compute_threads_ == std::max(1, threads);
+     }
+ 
+     std::vector<float> run(const audio::AudioTensor & features) {
 diff --git a/src/models/qwen3_tts/talker.cpp b/src/models/qwen3_tts/talker.cpp
-index 5bad35c..63e8742 100644
+index 5bad35c..3365239 100644
 --- a/src/models/qwen3_tts/talker.cpp
 +++ b/src/models/qwen3_tts/talker.cpp
 @@ -12,6 +12,7 @@
@@ -952,25 +1103,21 @@ index 5bad35c..63e8742 100644
  #include "engine/framework/runtime/kv_cache.h"
 +#include "engine/framework/runtime/cache_slots.h"
  #include "engine/framework/sampling/torch_random.h"
-
+ 
  #include "engine/framework/core/constant_tensor_cache.h"
-@@ -98,6 +99,72 @@ struct PromptEmbeddingState {
-     std::vector<float> prompt;
-     std::vector<float> trailing_text;
+@@ -100,6 +101,69 @@ struct PromptEmbeddingState {
      std::vector<float> tts_pad;
-+    // Prefix rows before the first phrase-dependent text embedding. They are
-+    // calculated from the fused prompt layout below, not reference material alone.
-+    int64_t immutable_prefix_steps = 0;
-+};
-+
+ };
+ 
 +bool speech_codes_equal(const Qwen3SpeechCodes & lhs, const Qwen3SpeechCodes & rhs);
 +bool speaker_embedding_equal(const Qwen3SpeakerEmbedding & lhs, const Qwen3SpeakerEmbedding & rhs);
 +
 +// The Base-clone prompt fuses request text into the first reference-code rows.
 +// That means a complete clone KV state cannot be reused without changing model
 +// semantics: later reference rows are causally dependent on the phrase text.
-+// We can still retain the expensive immutable host-side material and the exact
-+// leading KV prefix, then rebuild/replay only the required causal suffix.
++// Only the immutable host-side material is retained.  No talker KV state is
++// shared between phrases: each request prefills its whole prompt in one
++// batched pass.
 +struct VoiceClonePromptMaterial {
 +    std::vector<float> static_prompt_prefix;
 +    std::vector<float> projected_reference_text;
@@ -978,7 +1125,6 @@ index 5bad35c..63e8742 100644
 +    std::vector<float> tts_eos;
 +    std::vector<float> tts_pad;
 +    int64_t reference_codec_rows = 0;
-+    int64_t immutable_prefix_steps = 0;
 +};
 +
 +struct VoiceClonePromptMaterialKey {
@@ -1024,10 +1170,12 @@ index 5bad35c..63e8742 100644
 +            lhs.x_vector_only_mode == rhs.x_vector_only_mode &&
 +            clone_cache_identity_equal(lhs.source_identity, rhs.source_identity);
 +    }
- };
-
++};
++
  bool speech_codes_equal(const Qwen3SpeechCodes & lhs, const Qwen3SpeechCodes & rhs) {
-@@ -117,10 +184,11 @@ bool talker_prefill_equal(const Qwen3TalkerPrefill & lhs, const Qwen3TalkerPrefi
+     return lhs.frames == rhs.frames &&
+            lhs.code_groups == rhs.code_groups &&
+@@ -117,10 +181,11 @@ bool talker_prefill_equal(const Qwen3TalkerPrefill & lhs, const Qwen3TalkerPrefi
          lhs.instruct_ids != rhs.instruct_ids ||
          lhs.reference_ids != rhs.reference_ids ||
          lhs.speaker != rhs.speaker ||
@@ -1043,10 +1191,10 @@ index 5bad35c..63e8742 100644
          lhs.speaker_embedding.has_value() != rhs.speaker_embedding.has_value()) {
          return false;
      }
-@@ -394,14 +462,146 @@ std::vector<float> repeat_row(const std::vector<float> & row, int64_t repeats) {
+@@ -394,14 +459,143 @@ std::vector<float> repeat_row(const std::vector<float> & row, int64_t repeats) {
      return out;
  }
-
+ 
 -PromptEmbeddingState build_prompt_state(
 +VoiceClonePromptMaterial build_voice_clone_prompt_material(
      const Qwen3TalkerPrefill & prefill,
@@ -1138,8 +1286,6 @@ index 5bad35c..63e8742 100644
 +        append_row(material.reference_codec, summed);
 +    }
 +    material.reference_codec_rows = static_cast<int64_t>(material.reference_codec.size()) / config.hidden_size;
-+    material.immutable_prefix_steps = static_cast<int64_t>(material.static_prompt_prefix.size()) / config.hidden_size +
-+        std::min<int64_t>(static_cast<int64_t>(ref_text_ids.size()), material.reference_codec_rows);
 +    return material;
 +}
 +
@@ -1172,7 +1318,6 @@ index 5bad35c..63e8742 100644
 +        append_rows(state.prompt, add_rows(padded_text, material.reference_codec));
 +        state.trailing_text = material.tts_pad;
 +    }
-+    state.immutable_prefix_steps = material.immutable_prefix_steps;
 +    return state;
 +}
 +
@@ -1191,60 +1336,22 @@ index 5bad35c..63e8742 100644
      const auto tts_special_hidden = lookup_rows(
          weights.text_embedding,
          config.text_hidden_size,
-@@ -577,6 +777,12 @@ PromptEmbeddingState build_prompt_state(
-     }
-     const int64_t text_rows = static_cast<int64_t>(text_embed.size()) / config.hidden_size;
-     const int64_t ref_codec_rows = static_cast<int64_t>(ref_codec.size()) / config.hidden_size;
-+    // `combined_text` is reference text followed immediately by request text,
-+    // and is added elementwise to reference codec rows. Retain only the rows
-+    // that cannot contain request text; reference audio is not a safe boundary.
-+    const int64_t immutable_control_rows = 3 + codec_rows - 1;
-+    state.immutable_prefix_steps = immutable_control_rows + std::min<int64_t>(
-+        static_cast<int64_t>(ref_text_ids.size()), ref_codec_rows);
-     if (text_rows > ref_codec_rows) {
-         std::vector<float> text_part(text_embed.begin(), text_embed.begin() + static_cast<std::ptrdiff_t>(ref_codec.size()));
-         append_rows(state.prompt, add_rows(text_part, ref_codec));
-@@ -1010,6 +1216,23 @@ private:
-     ggml_backend_buffer_t buffer_ = nullptr;
- };
-
-+struct ImmutableTalkerPrefixCacheKey {
-+    int64_t steps = 0;
-+    std::vector<float> prefix_embeddings;
-+};
-+
-+struct ImmutableTalkerPrefixCacheKeyEqual {
-+    bool operator()(
-+        const ImmutableTalkerPrefixCacheKey & lhs,
-+        const ImmutableTalkerPrefixCacheKey & rhs) const noexcept {
-+        return lhs.steps == rhs.steps && lhs.prefix_embeddings == rhs.prefix_embeddings;
-+    }
-+};
-+
-+struct ImmutableTalkerPrefixCacheEntry {
-+    TalkerPrefillGraph::OutputWithCache prefill;
-+};
-+
- class TalkerCachedStepGraph {
- public:
-     TalkerCachedStepGraph(
-@@ -1641,10 +1864,13 @@ public:
+@@ -1641,10 +1835,12 @@ public:
      Impl(
          std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
          int64_t prompt_capacity,
 -        int64_t generation_capacity)
 +        int64_t generation_capacity,
-+        std::size_t immutable_prefix_cache_slots)
++        std::size_t prompt_material_cache_slots)
          : weights_(std::move(weights)),
            prompt_capacity_(prompt_capacity),
 -          generation_capacity_(generation_capacity) {
 +          generation_capacity_(generation_capacity),
-+          voice_clone_prompt_material_cache_(immutable_prefix_cache_slots),
-+          immutable_prefix_cache_(immutable_prefix_cache_slots) {
++          voice_clone_prompt_material_cache_(prompt_material_cache_slots) {
          if (weights_ == nullptr) {
              throw std::runtime_error("Qwen3 talker step runtime requires weights runtime");
          }
-@@ -1656,7 +1882,8 @@ public:
+@@ -1656,7 +1852,8 @@ public:
      Qwen3TalkerCodes generate(
          const Qwen3TalkerPrefill & request,
          const Qwen3TTSGenerationOptions & options,
@@ -1254,7 +1361,7 @@ index 5bad35c..63e8742 100644
          const auto total_start = Clock::now();
          const int64_t max_new_tokens = options.max_new_tokens;
          if (max_new_tokens <= 0 || max_new_tokens > generation_capacity_) {
-@@ -1664,10 +1891,53 @@ public:
+@@ -1664,10 +1861,53 @@ public:
          }
          std::mt19937 rng(options.seed);
          const auto prompt_state_start = Clock::now();
@@ -1309,86 +1416,42 @@ index 5bad35c..63e8742 100644
              cached_prompt_prefill_ = request;
              cached_prefill_output_.reset();
          }
-@@ -1680,12 +1950,47 @@ public:
-         }
+@@ -1681,11 +1921,16 @@ public:
          const auto prefill_start = Clock::now();
          const bool prefill_cache_hit = cached_prefill_output_.has_value();
--        if (!prefill_cache_hit) {
-+        const bool immutable_prefix_cache_eligible =
-+            immutable_prefix_cache_.capacity() > 0 &&
-+            state.immutable_prefix_steps > 0 &&
-+            state.immutable_prefix_steps <= prompt_steps;
-+        bool immutable_prefix_cache_hit = false;
-+        int64_t cached_prefill_steps = prompt_steps;
-+        const TalkerPrefillGraph::OutputWithCache * prefill_output_ptr = nullptr;
-+        if (prefill_cache_hit) {
-+            prefill_output_ptr = &*cached_prefill_output_;
-+        } else if (immutable_prefix_cache_eligible) {
-+            // Preserve the exact fused immutable leading rows, not a profile
-+            // identifier.  They include clone/reference conditioning and the
-+            // language control rows, so a changed clone, language, or model
-+            // runtime cannot match this entry.  The remaining rows are
-+            // phrase-local and replayed below from a freshly imported KV
-+            // snapshot before any generated speech is sampled.
-+            cached_prefill_steps = state.immutable_prefix_steps;
-+            ImmutableTalkerPrefixCacheKey key;
-+            key.steps = cached_prefill_steps;
-+            const auto prefix_end = state.prompt.begin() + static_cast<std::ptrdiff_t>(
-+                cached_prefill_steps * config.hidden_size);
-+            key.prefix_embeddings.assign(state.prompt.begin(), prefix_end);
-+            if (auto * cached = immutable_prefix_cache_.find(key)) {
-+                immutable_prefix_cache_hit = true;
-+                prefill_output_ptr = &cached->prefill;
-+            } else {
-+                ImmutableTalkerPrefixCacheEntry entry;
-+                entry.prefill = run_prefill_embeddings_with_state(key.prefix_embeddings, cached_prefill_steps);
-+                immutable_prefix_cache_.put(key, std::move(entry));
-+                auto * stored = immutable_prefix_cache_.find(key);
-+                if (stored == nullptr) {
-+                    throw std::runtime_error("Qwen3 immutable talker-prefix cache insert failed");
-+                }
-+                prefill_output_ptr = &stored->prefill;
-+            }
-+        } else {
+         if (!prefill_cache_hit) {
++            // One batched pass over the whole prompt.  The clone prompt adds
++            // the phrase text to the reference-code rows, so every row after
++            // the reference transcript differs between phrases.  A cached
++            // leading KV prefix therefore saved little and forced each later
++            // row through its own single-row graph run (about 160 runs for an
++            // 18 second reference); the batched pass replaces all of them.
              cached_prefill_output_ = run_prefill_embeddings_with_state(state.prompt, prompt_steps);
-+            prefill_output_ptr = &*cached_prefill_output_;
          }
--        const auto & prefill_output = *cached_prefill_output_;
-+        const auto & prefill_output = *prefill_output_ptr;
+         const auto & prefill_output = *cached_prefill_output_;
          const auto prefill_end = Clock::now();
 -        auto current = prefill_output.result;
          double code_predictor_build_ms = 0.0;
          if (code_predictor_graph_ == nullptr) {
              const auto build_start = Clock::now();
-@@ -1694,8 +1999,12 @@ public:
+@@ -1694,8 +1939,12 @@ public:
          }
          double cached_step_build_ms = 0.0;
          double import_prefill_state_ms = 0.0;
-+        double phrase_suffix_prefill_ms = 0.0;
++        double first_frame_ms = 0.0;
          int64_t cached_step_capacity = 0;
          runtime::TransformerKVState exported_cached_state;
 +        // Import an immutable prefill snapshot for every request. Never export
 +        // the cache after generated frames have been appended: generated speech
-+        // and phrase-dependent suffix state must remain request-local.
++        // must remain request-local.
          const runtime::TransformerKVState * cached_state = &prefill_output.state;
          bool cached_graph_has_state = false;
          auto ensure_cached_step_capacity = [&](int64_t required_capacity) {
-@@ -1730,9 +2039,24 @@ public:
+@@ -1730,9 +1979,13 @@ public:
              }
              cached_step_capacity = cached_step_graph_->cache_steps();
          };
 +        auto current = prefill_output.result;
-+        if (cached_prefill_steps < prompt_steps) {
-+            // A prefix cache is never a continuation cache.  Re-import the
-+            // immutable KV snapshot and replay every phrase-dependent row for
-+            // this request before generation; no generated row is retained.
-+            ensure_cached_step_capacity(prompt_steps);
-+            for (int64_t row = cached_prefill_steps; row < prompt_steps; ++row) {
-+                const auto suffix_start = Clock::now();
-+                current = cached_step_graph_->run_step(row_at(state.prompt, row, config.hidden_size));
-+                phrase_suffix_prefill_ms += engine::debug::elapsed_ms(suffix_start, Clock::now());
-+            }
-+        }
          Qwen3TalkerCodes out;
          out.generated_codes.code_groups = config.num_code_groups;
          out.decoder_input_codes.code_groups = config.num_code_groups;
@@ -1398,7 +1461,7 @@ index 5bad35c..63e8742 100644
          const int64_t trailing_rows = static_cast<int64_t>(state.trailing_text.size()) / config.hidden_size;
          std::vector<int32_t> generated_first_codes;
          generated_first_codes.reserve(static_cast<size_t>(max_new_tokens));
-@@ -1760,6 +2084,7 @@ public:
+@@ -1760,6 +2013,7 @@ public:
                  : argmax_index(logits);
              processor_ms += engine::debug::elapsed_ms(processor_start, Clock::now());
              if (first_code == config.codec_eos_token_id) {
@@ -1406,10 +1469,13 @@ index 5bad35c..63e8742 100644
                  break;
              }
              if (step + 1 >= max_new_tokens) {
-@@ -1778,6 +2103,13 @@ public:
+@@ -1778,6 +2032,16 @@ public:
              code_predictor_timing.output_read_ms += predictor_timing.output_read_ms;
              out.generated_codes.codes.insert(out.generated_codes.codes.end(), frame.codes.begin(), frame.codes.end());
              ++out.generated_codes.frames;
++            if (out.generated_codes.frames == 1) {
++                first_frame_ms = engine::debug::elapsed_ms(total_start, Clock::now());
++            }
 +            if (on_generated_frame) {
 +                Qwen3SpeechCodes generated_frame;
 +                generated_frame.code_groups = out.generated_codes.code_groups;
@@ -1417,26 +1483,27 @@ index 5bad35c..63e8742 100644
 +                generated_frame.codes = frame.codes;
 +                on_generated_frame(generated_frame);
 +            }
-
+ 
              const auto frame_embed_start = Clock::now();
              const auto text_hidden = step < trailing_rows
-@@ -1809,7 +2141,15 @@ public:
+@@ -1809,7 +2073,16 @@ public:
          out.decoder_input_codes.frames += out.generated_codes.frames;
          debug::timing_log_scalar("qwen3_tts.talker.prompt_state_ms", engine::debug::elapsed_ms(prompt_state_start, prompt_state_end));
          debug::timing_log_scalar("qwen3_tts.talker.prefill_ms", engine::debug::elapsed_ms(prefill_start, prefill_end));
-+        debug::timing_log_scalar("qwen3_tts.talker.prefix_cache.suffix_replay_ms", phrase_suffix_prefill_ms);
++        out.prompt_rows = prompt_steps;
++        out.prompt_prefill_ms = prefill_cache_hit ? 0.0 : engine::debug::elapsed_ms(prefill_start, prefill_end);
++        out.prompt_import_ms = import_prefill_state_ms;
++        out.first_frame_ms = first_frame_ms;
++        debug::timing_log_scalar("qwen3_tts.talker.prompt_rows", prompt_steps);
++        debug::timing_log_scalar("qwen3_tts.talker.first_frame_ms", first_frame_ms);
          debug::timing_log_scalar("qwen3_tts.talker.prefill_cache.hit", prefill_cache_hit);
 +        debug::timing_log_scalar("qwen3_tts.talker.clone_prompt_material_cache.enabled", voice_clone_prompt_material_cache_.capacity() > 0);
 +        debug::timing_log_scalar("qwen3_tts.talker.clone_prompt_material_cache.hit", voice_clone_prompt_material_cache_hit);
 +        debug::timing_log_scalar("qwen3_tts.talker.clone_prompt_material_cache.entries", static_cast<int64_t>(voice_clone_prompt_material_cache_.size()));
-+        debug::timing_log_scalar("qwen3_tts.talker.immutable_prefix_cache.enabled", immutable_prefix_cache_.capacity() > 0);
-+        debug::timing_log_scalar("qwen3_tts.talker.immutable_prefix_cache.eligible", immutable_prefix_cache_eligible);
-+        debug::timing_log_scalar("qwen3_tts.talker.immutable_prefix_cache.hit", immutable_prefix_cache_hit);
-+        debug::timing_log_scalar("qwen3_tts.talker.immutable_prefix_cache.entries", static_cast<int64_t>(immutable_prefix_cache_.size()));
          debug::timing_log_scalar("qwen3_tts.talker.code_predictor_build_ms", code_predictor_build_ms);
          debug::timing_log_scalar("qwen3_tts.talker.cached_step_build_ms", cached_step_build_ms);
          debug::timing_log_scalar("qwen3_tts.talker.import_prefill_state_ms", import_prefill_state_ms);
-@@ -1863,6 +2203,14 @@ private:
+@@ -1863,6 +2136,10 @@ private:
      std::optional<Qwen3TalkerPrefill> cached_prompt_prefill_;
      std::optional<PromptEmbeddingState> cached_prompt_state_;
      std::optional<TalkerPrefillGraph::OutputWithCache> cached_prefill_output_;
@@ -1444,14 +1511,10 @@ index 5bad35c..63e8742 100644
 +        VoiceClonePromptMaterialKey,
 +        VoiceClonePromptMaterial,
 +        VoiceClonePromptMaterialKeyEqual> voice_clone_prompt_material_cache_;
-+    runtime::CacheSlots<
-+        ImmutableTalkerPrefixCacheKey,
-+        ImmutableTalkerPrefixCacheEntry,
-+        ImmutableTalkerPrefixCacheKeyEqual> immutable_prefix_cache_;
  };
-
+ 
  Qwen3TalkerStepRuntime::Qwen3TalkerStepRuntime(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
-@@ -1876,8 +2224,9 @@ Qwen3TalkerStepRuntime::~Qwen3TalkerStepRuntime() = default;
+@@ -1876,8 +2153,9 @@ Qwen3TalkerStepRuntime::~Qwen3TalkerStepRuntime() = default;
  Qwen3TalkerCodes Qwen3TalkerStepRuntime::generate(
      const Qwen3TalkerPrefill & prefill,
      const Qwen3TTSGenerationOptions & options,
@@ -1461,30 +1524,465 @@ index 5bad35c..63e8742 100644
 +    GeneratedFrameCallback on_generated_frame) {
 +    return impl_->generate(prefill, options, repetition_penalty, std::move(on_generated_frame));
  }
-
+ 
  int64_t Qwen3TalkerStepRuntime::release_cached_step_graph() {
-@@ -1915,9 +2264,11 @@ std::shared_ptr<const Qwen3TalkerWeightsRuntime> Qwen3Talker::create_weights_run
+@@ -1915,9 +2193,11 @@ std::shared_ptr<const Qwen3TalkerWeightsRuntime> Qwen3Talker::create_weights_run
  std::shared_ptr<Qwen3TalkerStepRuntime> Qwen3Talker::create_step_runtime(
      std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
      int64_t prompt_capacity,
 -    int64_t generation_capacity) const {
 +    int64_t generation_capacity,
-+    std::size_t immutable_prefix_cache_slots) const {
++    std::size_t prompt_material_cache_slots) const {
      return std::make_shared<Qwen3TalkerStepRuntime>(
 -        std::make_unique<Qwen3TalkerStepRuntime::Impl>(std::move(weights), prompt_capacity, generation_capacity));
 +        std::make_unique<Qwen3TalkerStepRuntime::Impl>(
-+            std::move(weights), prompt_capacity, generation_capacity, immutable_prefix_cache_slots));
++            std::move(weights), prompt_capacity, generation_capacity, prompt_material_cache_slots));
  }
-
+ 
  }  // namespace engine::models::qwen3_tts
 diff --git a/src/models/qwen3_tts/tokenizer_speech_decoder.cpp b/src/models/qwen3_tts/tokenizer_speech_decoder.cpp
-index 4101dd2..4381f14 100644
+index 4101dd2..dbb5193 100644
 --- a/src/models/qwen3_tts/tokenizer_speech_decoder.cpp
 +++ b/src/models/qwen3_tts/tokenizer_speech_decoder.cpp
-@@ -1144,6 +1144,38 @@ Qwen3SpeechTokenizerDecoderRuntime::Qwen3SpeechTokenizerDecoderRuntime(
-
+@@ -893,6 +893,54 @@ int graph_node_capacity(const DecoderConfig & config) {
+     return static_cast<int>(4096 + config.num_layers * config.num_heads * 16 + config.upsample_rates.size() * 512);
+ }
+ 
++// The decoder is two causal stages.  The transformer stage attends
++// `sliding_window` frames back in every layer, so its reach is many times the
++// window.  The vocoder stage is convolutional and looks back a fixed, short
++// distance.  Streaming splits the graph between them so that the transformer
++// can see the same history as the offline decode while the expensive vocoder
++// only runs on new frames.
++enum class DecoderGraphPart {
++    Full,
++    Transformer,
++    Vocoder,
++};
++
++int64_t causal_conv_lookback_steps(const Conv1dWeights & conv) {
++    return (conv.kernel - 1) * conv.dilation + 1 - conv.stride;
++}
++
++int64_t causal_conv_transpose_lookback_steps(const ConvTranspose1dWeights & conv) {
++    // After the right trim, output n is built from inputs floor(n / stride)
++    // down to floor(n / stride) - (ceil(kernel / stride) - 1).
++    return (conv.kernel + conv.stride - 1) / conv.stride - 1;
++}
++
++// Waveform samples before a frame boundary that can still change the audio
++// after it, summed over every causal convolution of the vocoder stage.
++int64_t vocoder_lookback_samples(const Qwen3SpeechTokenizerDecoderWeights & weights) {
++    int64_t samples_per_step = kDecodeSamplesPerCode;
++    int64_t lookback = 0;
++    for (const auto & stage : weights.upsample_stages) {
++        lookback += causal_conv_transpose_lookback_steps(stage.upconv) * samples_per_step;
++        samples_per_step /= stage.upconv.stride;
++        lookback += causal_conv_lookback_steps(stage.convnext.dwconv) * samples_per_step;
++    }
++    lookback += causal_conv_lookback_steps(weights.decoder_input_conv) * samples_per_step;
++    for (const auto & block : weights.decoder_blocks) {
++        lookback += causal_conv_transpose_lookback_steps(block.upconv) * samples_per_step;
++        samples_per_step /= block.upconv.stride;
++        for (const auto & unit : block.residual_units) {
++            lookback += causal_conv_lookback_steps(unit.conv1) * samples_per_step;
++            lookback += causal_conv_lookback_steps(unit.conv2) * samples_per_step;
++        }
++    }
++    lookback += causal_conv_lookback_steps(weights.output_conv) * samples_per_step;
++    if (samples_per_step != 1) {
++        throw std::runtime_error("Qwen3 speech decoder upsampling does not match the codec frame size");
++    }
++    return lookback;
++}
++
+ }  // namespace
+ 
+ class Qwen3SpeechTokenizerDecoderGraph {
+@@ -903,12 +951,14 @@ public:
+         core::ExecutionContext & execution_context,
+         core::ConstantTensorCache & constants,
+         size_t graph_arena_bytes,
+-        Qwen3TTSPerfMode perf_mode)
++        Qwen3TTSPerfMode perf_mode,
++        DecoderGraphPart part = DecoderGraphPart::Full)
+         : weights_(std::move(weights)),
+           code_frames_(code_frames),
+           backend_(execution_context.backend()),
+           compute_threads_(std::max(1, execution_context.config().threads)),
+-          perf_mode_(perf_mode) {
++          perf_mode_(perf_mode),
++          part_(part) {
+         if (weights_ == nullptr) {
+             throw std::runtime_error("Qwen3 speech decoder graph requires weights");
+         }
+@@ -937,16 +987,20 @@ public:
+             throw std::runtime_error("failed to initialize Qwen3 speech decoder ggml context");
+         }
+ 
+-        codes_ = ggml_new_tensor_3d(ctx_.get(), GGML_TYPE_I32, code_frames_, config.num_quantizers, 1);
+-        ggml_set_input(codes_);
+-        positions_ = ggml_new_tensor_1d(ctx_.get(), GGML_TYPE_I32, code_frames_);
+-        ggml_set_input(positions_);
+-        if (perf_mode_ == Qwen3TTSPerfMode::FlashAttention) {
+-            mask_ = ggml_new_tensor_4d(ctx_.get(), GGML_TYPE_F16, code_frames_, code_frames_, 1, 1);
+-        } else {
+-            mask_ = ggml_new_tensor_2d(ctx_.get(), GGML_TYPE_F32, code_frames_, code_frames_);
++        const bool has_transformer = part_ != DecoderGraphPart::Vocoder;
++        const bool has_vocoder = part_ != DecoderGraphPart::Transformer;
++        if (has_transformer) {
++            codes_ = ggml_new_tensor_3d(ctx_.get(), GGML_TYPE_I32, code_frames_, config.num_quantizers, 1);
++            ggml_set_input(codes_);
++            positions_ = ggml_new_tensor_1d(ctx_.get(), GGML_TYPE_I32, code_frames_);
++            ggml_set_input(positions_);
++            if (perf_mode_ == Qwen3TTSPerfMode::FlashAttention) {
++                mask_ = ggml_new_tensor_4d(ctx_.get(), GGML_TYPE_F16, code_frames_, code_frames_, 1, 1);
++            } else {
++                mask_ = ggml_new_tensor_2d(ctx_.get(), GGML_TYPE_F32, code_frames_, code_frames_);
++            }
++            ggml_set_input(mask_);
+         }
+-        ggml_set_input(mask_);
+ 
+         core::ModuleBuildContext build_ctx{
+             ctx_.get(),
+@@ -954,7 +1008,9 @@ public:
+             execution_context.backend_type(),
+         };
+         constants.begin_graph();
+-        auto hidden = quantizer_decode(ctx_.get(), build_ctx, codes_, *weights_, constants);
++        core::TensorValue hidden;
++        if (has_transformer) {
++        hidden = quantizer_decode(ctx_.get(), build_ctx, codes_, *weights_, constants);
+         hidden = modules::TransposeModule({{0, 2, 1, 3}, 3}).build(build_ctx, hidden);
+         hidden = causal_conv1d(build_ctx, hidden, weights_->pre_conv, constants);
+         hidden = modules::TransposeModule({{0, 2, 1, 3}, 3}).build(build_ctx, hidden);
+@@ -983,6 +1039,27 @@ public:
+             weights_->transformer_output_proj.output_dim,
+             weights_->transformer_output_proj.use_bias))
+             .build(build_ctx, hidden, binding::linear_data(constants, weights_->transformer_output_proj.weight, weights_->transformer_output_proj.bias));
++        }
++        if (part_ == DecoderGraphPart::Transformer) {
++            // The split point is the transformer's projected output, one
++            // latent row per codec frame.  Rows are contiguous by frame, so a
++            // run of frames can be read back and handed to a vocoder graph.
++            hidden = core::ensure_backend_addressable_layout(build_ctx, hidden);
++            if (hidden.tensor->ne[0] != config.latent_dim || hidden.tensor->ne[1] != code_frames_ ||
++                hidden.tensor->ne[2] != 1) {
++                throw std::runtime_error("Qwen3 speech decoder transformer output has an unexpected layout");
++            }
++            output_ = ggml_cont(ctx_.get(), hidden.tensor);
++        }
++        if (part_ == DecoderGraphPart::Vocoder) {
++            latent_input_ = ggml_new_tensor_3d(ctx_.get(), GGML_TYPE_F32, config.latent_dim, code_frames_, 1);
++            ggml_set_input(latent_input_);
++            hidden = core::wrap_tensor(
++                latent_input_,
++                core::TensorShape::from_dims({1, code_frames_, config.latent_dim}),
++                GGML_TYPE_F32);
++        }
++        if (has_vocoder) {
+         hidden = modules::TransposeModule({{0, 2, 1, 3}, 3}).build(build_ctx, hidden);
+         for (const auto & stage : weights_->upsample_stages) {
+             hidden = causal_conv_transpose1d(build_ctx, hidden, stage.upconv, constants);
+@@ -1008,6 +1085,7 @@ public:
+             weights_->output_alpha,
+             weights_->output_beta);
+         output_ = ggml_clamp(ctx_.get(), causal_conv1d(build_ctx, hidden, weights_->output_conv, constants).tensor, -1.0F, 1.0F);
++        }
+         ggml_set_output(output_);
+         graph_ = ggml_new_graph_custom(ctx_.get(), graph_node_capacity(config), false);
+         ggml_build_forward_expand(graph_, output_);
+@@ -1018,21 +1096,23 @@ public:
+         if (gallocr_ == nullptr || !ggml_gallocr_alloc_graph(gallocr_, graph_)) {
+             throw std::runtime_error("failed to allocate Qwen3 speech decoder graph");
+         }
+-        std::vector<int32_t> positions(static_cast<size_t>(code_frames_));
++        if (!has_transformer) {
++            return;
++        }
++        positions_data_.resize(static_cast<size_t>(code_frames_));
+         for (int64_t i = 0; i < code_frames_; ++i) {
+-            positions[static_cast<size_t>(i)] = static_cast<int32_t>(i);
++            positions_data_[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+         }
+-        const auto mask = make_mask(code_frames_, config.sliding_window);
+-        ggml_backend_tensor_set(positions_, positions.data(), 0, positions.size() * sizeof(int32_t));
++        mask_data_ = make_mask(code_frames_, config.sliding_window);
+         if (perf_mode_ == Qwen3TTSPerfMode::FlashAttention) {
+-            std::vector<ggml_fp16_t> mask_f16(mask.size());
+-            for (size_t index = 0; index < mask.size(); ++index) {
+-                mask_f16[index] = ggml_fp32_to_fp16(mask[index]);
++            mask_f16_data_.resize(mask_data_.size());
++            for (size_t index = 0; index < mask_data_.size(); ++index) {
++                mask_f16_data_[index] = ggml_fp32_to_fp16(mask_data_[index]);
+             }
+-            ggml_backend_tensor_set(mask_, mask_f16.data(), 0, mask_f16.size() * sizeof(ggml_fp16_t));
+-        } else {
+-            ggml_backend_tensor_set(mask_, mask.data(), 0, mask.size() * sizeof(float));
++            mask_data_.clear();
++            mask_data_.shrink_to_fit();
+         }
++        upload_fixed_inputs();
+     }
+ 
+     ~Qwen3SpeechTokenizerDecoderGraph() {
+@@ -1053,6 +1133,84 @@ public:
+     }
+ 
+     std::vector<float> run(const int32_t * codes, size_t code_count) {
++        if (part_ != DecoderGraphPart::Full) {
++            throw std::runtime_error("Qwen3 speech decoder split graph cannot run a complete decode");
++        }
++        (void) upload_codes(codes, code_count);
++        compute();
++        const auto read_start = Clock::now();
++        std::vector<float> audio(static_cast<size_t>(waveform_frames_), 0.0F);
++        ggml_backend_tensor_get(output_, audio.data(), 0, audio.size() * sizeof(float));
++        last_output_read_ms_ = engine::debug::elapsed_ms(read_start, Clock::now());
++        return audio;
++    }
++
++    // Returns one latent row per input frame.  Frames after the input are
++    // zero codes; the stage is causal, so they cannot change earlier rows.
++    std::vector<float> run_transformer(const int32_t * codes, size_t code_count) {
++        if (part_ != DecoderGraphPart::Transformer) {
++            throw std::runtime_error("Qwen3 speech decoder graph has no separate transformer output");
++        }
++        const int64_t input_frames = upload_codes(codes, code_count);
++        compute();
++        const auto read_start = Clock::now();
++        std::vector<float> latent(static_cast<size_t>(input_frames * weights_->config.latent_dim), 0.0F);
++        ggml_backend_tensor_get(output_, latent.data(), 0, latent.size() * sizeof(float));
++        last_output_read_ms_ = engine::debug::elapsed_ms(read_start, Clock::now());
++        return latent;
++    }
++
++    // Decodes `rows` consecutive latent rows.  Rows after them are zero and
++    // the caller keeps only the samples of the rows it supplied.
++    std::vector<float> run_vocoder(const float * latent_rows, int64_t rows) {
++        if (part_ != DecoderGraphPart::Vocoder) {
++            throw std::runtime_error("Qwen3 speech decoder graph has no separate vocoder input");
++        }
++        if (rows <= 0 || rows > code_frames_) {
++            throw std::runtime_error("Qwen3 speech decoder latent rows exceed graph capacity");
++        }
++        const auto upload_start = Clock::now();
++        const size_t latent_dim = static_cast<size_t>(weights_->config.latent_dim);
++        std::vector<float> padded(static_cast<size_t>(code_frames_) * latent_dim, 0.0F);
++        std::copy(latent_rows, latent_rows + static_cast<size_t>(rows) * latent_dim, padded.begin());
++        ggml_backend_tensor_set(latent_input_, padded.data(), 0, padded.size() * sizeof(float));
++        last_input_upload_ms_ = engine::debug::elapsed_ms(upload_start, Clock::now());
++        compute();
++        const auto read_start = Clock::now();
++        std::vector<float> audio(static_cast<size_t>(rows * kDecodeSamplesPerCode), 0.0F);
++        ggml_backend_tensor_get(output_, audio.data(), 0, audio.size() * sizeof(float));
++        last_output_read_ms_ = engine::debug::elapsed_ms(read_start, Clock::now());
++        return audio;
++    }
++
++    double last_input_upload_ms() const noexcept {
++        return last_input_upload_ms_;
++    }
++
++    double last_graph_compute_ms() const noexcept {
++        return last_graph_compute_ms_;
++    }
++
++    double last_output_read_ms() const noexcept {
++        return last_output_read_ms_;
++    }
++
++private:
++    // The graph allocator keeps only outputs alive.  It frees an input once
++    // its last consumer is placed and hands that memory to later nodes, so
++    // positions and the attention mask are overwritten during every run.
++    // Uploading them once at build time left every run after the first with
++    // whatever a later node had written there.
++    void upload_fixed_inputs() {
++        ggml_backend_tensor_set(positions_, positions_data_.data(), 0, positions_data_.size() * sizeof(int32_t));
++        if (perf_mode_ == Qwen3TTSPerfMode::FlashAttention) {
++            ggml_backend_tensor_set(mask_, mask_f16_data_.data(), 0, mask_f16_data_.size() * sizeof(ggml_fp16_t));
++        } else {
++            ggml_backend_tensor_set(mask_, mask_data_.data(), 0, mask_data_.size() * sizeof(float));
++        }
++    }
++
++    int64_t upload_codes(const int32_t * codes, size_t code_count) {
+         const int64_t input_frames = static_cast<int64_t>(code_count / weights_->config.num_quantizers);
+         const size_t expected = static_cast<size_t>(code_frames_ * weights_->config.num_quantizers);
+         if (code_count % static_cast<size_t>(weights_->config.num_quantizers) != 0 || input_frames <= 0 || input_frames > code_frames_) {
+@@ -1067,7 +1225,12 @@ public:
+             }
+         }
+         ggml_backend_tensor_set(codes_, tensor_codes.data(), 0, tensor_codes.size() * sizeof(int32_t));
++        upload_fixed_inputs();
+         last_input_upload_ms_ = engine::debug::elapsed_ms(upload_start, Clock::now());
++        return input_frames;
++    }
++
++    void compute() {
+         const auto compute_start = Clock::now();
+         core::set_backend_threads(backend_, compute_threads_);
+         const ggml_status status = engine::core::compute_backend_graph(backend_, graph_);
+@@ -1076,26 +1239,8 @@ public:
+         if (status != GGML_STATUS_SUCCESS) {
+             throw std::runtime_error("Qwen3 speech decoder graph compute failed");
+         }
+-        const auto read_start = Clock::now();
+-        std::vector<float> audio(static_cast<size_t>(waveform_frames_), 0.0F);
+-        ggml_backend_tensor_get(output_, audio.data(), 0, audio.size() * sizeof(float));
+-        last_output_read_ms_ = engine::debug::elapsed_ms(read_start, Clock::now());
+-        return audio;
+-    }
+-
+-    double last_input_upload_ms() const noexcept {
+-        return last_input_upload_ms_;
+     }
+ 
+-    double last_graph_compute_ms() const noexcept {
+-        return last_graph_compute_ms_;
+-    }
+-
+-    double last_output_read_ms() const noexcept {
+-        return last_output_read_ms_;
+-    }
+-
+-private:
+     std::shared_ptr<const Qwen3SpeechTokenizerDecoderWeights> weights_;
+     int64_t code_frames_ = 0;
+     int64_t waveform_frames_ = 0;
+@@ -1105,10 +1250,15 @@ private:
+     ggml_tensor * codes_ = nullptr;
+     ggml_tensor * positions_ = nullptr;
+     ggml_tensor * mask_ = nullptr;
++    ggml_tensor * latent_input_ = nullptr;
+     ggml_tensor * output_ = nullptr;
+     ggml_cgraph * graph_ = nullptr;
+     ggml_gallocr_t gallocr_ = nullptr;
+     Qwen3TTSPerfMode perf_mode_ = Qwen3TTSPerfMode::Standard;
++    DecoderGraphPart part_ = DecoderGraphPart::Full;
++    std::vector<int32_t> positions_data_;
++    std::vector<float> mask_data_;
++    std::vector<ggml_fp16_t> mask_f16_data_;
+     double last_input_upload_ms_ = 0.0;
+     double last_graph_compute_ms_ = 0.0;
+     double last_output_read_ms_ = 0.0;
+@@ -1125,6 +1275,7 @@ Qwen3SpeechTokenizerDecoderRuntime::Qwen3SpeechTokenizerDecoderRuntime(
+     : assets_(std::move(assets)),
+       execution_context_(&execution_context),
+       graph_arena_bytes_(graph_arena_bytes),
++      constant_context_bytes_(constant_context_bytes),
+       perf_mode_(perf_mode) {
+     if (assets_ == nullptr) {
+         throw std::runtime_error("Qwen3 speech tokenizer decoder requires assets");
+@@ -1144,6 +1295,141 @@ Qwen3SpeechTokenizerDecoderRuntime::Qwen3SpeechTokenizerDecoderRuntime(
+ 
  Qwen3SpeechTokenizerDecoderRuntime::~Qwen3SpeechTokenizerDecoderRuntime() = default;
-
+ 
++int64_t Qwen3SpeechTokenizerDecoderRuntime::vocoder_context_frames() const {
++    const int64_t lookback = vocoder_lookback_samples(*weights_);
++    return (lookback + kDecodeSamplesPerCode - 1) / kDecodeSamplesPerCode;
++}
++
++runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode_streaming_block(
++    const Qwen3SpeechCodes & history,
++    int64_t target_frames,
++    int64_t max_block_frames) const {
++    if (history.frames <= 0 || history.code_groups != weights_->config.num_quantizers ||
++        static_cast<int64_t>(history.codes.size()) != history.frames * history.code_groups) {
++        throw std::runtime_error("Qwen3 speech decoder received invalid streaming codec history");
++    }
++    if (target_frames <= 0 || target_frames > history.frames || max_block_frames <= 0) {
++        throw std::runtime_error("Qwen3 speech decoder received an invalid streaming block range");
++    }
++    const int64_t vocoder_context = vocoder_context_frames();
++    const int64_t transformer_capacity = kChunkCodes + kLeftContextCodes;
++    const int64_t vocoder_capacity = vocoder_context + max_block_frames;
++    if (vocoder_capacity > transformer_capacity) {
++        throw std::runtime_error("Qwen3 speech decoder streaming block exceeds the offline chunk size");
++    }
++    const int threads = std::max(1, execution_context_->config().threads);
++    // A constant cache replays one fixed tensor sequence, so each graph part
++    // owns its own cache instead of sharing the complete graph's.
++    const size_t part_constant_bytes = std::min<size_t>(constant_context_bytes_, 256ull * 1024ull * 1024ull);
++    double graph_build_ms = 0.0;
++    if (transformer_graph_ == nullptr ||
++        !transformer_graph_->matches(*weights_, transformer_capacity, execution_context_->backend(), threads)) {
++        const auto build_start = Clock::now();
++        transformer_graph_.reset();
++        if (transformer_constants_ == nullptr) {
++            transformer_constants_ = std::make_unique<core::ConstantTensorCache>(
++                execution_context_->backend(),
++                threads,
++                "qwen3_tts.speech_tokenizer_decoder.transformer_constants",
++                part_constant_bytes);
++        }
++        transformer_graph_ = std::make_unique<Qwen3SpeechTokenizerDecoderGraph>(
++            weights_, transformer_capacity, *execution_context_, *transformer_constants_, graph_arena_bytes_,
++            perf_mode_, DecoderGraphPart::Transformer);
++        graph_build_ms += engine::debug::elapsed_ms(build_start, Clock::now());
++    }
++    if (vocoder_graph_ == nullptr ||
++        !vocoder_graph_->matches(*weights_, vocoder_capacity, execution_context_->backend(), threads)) {
++        const auto build_start = Clock::now();
++        vocoder_graph_.reset();
++        if (vocoder_constants_ == nullptr) {
++            vocoder_constants_ = std::make_unique<core::ConstantTensorCache>(
++                execution_context_->backend(),
++                threads,
++                "qwen3_tts.speech_tokenizer_decoder.vocoder_constants",
++                part_constant_bytes);
++        }
++        vocoder_graph_ = std::make_unique<Qwen3SpeechTokenizerDecoderGraph>(
++            weights_, vocoder_capacity, *execution_context_, *vocoder_constants_, graph_arena_bytes_,
++            perf_mode_, DecoderGraphPart::Vocoder);
++        graph_build_ms += engine::debug::elapsed_ms(build_start, Clock::now());
++    }
++
++    const size_t groups = static_cast<size_t>(history.code_groups);
++    const size_t latent_dim = static_cast<size_t>(weights_->config.latent_dim);
++    std::vector<float> samples;
++    samples.reserve(static_cast<size_t>(target_frames * kDecodeSamplesPerCode));
++    double transformer_ms = 0.0;
++    double vocoder_ms = 0.0;
++    int64_t begin = history.frames - target_frames;
++    while (begin < history.frames) {
++        // Reproduce decode(): frame `begin` belongs to one 300-frame chunk,
++        // and that chunk is decoded from its own start (plus 25 frames of
++        // overlap for every chunk after the first).  The transformer runs on
++        // exactly that window, so its rows equal the offline rows.
++        const int64_t chunk_begin = (begin / kChunkCodes) * kChunkCodes;
++        const int64_t chunk_end = std::min<int64_t>(chunk_begin + kChunkCodes, history.frames);
++        const int64_t chunk_context = chunk_begin > kLeftContextCodes ? kLeftContextCodes : chunk_begin;
++        const int64_t window_begin = chunk_begin - chunk_context;
++        const auto latent = transformer_graph_->run_transformer(
++            history.codes.data() + static_cast<size_t>(window_begin) * groups,
++            static_cast<size_t>(chunk_end - window_begin) * groups);
++        transformer_ms += transformer_graph_->last_graph_compute_ms();
++        while (begin < chunk_end) {
++            const int64_t end = std::min<int64_t>(chunk_end, begin + max_block_frames);
++            // The vocoder cannot see further back than `vocoder_context`
++            // frames, so rows before that do not affect the kept samples.
++            const int64_t vocoder_begin = std::max<int64_t>(window_begin, begin - vocoder_context);
++            const auto decoded = vocoder_graph_->run_vocoder(
++                latent.data() + static_cast<size_t>(vocoder_begin - window_begin) * latent_dim,
++                end - vocoder_begin);
++            vocoder_ms += vocoder_graph_->last_graph_compute_ms();
++            samples.insert(
++                samples.end(),
++                decoded.begin() + static_cast<std::ptrdiff_t>((begin - vocoder_begin) * kDecodeSamplesPerCode),
++                decoded.begin() + static_cast<std::ptrdiff_t>((end - vocoder_begin) * kDecodeSamplesPerCode));
++            begin = end;
++        }
++    }
++    debug::timing_log_scalar("qwen3_tts.speech_decoder.stream.graph.build_ms", graph_build_ms);
++    debug::timing_log_scalar("qwen3_tts.speech_decoder.stream.transformer_ms", transformer_ms);
++    debug::timing_log_scalar("qwen3_tts.speech_decoder.stream.vocoder_ms", vocoder_ms);
++    debug::timing_log_scalar("qwen3_tts.speech_decoder.stream.vocoder_context_frames", vocoder_context);
++    return runtime::AudioBuffer{kSampleRate, 1, std::move(samples)};
++}
++
 +runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode_padded(
 +    const Qwen3SpeechCodes & codec_codes,
 +    int64_t graph_capacity_frames) const {
@@ -1520,7 +2018,7 @@ index 4101dd2..4381f14 100644
  runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode(const Qwen3SpeechCodes & codec_codes) const {
      const auto total_start = Clock::now();
      if (codec_codes.frames <= 0 || codec_codes.code_groups != weights_->config.num_quantizers) {
-@@ -1228,11 +1260,9 @@ runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode_and_trim_referen
+@@ -1228,11 +1514,9 @@ runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode_and_trim_referen
      combined.codes.insert(combined.codes.end(), reference_codes.codes.begin(), reference_codes.codes.end());
      combined.codes.insert(combined.codes.end(), generated_codes.codes.begin(), generated_codes.codes.end());
      auto audio = decode(combined);
@@ -1535,3 +2033,62 @@ index 4101dd2..4381f14 100644
      if (cut < 0 || cut > static_cast<int64_t>(audio.samples.size())) {
          throw std::runtime_error("Qwen3 speech decoder reference trim is out of range");
      }
+diff --git a/src/models/qwen3_tts/tokenizer_speech_encoder.cpp b/src/models/qwen3_tts/tokenizer_speech_encoder.cpp
+index 3663607..d0d784c 100644
+--- a/src/models/qwen3_tts/tokenizer_speech_encoder.cpp
++++ b/src/models/qwen3_tts/tokenizer_speech_encoder.cpp
+@@ -580,15 +580,14 @@ public:
+         if (gallocr_ == nullptr || !ggml_gallocr_alloc_graph(gallocr_, graph_)) {
+             throw std::runtime_error("failed to allocate Qwen3 speech tokenizer graph");
+         }
+-        std::vector<int32_t> positions(static_cast<size_t>(transformer_frames_), 0);
++        positions_data_.assign(static_cast<size_t>(transformer_frames_), 0);
+         for (int64_t i = 0; i < transformer_frames_; ++i) {
+-            positions[static_cast<size_t>(i)] = static_cast<int32_t>(i);
++            positions_data_[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+         }
+-        ggml_backend_tensor_set(positions_, positions.data(), 0, positions.size() * sizeof(int32_t));
+         if (attention_mask_ != nullptr) {
+-            auto mask = modules::qwen_causal_prefill_mask_values(1, transformer_frames_);
+-            ggml_backend_tensor_set(attention_mask_, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
++            mask_data_ = modules::qwen_causal_prefill_mask_values(1, transformer_frames_);
+         }
++        upload_fixed_inputs();
+     }
+ 
+     ~Qwen3SpeechTokenizerEncoderGraph() {
+@@ -610,6 +609,7 @@ public:
+         std::vector<float> padded(static_cast<size_t>(sample_capacity_), 0.0F);
+         std::copy(waveform.begin(), waveform.end(), padded.begin());
+         ggml_backend_tensor_set(input_, padded.data(), 0, padded.size() * sizeof(float));
++        upload_fixed_inputs();
+         core::set_backend_threads(backend_, compute_threads_);
+         const ggml_status status = engine::core::compute_backend_graph(backend_, graph_);
+         ggml_backend_synchronize(backend_);
+@@ -628,6 +628,17 @@ public:
+     }
+ 
+ private:
++    // The graph allocator reuses the memory of positions and the mask for
++    // later nodes, so they must be uploaded again before every run.  A second
++    // reference with the same sample count otherwise reuses this graph with
++    // overwritten positions and gets different codes.
++    void upload_fixed_inputs() {
++        ggml_backend_tensor_set(positions_, positions_data_.data(), 0, positions_data_.size() * sizeof(int32_t));
++        if (attention_mask_ != nullptr) {
++            ggml_backend_tensor_set(attention_mask_, mask_data_.data(), 0, mask_data_.size() * sizeof(ggml_fp16_t));
++        }
++    }
++
+     std::shared_ptr<const Qwen3SpeechTokenizerEncoderWeights> weights_;
+     int64_t sample_capacity_ = 0;
+     int64_t frames_ = 0;
+@@ -643,6 +654,8 @@ private:
+     int compute_threads_ = 1;
+     Qwen3TTSPerfMode perf_mode_ = Qwen3TTSPerfMode::Standard;
+     ggml_gallocr_t gallocr_ = nullptr;
++    std::vector<int32_t> positions_data_;
++    std::vector<ggml_fp16_t> mask_data_;
+ };
+ 
+ Qwen3SpeechTokenizerEncoderRuntime::Qwen3SpeechTokenizerEncoderRuntime(

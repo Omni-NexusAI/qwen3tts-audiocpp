@@ -160,7 +160,7 @@ uses one completed `offline_full` decoder pass before playback and is not labele
 native streaming. It retains the selected profile's sampler and phrase-queue
 policy while requiring result-derived `offline-full-decoder` proof, so a native
 block loop cannot be silently buffered behind the fallback label. The development
-override enables the pinned nine-file engine patch, keeps one model resident,
+override enables the pinned eleven-file engine patch, keeps one model resident,
 and makes **Native incremental PCM (experimental)** selectable through
 `/v1/audio/speech` with `stream:true` and `response_format:"pcm"`. Buffered
 phrase PCM remains the Playground default until native passes the live timing,
@@ -169,13 +169,18 @@ offline reference path. Stop/new-turn cancellation closes the browser proxy and
 supervisor streams so the engine resets without stale tail playback. Native
 promotion requires independent multi-chunk, cancellation/recovery, timing, and
 single-resident GPU validation for each raw model. The default clone cache
-reuses encoded reference conditioning and speaker embeddings. The engine's
-talker-prefix cache defaults to zero slots; the explicit native-development
-override configures four experimental slots for the exact immutable leading
-clone, language, control, and reference KV state. Each request restores that
-prefix, replays every phrase-dependent suffix row, and keeps generated speech
-state request-local. Native first-PCM latency therefore remains an
-explicit performance gate rather than a solved capability. Physical
+reuses encoded reference conditioning and speaker embeddings. The speaker
+encoder graph is built for the exact reference length, so a reference keeps the
+same speaker embedding whatever was encoded before it. The engine caches no
+talker KV state between phrases: every request prefills its whole prompt in one
+batched pass and keeps generated speech state request-local.
+`qwen3_tts.talker_prefix_cache_slots` keeps its name but only sizes the
+host-side clone prompt material cache (zero by default, four in the
+native-development override). The engine reports where the time before the
+first frame went (`prompt_rows`, `prompt_prefill_ms`, `prompt_import_ms`,
+`first_frame_ms`) in the `speech.generation` event and in `X-AudioCPP-*`
+headers on completed responses. Native first-PCM latency remains a measured
+gate: the batched prefill has not yet been timed on the GPU. Physical
 speaker-loopback AEC3 suppression and human double-talk preservation remain
 user-owned acoustic validation.
 The streaming Playground starts by default for evaluation. Non-streaming uses
@@ -220,13 +225,23 @@ Built-ins are immutable; editing starts by cloning one. Realtime Save As sends
 the complete effective safe schema and can atomically select the new profile
 only for the Realtime scope, without changing Voice Studio's selection. Custom
 updates require their current revision and reject stale writes.
-All built-ins retain the model-required 25 decoder-context frames (2 seconds).
-A smaller
-custom or temporary value is an explicitly warned Advanced experiment because
-reduced causal history can progressively degrade a long native stream. The
- pinned native engine patch uses the same 25-frame causal-context fallback for direct internal
-requests, so bypassing profile resolution cannot silently restore the older
-quality-degrading context.
+Native streaming decodes each block with the `offline_matched` stream decoder
+by default: the decoder's transformer stage runs over the same window the
+offline decode uses (reference plus everything generated so far, in upstream's
+300-frame chunks) and only the convolutional vocoder stage is limited to the new
+frames plus its exact look-back (10 frames). A block therefore carries the
+samples the offline decode produces for the same codes, up to float rounding.
+The profile field `left_context_frames` is kept for compatibility and no longer
+changes that audio. It applies only to the previous `windowed` decoder, which a
+request can still select with `options["qwen3_tts.stream_decoder"] = "windowed"`.
+25 frames is upstream's chunk overlap, not the decoder's reach: the decoder
+transformer attends 72 frames back in each of 8 layers, so a windowed block
+differs measurably from the offline decode (15 to 16.5 dB signal-to-difference
+on a CPU build of the 0.6B model, against 99 dB for `offline_matched`).
+The engine also uploads the decoder's and the reference encoder's positions and
+attention mask before every run now. They used to be uploaded once when a graph
+was built, and the graph allocator reuses that memory, so every run after a
+graph's first decoded with overwritten values.
 Seed accepts null or an unsigned 32-bit integer: blank and Gradio's `-1`
 sentinel omit the field for engine randomness, while explicit values are
 forwarded. Temperature must be greater than zero. x-vector-only clone mode and

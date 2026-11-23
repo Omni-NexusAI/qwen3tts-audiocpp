@@ -42,7 +42,7 @@ FROM ${AUDIO_CPP_BASE_IMAGE}
 # Rebuild the pinned engine in the disposable stage above, then add only that
 # binary and the candidate control-plane/browser sources to the final image.
 # This avoids re-downloading or re-exporting either model checkpoint.
-ARG AUDIO_CPP_OVERLAY_REV=native-stream-fixed-shape-20260903
+ARG AUDIO_CPP_OVERLAY_REV=offline-matched-stream-batched-prefill-20261122
 ARG AUDIO_CPP_REF=238ab6a9e321c17de8e120559f57efeedaeb1345
 ARG AUDIO_CPP_BASE_IMAGE_ID
 RUN test -n "$AUDIO_CPP_OVERLAY_REV" \

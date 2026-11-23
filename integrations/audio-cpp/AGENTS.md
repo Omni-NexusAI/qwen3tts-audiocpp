@@ -53,17 +53,24 @@
   inheriting nvcc's fallback architecture. The pinned engine exposes no
   supported CUDA-graph runtime toggle, so status must report its graph mode as
   engine-default/uncontrolled and must not advertise a cosmetic A/B switch.
-- Native clone caches may reuse immutable encoded reference conditioning and
-  speaker embeddings. The opt-in `qwen3_tts.talker_prefix_cache_slots` prototype
-  may additionally retain the exact immutable leading clone, language, control,
-  and reference talker-KV state, plus bounded host-side static prompt material
-  keyed by the paired transcript/reference identity. It must still replay every
-  phrase-dependent causal suffix; never cache a whole long-reference KV state
-  merely to reduce latency. The engine defaults to zero slots and
-  `mem_saver` always disables it; the explicit native-development override may
-  configure a bounded nonzero slot count for validation. Every request restores
-  only that prefix, replays all phrase-dependent suffix rows, and keeps generated
-  speech state request-local. Native first-PCM latency remains a measured gate.
+- Native clone caches may reuse immutable encoded reference conditioning,
+  speaker embeddings, and bounded host-side static prompt material keyed by the
+  paired transcript/reference identity. No talker KV state is cached between
+  phrases: the clone prompt adds the phrase text to the reference-code rows, so
+  every request prefills its whole prompt in one batched pass. Do not bring back
+  row-by-row replay of prompt rows; it cost one graph run per row (about 2 s for
+  an 18 s reference). `qwen3_tts.talker_prefix_cache_slots` keeps its name but
+  only sizes the host-side prompt material cache; it defaults to zero and
+  `mem_saver` always disables it. Generated speech state stays request-local.
+  Native first-PCM latency remains a measured gate.
+- The speaker encoder graph must match the reference's frame count exactly.
+  Its pooling averages over every graph frame, so a reused larger graph changes
+  the speaker embedding and breaks seed reproducibility for that voice.
+- The engine reports `prompt_rows`, `prompt_prefill_ms`, `prompt_import_ms`,
+  `first_frame_ms` and (streams) `stream_decoder` in `speech.generation` and as
+  `X-AudioCPP-*` headers on completed responses. The supervisor relays them
+  unchanged into request outcomes and response headers; they are optional so
+  an older engine still works.
 - `/health`, `/control/status`, and candidate inventory expose a new random
   `supervisorInstanceId` together with `engineEpoch`. Realtime phrase requests
   that carry expected lifecycle values require the complete pair and reject 409
@@ -79,11 +86,22 @@
   may submit its frozen clone snapshot with exact encoded reference material;
   validate its ID/revision/hash and use those bytes instead of reopening the
   mutable profile slot, then strip the private snapshot before the engine call.
-- Both raw model decoders declare a 25-frame causal window (2 seconds at one
-  80 ms codec frame). Built-in native profiles retain those 25 frames; a wider
-  value only adds decode latency, while smaller Advanced overrides are
-  experimental and must warn about progressive quality loss rather than
-  masquerading as a safe latency optimization.
+- Both raw model decoders declare `sliding_window: 72` over 8 transformer
+  layers, so the decoder reaches hundreds of frames back; 25 frames is only
+  upstream's chunk overlap. Native streaming therefore defaults to the
+  `offline_matched` stream decoder: the transformer stage runs over the offline
+  decode's own window and only the vocoder stage is limited to new frames plus
+  its exact look-back, so a block equals the offline decode of the same codes
+  up to float rounding. Keep that equality; do not window the transformer to
+  save time. `left_context_frames` stays in profiles for compatibility and
+  applies only to the previous `windowed` decoder, selectable per request with
+  `qwen3_tts.stream_decoder=windowed` as a rollback.
+- Upload every graph input before every run. The graph allocator keeps only
+  outputs alive: it frees an input after its last consumer and gives the memory
+  to later nodes. The speech decoder and the reference encoder used to upload
+  positions and the attention mask once at build time, so each run after a
+  graph's first used overwritten values. Any new graph input needs the same
+  per-run upload, or it must be allocated outside the graph allocator.
 - Normalize Gradio's `seed=-1` random-seed sentinel by omitting `seed` at the
   audio.cpp boundary; audio.cpp accepts only unsigned explicit seed values.
 - The actual editable Studio is the copied Gradio app at `/voice-studio/`. Keep the root HF Realtime

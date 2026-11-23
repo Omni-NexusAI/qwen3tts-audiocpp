@@ -149,10 +149,45 @@ def _finish_request_outcome(request_id: str, status: str, reason: str | None = N
     if record is None or record["state"] in {"completed", "error", "cancelled", "limited"}:
         return
     allowed = {"generatedFrames", "generationCap", "eos", "audioSeconds", "bytes", "elapsedSeconds",
-               "promptMs", "prefillMs", "talkerMs", "decodeMs"}
+               "promptMs", "prefillMs", "talkerMs", "decodeMs", *ENGINE_STAGE_OUTCOME_KEYS}
     record.update({key: value for key, value in fields.items() if key in allowed})
     record.update(state=status, reason=reason, _updated=time.monotonic())
     _prune_request_outcomes()
+
+
+# Engine stage detail relayed as-is: where the time before the first generated
+# frame went, and which stream decoder produced the blocks.  Older engines do
+# not report these, so every key is optional.
+ENGINE_STAGE_TIMINGS = (
+    ("prompt_prefill_ms", "promptPrefillMs", "X-AudioCPP-Prompt-Prefill-Ms"),
+    ("prompt_import_ms", "promptImportMs", "X-AudioCPP-Prompt-Import-Ms"),
+    ("first_frame_ms", "firstFrameMs", "X-AudioCPP-First-Frame-Ms"),
+)
+ENGINE_STAGE_OUTCOME_KEYS = (*(key for _, key, _ in ENGINE_STAGE_TIMINGS), "promptRows", "streamDecoder")
+ENGINE_COMPLETED_TIMING_HEADERS = (
+    ("prompt_ms", "X-AudioCPP-Prompt-Ms"), ("prefill_ms", "X-AudioCPP-Prefill-Ms"),
+    ("talker_ms", "X-AudioCPP-Talker-Ms"), ("decode_ms", "X-AudioCPP-Decode-Ms"),
+    *((engine_key, header) for engine_key, _, header in ENGINE_STAGE_TIMINGS),
+)
+ENGINE_RELAYED_HEADERS = (
+    "X-AudioCPP-Generated-Frames", "X-AudioCPP-Generation-Cap", "X-AudioCPP-Termination",
+    "X-AudioCPP-Prompt-Rows", *(header for _, header in ENGINE_COMPLETED_TIMING_HEADERS),
+)
+
+
+def _completed_generation_event(headers: Any, termination: str) -> dict[str, Any]:
+    """Rebuild the engine's generation report from a completed response's headers."""
+    event: dict[str, Any] = {
+        "generated_frames": int(headers["X-AudioCPP-Generated-Frames"]),
+        "generation_cap": int(headers["X-AudioCPP-Generation-Cap"]),
+        "termination": termination,
+    }
+    for engine_key, header in ENGINE_COMPLETED_TIMING_HEADERS:
+        if header in headers:
+            event[engine_key] = float(headers[header])
+    if "X-AudioCPP-Prompt-Rows" in headers:
+        event["prompt_rows"] = int(headers["X-AudioCPP-Prompt-Rows"])
+    return event
 
 
 def _request_audio_limit_frames(payload: dict[str, Any], mode: str) -> int | None:
@@ -191,12 +226,20 @@ def _generation_event_fields(event: dict[str, Any]) -> dict[str, Any]:
     if cap < 1 or frames > cap or termination not in {"eos", "max_generated_frames"}:
         raise HTTPException(502, "Malformed audio.cpp generation outcome")
     result = {"generatedFrames": frames, "generationCap": cap, "eos": termination == "eos"}
-    for engine_key, key in (("prompt_ms", "promptMs"), ("prefill_ms", "prefillMs"), ("talker_ms", "talkerMs"), ("decode_ms", "decodeMs")):
+    for engine_key, key in (("prompt_ms", "promptMs"), ("prefill_ms", "prefillMs"), ("talker_ms", "talkerMs"), ("decode_ms", "decodeMs"),
+                            *((engine_key, key) for engine_key, key, _ in ENGINE_STAGE_TIMINGS)):
         if engine_key in event:
             value = event[engine_key]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 600000:
                 raise HTTPException(502, "Malformed audio.cpp stage timing")
             result[key] = value
+    if "prompt_rows" in event:
+        rows = event["prompt_rows"]
+        if isinstance(rows, bool) or not isinstance(rows, int) or not 0 <= rows <= 1_000_000:
+            raise HTTPException(502, "Malformed audio.cpp stage timing")
+        result["promptRows"] = rows
+    if event.get("stream_decoder") in {"offline-matched", "windowed"}:
+        result["streamDecoder"] = event["stream_decoder"]
     return result
 
 
@@ -674,9 +717,9 @@ def _start_engine(model_id: str) -> None:
         "qwen3_tts.mem_saver": "false" if NATIVE_INCREMENTAL_PCM_ENABLED else "true",
     }
     if NATIVE_INCREMENTAL_PCM_ENABLED and TALKER_PREFIX_CACHE_SLOTS > 0:
-        # Cache only immutable clone/language/control/reference talker state.
-        # Phrase-dependent suffix rows are replayed and generated speech state
-        # remains request-local inside audio.cpp.
+        # Sizes the engine's host-side clone prompt material cache.  The engine
+        # no longer caches talker KV state: every request prefills its whole
+        # prompt in one batched pass and generated speech stays request-local.
         model["session_options"]["qwen3_tts.talker_prefix_cache_slots"] = str(
             TALKER_PREFIX_CACHE_SLOTS
         )
@@ -2644,11 +2687,8 @@ async def _voice_clone_response(
         generation_fields = {}
         if termination == "eos":
             try:
-                generation_fields = _generation_event_fields({
-                    "generated_frames": int(response.headers["X-AudioCPP-Generated-Frames"]),
-                    "generation_cap": int(response.headers["X-AudioCPP-Generation-Cap"]),
-                    "termination": termination,
-                })
+                generation_fields = _generation_event_fields(
+                    _completed_generation_event(response.headers, termination))
             except (KeyError, ValueError) as exc:
                 raise HTTPException(502, "Malformed audio.cpp completed generation telemetry") from exc
         try:
@@ -2706,7 +2746,7 @@ async def _voice_clone_response(
         }
         if "seed" in engine_payload:
             result_headers["X-TTS-Seed"] = str(engine_payload["seed"])
-        for name in ("X-AudioCPP-Generated-Frames", "X-AudioCPP-Generation-Cap", "X-AudioCPP-Termination"):
+        for name in ENGINE_RELAYED_HEADERS:
             if name in response.headers:
                 result_headers[name] = response.headers[name]
         if decoder_mode != "unreported":

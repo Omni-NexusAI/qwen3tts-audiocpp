@@ -6,9 +6,9 @@ services:
       AUDIO_CPP_NATIVE_INCREMENTAL_PCM: "true"
       AUDIO_CPP_NATIVE_LOAD_WARMUP: "true"
       AUDIO_CPP_NATIVE_LOAD_WARMUP_TIMEOUT_SECONDS: "180"
-      # Four entries cover the normal A/B set: each retains one exact clone/language/control/reference KV prefix,
-      # then replays the phrase-specific suffix. generated speech state remain fresh and request-local.
-      # This is active only in this explicit native-development override.
+      # Four entries cover the normal A/B set of voices.  Each keeps one clone's host-side prompt material;
+      # the engine caches no talker KV state and prefills every prompt in one batched pass.
+      # Generated speech state stays request-local.  Active only in this explicit native-development override.
       AUDIO_CPP_TALKER_PREFIX_CACHE_SLOTS: "4"
       # The pinned audio.cpp/ggml source exposes no supported runtime CUDA-graph
       # switch. It therefore runs the engine default. Do not add a cosmetic env
