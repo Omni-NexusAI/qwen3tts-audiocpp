@@ -178,11 +178,11 @@ Profiles expose only runtime-safe controls:
 - first and steady native PCM block sizes;
 - text look-ahead and safe phrase-flush timing;
 - temperature, top-k, top-p, repetition penalty, and optional uint32 seed; and
-- decoder context, which should remain at the model-required 25 frames
-  (2 seconds).
+- decoder context, kept for compatibility. It only affects the previous
+  `windowed` stream decoder; the default `offline_matched` decoder reproduces
+  the offline decode block by block and ignores it.
 
-Reducing decoder context is an explicitly warned experiment because it can
-degrade a long native stream. Output transport stays fixed at model-native
+Output transport stays fixed at model-native
 24 kHz PCM16. x-vector-only cloning and runtime crossfade are unavailable and
 are not forwarded to audio.cpp.
 

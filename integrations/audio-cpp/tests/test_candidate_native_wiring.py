@@ -182,9 +182,10 @@ class CandidateNativeWiringTests(unittest.TestCase):
         self.assertIn('AUDIO_CPP_TALKER_PREFIX_CACHE_SLOTS: "4"', native)
         self.assertNotIn("GGML_CUDA_DISABLE_GRAPHS", native)
         self.assertIn("no supported runtime CUDA-graph", native)
-        self.assertIn("exact clone/language/control/reference KV prefix", native)
-        self.assertIn("phrase-specific suffix", native)
-        self.assertIn("generated speech state remain fresh", native)
+        self.assertIn("host-side prompt material", native)
+        self.assertIn("caches no talker KV state", native)
+        self.assertIn("one batched pass", native)
+        self.assertIn("Generated speech state stays request-local", native)
         self.assertIn("engine consumes one", native)
         self.assertIn("${AUDIO_CPP_IMAGE:-local/audio-cpp-qwen3-tts-voice-studio:native-development}", candidate)
         self.assertNotIn("image:", native)
@@ -727,7 +728,11 @@ class CandidateNativeWiringTests(unittest.TestCase):
         self.assertIn('line = await lines.__anext__()', source)
         self.assertIn('"X-TTS-Streaming-Mode": "native-incremental-pcm"', source)
         self.assertIn('"X-TTS-Decoder-Mode": verified_decode_mode', source)
-        self.assertIn('"X-TTS-Native-Engine-Chunk-Proof": "two-distinct-sse-delta-events"', source)
+        self.assertIn('NATIVE_CHUNK_PROOF_TWO_DELTAS = "two-distinct-sse-delta-events"', source)
+        self.assertIn(
+            '"X-TTS-Native-Engine-Chunk-Proof": (attested_proof or {}).get("proof", NATIVE_CHUNK_PROOF_TWO_DELTAS)',
+            source,
+        )
 
     def test_thin_overlay_rebuilds_and_copies_the_patched_engine(self) -> None:
         overlay = (INTEGRATION / "Dockerfile.overlay").read_text(encoding="utf-8")

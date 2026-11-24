@@ -27,6 +27,25 @@
   native label from request metadata. Automated transport validation does not prove
   speaker-loopback suppression or human double-talk preservation; those remain
   physical microphone/output-device tests owned by the user.
+- Before headers go out the supervisor also needs proof that the engine is
+  producing blocks, reported in `X-TTS-Native-Engine-Chunk-Proof`. A request
+  that carries the lifecycle pair keeps `two-distinct-sse-delta-events`
+  exactly: two nonempty engine deltas are consumed first. Any other request
+  may release headers on the engine's own label of block 0 (`seq`, `frames`,
+  `phase` on `speech.audio.delta`): `engine-attested-first-block` when the
+  phase is `first` (emitted while the talker is still generating) and
+  `engine-attested-single-block` when it is `final` (an utterance shorter than
+  one block). A missing label, another `seq`, or a byte count that contradicts
+  `frames` falls back to two deltas. Never derive the label from request
+  fields or from HTTP read sizes.
+- Because headers can go out on the first block, a built-in profile's first
+  block must hold at least as much audio as its second block takes to
+  generate, or a player that starts at the first byte runs dry. Low Latency is
+  therefore 3 first / 8 steady frames (revision 3): with 2 frames the 1.7B
+  model left a gap of about 70 ms. Built-ins are replaced from the product
+  defaults whenever the saved profile document is read, so a saved selection
+  of `low-latency` follows the new value; custom profiles and a response's
+  frozen tuning snapshot keep the values they were saved or frozen with.
 - audio.cpp lazy loading retains models. Use `supervisor.py` so only one model
   process/config is active; model switches must stop the old child first and
   must reject GPU-busy or insufficient-VRAM conditions before a load.
@@ -53,17 +72,38 @@
   inheriting nvcc's fallback architecture. The pinned engine exposes no
   supported CUDA-graph runtime toggle, so status must report its graph mode as
   engine-default/uncontrolled and must not advertise a cosmetic A/B switch.
-- Native clone caches may reuse immutable encoded reference conditioning and
-  speaker embeddings. The opt-in `qwen3_tts.talker_prefix_cache_slots` prototype
-  may additionally retain the exact immutable leading clone, language, control,
-  and reference talker-KV state, plus bounded host-side static prompt material
-  keyed by the paired transcript/reference identity. It must still replay every
-  phrase-dependent causal suffix; never cache a whole long-reference KV state
-  merely to reduce latency. The engine defaults to zero slots and
-  `mem_saver` always disables it; the explicit native-development override may
-  configure a bounded nonzero slot count for validation. Every request restores
-  only that prefix, replays all phrase-dependent suffix rows, and keeps generated
-  speech state request-local. Native first-PCM latency remains a measured gate.
+- Native clone caches may reuse immutable encoded reference conditioning,
+  speaker embeddings, and bounded host-side static prompt material keyed by the
+  paired transcript/reference identity. No talker KV state is cached between
+  phrases: the clone prompt adds the phrase text to the reference-code rows, so
+  every request prefills its whole prompt in one batched pass. Do not bring back
+  row-by-row replay of prompt rows; it cost one graph run per row (about 2 s for
+  an 18 s reference). `qwen3_tts.talker_prefix_cache_slots` keeps its name but
+  only sizes the host-side prompt material cache; it defaults to zero and
+  `mem_saver` always disables it. Generated speech state stays request-local.
+  Native first-PCM latency remains a measured gate.
+- The speaker encoder graph must match the reference's frame count exactly.
+  Its pooling averages over every graph frame, so a reused larger graph changes
+  the speaker embedding and breaks seed reproducibility for that voice.
+- The text projection runs on the host for every text token of a request.
+  Keep its weights converted once at load and the per-output update loop: it
+  vectorizes and keeps each output's summation order, so the values equal the
+  plain dot product. Upstream's per-call conversion and scalar chain cost about
+  10 ms per text token on the 1.7B model, which made first audio grow with the
+  length of the text (it looked like a cost of the generation cap, which is
+  derived from the text). `prompt_embed_ms` reports this stage.
+- A closed client connection ends generation within one talker frame on the
+  streamed and the non-streamed path: the HTTP server installs a peer-closed
+  probe for `/v1/audio/speech` and the talker asks it once per frame. Streamed
+  speech responses also get the 30 s send timeout live ingest has, so a client
+  that stops reading cannot pin the model. The probe treats a half-closed
+  request socket as gone, so a client must keep its connection open until the
+  response ends.
+- The engine reports `prompt_rows`, `prompt_embed_ms`, `prompt_prefill_ms`, `prompt_import_ms`,
+  `first_frame_ms` and (streams) `stream_decoder` in `speech.generation` and as
+  `X-AudioCPP-*` headers on completed responses. The supervisor relays them
+  unchanged into request outcomes and response headers; they are optional so
+  an older engine still works.
 - `/health`, `/control/status`, and candidate inventory expose a new random
   `supervisorInstanceId` together with `engineEpoch`. Realtime phrase requests
   that carry expected lifecycle values require the complete pair and reject 409
@@ -79,11 +119,28 @@
   may submit its frozen clone snapshot with exact encoded reference material;
   validate its ID/revision/hash and use those bytes instead of reopening the
   mutable profile slot, then strip the private snapshot before the engine call.
-- Both raw model decoders declare a 25-frame causal window (2 seconds at one
-  80 ms codec frame). Built-in native profiles retain those 25 frames; a wider
-  value only adds decode latency, while smaller Advanced overrides are
-  experimental and must warn about progressive quality loss rather than
-  masquerading as a safe latency optimization.
+- Both raw model decoders declare `sliding_window: 72` over 8 transformer
+  layers, so the decoder reaches hundreds of frames back; 25 frames is only
+  upstream's chunk overlap. Native streaming therefore defaults to the
+  `offline_matched` stream decoder: the transformer stage runs over the offline
+  decode's own window and only the vocoder stage is limited to new frames plus
+  its exact look-back, so a block equals the offline decode of the same codes
+  up to float rounding. Keep that equality; do not window the transformer to
+  save time. `left_context_frames` stays in profiles for compatibility and
+  applies only to the previous `windowed` decoder, selectable per request with
+  `qwen3_tts.stream_decoder=windowed` as a rollback.
+- Upload every graph input before every run. The graph allocator keeps only
+  outputs alive: it frees an input after its last consumer and gives the memory
+  to later nodes. The speech decoder and the reference encoder used to upload
+  positions and the attention mask once at build time, so each run after a
+  graph's first used overwritten values. Any new graph input needs the same
+  per-run upload, or it must be allocated outside the graph allocator.
+- The batched prefill graph is as long as the prompt. It uses the graph
+  allocator: everything read back after the run (logits, last hidden, each
+  layer's K/V and the tensors they view) is marked as an output and its inputs
+  are uploaded before every run. Allocating every tensor of its context
+  instead kept each intermediate alive and cost about 1.1 GB of GPU memory on
+  the 1.7B model.
 - Normalize Gradio's `seed=-1` random-seed sentinel by omitting `seed` at the
   audio.cpp boundary; audio.cpp accepts only unsigned explicit seed values.
 - The actual editable Studio is the copied Gradio app at `/voice-studio/`. Keep the root HF Realtime

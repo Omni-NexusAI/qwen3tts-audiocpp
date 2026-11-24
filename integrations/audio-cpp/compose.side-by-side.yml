@@ -1,0 +1,18 @@
+# Side-by-side test instance of the candidate, for measuring a new image next
+# to the deployed one. Combine with compose.candidate.yml and compose.native.yml
+# under its own project name, and give it its own ports:
+#
+#   AUDIO_CPP_API_PORT=8892 AUDIO_CPP_STUDIO_PORT=8893 AUDIO_CPP_IMAGE=<new tag>
+#   docker compose -p audio-cpp-side -f compose.candidate.yml -f compose.native.yml
+#     -f compose.side-by-side.yml --profile audio-cpp-candidate up -d --no-build
+#
+# It has its own container name and its own voice-library volume. Restore a
+# backup of the deployed library into that volume first; never point two
+# supervisors at the same volume. It starts with no model loaded.
+services:
+  audio-cpp-candidate:
+    container_name: audio-cpp-qwen3-tts-side-by-side
+
+volumes:
+  audio-cpp-voice-library:
+    name: audio-cpp-side-by-side-voice-library

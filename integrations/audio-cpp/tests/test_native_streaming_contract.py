@@ -1,6 +1,6 @@
 """Regression checks for the reproducible native/offline Qwen3-TTS patch.
 
-The package is one nine-file patch based on a pinned upstream tree.  The
+The package is one thirteen-file patch based on a pinned upstream tree.  The
 optional parity test is enabled by ``AUDIO_CPP_AUTHORITATIVE_TREE`` during
 release validation; it intentionally does not require CUDA or model assets.
 """
@@ -16,15 +16,19 @@ PATCH = Path(__file__).parents[1] / "patches" / "qwen3-native-pcm-streaming.patc
 DOCKERFILE = Path(__file__).parents[1] / "Dockerfile"
 PINNED_REV = "238ab6a9e321c17de8e120559f57efeedaeb1345"
 TOUCHED_FILES = (
+    "app/server/http.cpp",
     "app/server/runtime.cpp",
+    "include/engine/framework/runtime/cancellation.h",
     "include/engine/models/qwen3_tts/session.h",
     "include/engine/models/qwen3_tts/talker.h",
     "include/engine/models/qwen3_tts/tokenizer_speech_decoder.h",
     "include/engine/models/qwen3_tts/types.h",
     "src/models/qwen3_tts/loader.cpp",
     "src/models/qwen3_tts/session.cpp",
+    "src/models/qwen3_tts/speaker_encoder.cpp",
     "src/models/qwen3_tts/talker.cpp",
     "src/models/qwen3_tts/tokenizer_speech_decoder.cpp",
+    "src/models/qwen3_tts/tokenizer_speech_encoder.cpp",
 )
 
 
@@ -83,7 +87,45 @@ class NativeStreamingContractTests(unittest.TestCase):
             self.patch,
         )
 
-    def test_fixed_tail_and_reference_trim_are_packaged(self) -> None:
+    def test_default_stream_decoder_reproduces_the_offline_decode(self) -> None:
+        native = self.patch.split("runtime::TaskResult Qwen3TTSSession::run_streaming_base_request", 1)[1]
+        native = native.split("runtime::TaskResult Qwen3TTSSession::run(", 1)[0]
+        # Default: each block is the offline decode of the same codes.  The
+        # session hands over reference + generated codes, as the offline path
+        # does, and the decoder mirrors decode()'s 300-frame chunk windows.
+        self.assertIn(
+            "audio = speech_decoder_->decode_streaming_block(accumulated, pending.frames, max_block_frames);",
+            native,
+        )
+        self.assertIn("return Qwen3StreamDecoder::OfflineMatched;", self.patch)
+        self.assertIn('"qwen3_tts.stream_decoder must be offline_matched or windowed"', self.patch)
+        self.assertIn("const int64_t chunk_begin = (begin / kChunkCodes) * kChunkCodes;", self.patch)
+        self.assertIn(
+            "const int64_t chunk_context = chunk_begin > kLeftContextCodes ? kLeftContextCodes : chunk_begin;",
+            self.patch,
+        )
+        # The transformer stage covers the whole offline window; only the
+        # convolutional vocoder stage is limited to new frames plus its exact
+        # look-back, which is computed from the loaded kernels.
+        self.assertIn("DecoderGraphPart::Transformer", self.patch)
+        self.assertIn("DecoderGraphPart::Vocoder", self.patch)
+        self.assertIn("int64_t vocoder_lookback_samples(", self.patch)
+        self.assertIn(
+            "const int64_t vocoder_begin = std::max<int64_t>(window_begin, begin - vocoder_context);",
+            self.patch,
+        )
+        # A constant cache replays one fixed tensor sequence, so the split
+        # graphs must not share the complete graph's cache.
+        self.assertIn("transformer_constants_", self.patch)
+        self.assertIn("vocoder_constants_", self.patch)
+        # The previous windowed decoder stays selectable per request.
+        self.assertLess(
+            native.index("if (stream_decoder == Qwen3StreamDecoder::OfflineMatched)"),
+            native.index("audio = speech_decoder_->decode_padded(decoder_input, decoder_capacity_frames);"),
+        )
+        self.assertIn('"stream_decoder"', self.patch)
+
+    def test_windowed_fixed_tail_and_reference_trim_are_packaged(self) -> None:
         native = self.patch.split("runtime::TaskResult Qwen3TTSSession::run_streaming_base_request", 1)[1]
         native = native.split("runtime::TaskResult Qwen3TTSSession::run(", 1)[0]
         self.assertIn(
@@ -117,7 +159,12 @@ class NativeStreamingContractTests(unittest.TestCase):
         self.assertIn("if (!wrote_audio)", self.patch)
         self.assertIn("if (require_qwen_decode_mode) {", self.patch)
 
-    def test_decoder_context_uses_upstream_25_frame_window_everywhere(self) -> None:
+    def test_windowed_decoder_context_is_upstream_overlap_not_model_reach(self) -> None:
+        # 25 frames is upstream's chunk overlap.  The patch must not describe
+        # it as the decoder's receptive field: the transformer attends 72
+        # frames back per layer.
+        self.assertIn("72 frames back in each of its layers", self.patch)
+        self.assertNotIn("causal receptive field is 25 complete codec frames", self.patch)
         self.assertIn('parse_block_frames("qwen3_tts.stream_left_context_frames", 25)', self.patch)
         self.assertIn("decoder_capacity_frames = left_context_frames + std::max(", self.patch)
         self.assertIn("must not exceed 300 codec frames", self.patch)
@@ -138,35 +185,153 @@ class NativeStreamingContractTests(unittest.TestCase):
         self.assertIn("qwen3_tts.voice_prompt_ms", self.patch)
         self.assertNotIn("talker_clone_conditioning_equal", self.patch)
 
-    def test_opt_in_prefix_cache_reuses_clone_conditioned_prefix_across_phrase_text(self) -> None:
+    def test_prompt_is_prefilled_in_one_batched_pass_without_a_kv_prefix_cache(self) -> None:
+        # The option keeps its name for deployed configurations, but it now
+        # only sizes the host-side prompt material cache.
         self.assertIn('"qwen3_tts.talker_prefix_cache_slots"', self.patch)
-        self.assertIn("immutable_prefix_cache_slots = 0", self.patch)
         self.assertIn("talker_prefix_cache_slots_(mem_saver_from_options(options) ? 0", self.patch)
-        self.assertIn("state.immutable_prefix_steps <= prompt_steps", self.patch)
-        self.assertNotIn("state.immutable_prefix_steps == prompt_steps", self.patch)
-        self.assertIn("cached_prefill_steps = state.immutable_prefix_steps", self.patch)
-        self.assertIn("key.prefix_embeddings.assign(state.prompt.begin(), prefix_end);", self.patch)
-        self.assertIn("run_prefill_embeddings_with_state(key.prefix_embeddings, cached_prefill_steps)", self.patch)
-        self.assertIn("cached_prefill_steps < prompt_steps", self.patch)
-        self.assertIn("current = cached_step_graph_->run_step(row_at(state.prompt, row, config.hidden_size));", self.patch)
-        self.assertIn("reference audio is not a safe boundary", self.patch)
+        self.assertIn("prompt_material_cache_slots = 0", self.patch)
+        self.assertIn("voice_clone_prompt_material_cache_(prompt_material_cache_slots)", self.patch)
+        self.assertIn("One batched pass over the whole prompt.", self.patch)
+        self.assertIn("no talker KV state is cached", self.patch)
+        # The one-row-at-a-time replay and the KV prefix cache are gone.
+        for removed in (
+            "immutable_prefix_cache_",
+            "ImmutableTalkerPrefixCacheKey",
+            "immutable_prefix_steps",
+            "cached_prefill_steps",
+            "current = cached_step_graph_->run_step(row_at(state.prompt, row, config.hidden_size));",
+            "suffix_replay_ms",
+        ):
+            self.assertNotIn(removed, self.patch)
 
-    def test_opt_in_prefix_cache_key_preserves_exact_clone_and_language_conditioning(self) -> None:
-        # The cache lives in one model runtime and its exact, unquantized fused
-        # prefix includes clone/reference and language control rows.  A phrase
-        # suffix is replayed locally; generated speech never becomes a cache key.
-        self.assertIn("std::vector<float> prefix_embeddings;", self.patch)
-        self.assertIn("lhs.prefix_embeddings == rhs.prefix_embeddings", self.patch)
-        self.assertIn("They include clone/reference conditioning and the", self.patch)
-        self.assertIn("language control rows", self.patch)
-        self.assertIn("no generated row is retained", self.patch)
-
-    def test_opt_in_prefix_cache_reimports_only_prefill_state(self) -> None:
+    def test_generated_speech_state_stays_request_local(self) -> None:
         self.assertIn("Never export\n+        // the cache after generated frames", self.patch)
+        self.assertIn("must remain request-local", self.patch)
         self.assertIn("const runtime::TransformerKVState * cached_state = &prefill_output.state;", self.patch)
         self.assertIn("cached_graph_has_state = false", self.patch)
-        self.assertIn("immutable_prefix_cache_.put(key, std::move(entry));", self.patch)
-        self.assertIn("replay every phrase-dependent row for", self.patch)
+
+    def test_prompt_stage_timings_reach_the_event_and_the_headers(self) -> None:
+        for field in ("prompt_rows", "prompt_embed_ms", "prompt_prefill_ms", "prompt_import_ms", "first_frame_ms"):
+            self.assertIn(f'artifact.meta.emplace("{field}"', self.patch)
+            self.assertIn(f'\\"{field}\\":', self.patch)
+        for header in (
+            "X-AudioCPP-Prompt-Ms",
+            "X-AudioCPP-Prefill-Ms",
+            "X-AudioCPP-Talker-Ms",
+            "X-AudioCPP-Decode-Ms",
+            "X-AudioCPP-Prompt-Rows",
+            "X-AudioCPP-Prompt-Embed-Ms",
+            "X-AudioCPP-Prompt-Prefill-Ms",
+            "X-AudioCPP-Prompt-Import-Ms",
+            "X-AudioCPP-First-Frame-Ms",
+        ):
+            self.assertIn(header, self.patch)
+
+    def test_text_projection_cost_does_not_grow_ten_ms_per_text_token(self) -> None:
+        # Upstream converted the whole projection weight on every call and
+        # summed one scalar chain per output: about 10 ms per text token on
+        # the 1.7B model, so first audio grew with the length of the text
+        # (and looked like it grew with the generation cap, which the
+        # supervisor derives from the text).
+        talker = self.patch.split("b/src/models/qwen3_tts/talker.cpp", 1)[1].split("diff --git ", 1)[0]
+        self.assertIn("+HostLinearWeights make_host_linear(", talker)
+        self.assertIn("+    weights.text_projection_fc1_host = make_host_linear(", talker)
+        self.assertIn("+    weights.text_projection_fc2_host = make_host_linear(", talker)
+        # Converted once at load (inside make_host_linear), not per call.
+        convert = 'assets::tensor_data_to_f32("Qwen3 talker host linear weight"'
+        self.assertEqual(talker.count(convert), 1)
+        self.assertLess(talker.index("+HostLinearWeights make_host_linear("), talker.index(convert))
+        self.assertLess(talker.index(convert), talker.index("+void linear_host_rows("))
+        # One independent update per output keeps each output's summation
+        # order (same values as the plain dot product) and vectorizes.
+        self.assertIn("+                    y[out] += column[out] * x;", talker)
+        self.assertIn("-                sum += weight_values[static_cast<size_t>(out * in_features + in)] *", talker)
+        self.assertIn("+        out.prompt_embed_ms = engine::debug::elapsed_ms(prompt_state_start, prompt_state_end);", talker)
+
+    def test_every_stream_block_carries_the_engines_own_label(self) -> None:
+        # seq / frames / phase let a relay tell from the first block alone
+        # that audio is produced while the talker is still generating.
+        self.assertIn('constexpr const char * kStreamBlockArtifactId = "qwen3_tts.stream_block";', self.patch)
+        self.assertIn('final_block ? "final" : emitted_blocks == 0 ? "first" : "steady"', self.patch)
+        self.assertIn("emit_pending(false);", self.patch)
+        # Only the EOS tail is final; a generation-cap exit emits no tail.
+        eos = self.patch.index("if (codes.termination == Qwen3GenerationTermination::Eos) {")
+        self.assertLess(eos, self.patch.index("emit_pending(true);"))
+        self.assertEqual(self.patch.count("emit_pending(true);"), 1)
+        self.assertIn('if (artifact.id != "qwen3_tts.stream_block") continue;', self.patch)
+        self.assertIn('",\\"seq\\":" + seq->second + ",\\"frames\\":" + frames->second +', self.patch)
+        self.assertIn('",\\"phase\\":" + json_quote(phase->second);', self.patch)
+
+    def test_a_closed_connection_stops_generation_within_one_frame(self) -> None:
+        http = self.patch.split("b/app/server/http.cpp", 1)[1].split("diff --git ", 1)[0]
+        self.assertIn("+bool socket_peer_closed(SocketHandle socket) {", http)
+        self.assertIn('+constexpr std::string_view kSpeechPath = "/v1/audio/speech";', http)
+        self.assertIn("+        const engine::runtime::ScopedCancellationProbe cancel_when_peer_closes(", http)
+        # Installed before the handler runs, so it covers the non-streamed
+        # path (generated inside handle()) and the streamed body alike.
+        self.assertLess(
+            http.index("ScopedCancellationProbe cancel_when_peer_closes("),
+            http.index(" const auto response = handler.handle(request);"),
+        )
+        talker = self.patch.split("b/src/models/qwen3_tts/talker.cpp", 1)[1].split("diff --git ", 1)[0]
+        loop = talker.index(" for (int64_t step = 0; step < max_new_tokens; ++step) {")
+        check = talker.index("+            if (runtime::cancellation_requested()) {")
+        sample = talker.index("apply_main_talker_processors(logits, config, generated_first_codes, step, repetition_penalty);")
+        self.assertLess(loop, check)
+        self.assertLess(check, sample)
+        self.assertIn("inline thread_local const CancellationProbe * active_cancellation_probe = nullptr;", self.patch)
+
+    def test_streamed_speech_has_a_send_timeout(self) -> None:
+        # A client that stops reading must fail the write, not pin the model.
+        self.assertIn("+            if (speech_request) {\n+                set_send_timeout(socket.get(), LiveIngestLimits{}.send_timeout_ms);", self.patch)
+
+    def test_batched_prefill_graph_reuses_its_memory(self) -> None:
+        # The prefill graph is as long as the prompt.  Allocating every tensor
+        # of its context kept each intermediate of every layer alive: about
+        # 1.1 GB more GPU memory on the 1.7B model for a 230-row prompt.
+        talker = self.patch.split("b/src/models/qwen3_tts/talker.cpp", 1)[1].split("diff --git ", 1)[0]
+        self.assertIn("-        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), weights_->backend());", talker)
+        self.assertIn(
+            "+        gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(weights_->backend()));", talker)
+        # Everything read back after the run stays allocated, including the
+        # tensor a view points into.
+        for kept in ("logits_output_", "hidden_output_", "keys_[layer]", "values_[layer]"):
+            self.assertIn(f"keep_after_compute({kept});", talker)
+        self.assertIn("+        for (; tensor != nullptr; tensor = tensor->view_src) {", talker)
+        # The allocator reuses input memory, so inputs are uploaded per run,
+        # between the embeddings upload and the graph run.
+        embeddings = talker.index("ggml_backend_tensor_set(input_, embeddings.data()")
+        positions = talker.index("+        ggml_backend_tensor_set(positions_, positions_data_.data()")
+        mask = talker.index("+            ggml_backend_tensor_set(attention_mask_, mask_data_.data()")
+        compute = talker.index("engine::core::compute_backend_graph(weights_->backend(), graph_);", embeddings)
+        self.assertLess(embeddings, positions)
+        self.assertLess(positions, mask)
+        self.assertLess(mask, compute)
+
+    def test_graph_inputs_are_uploaded_before_every_run(self) -> None:
+        # The graph allocator frees an input after its last consumer and reuses
+        # the memory, so positions and the attention mask written once at build
+        # time are garbage from the second run on.  That, not block windowing,
+        # was the main reason streamed audio differed from the offline decode.
+        decoder = self.patch.split("b/src/models/qwen3_tts/tokenizer_speech_decoder.cpp", 1)[1]
+        decoder = decoder.split("diff --git ", 1)[0]
+        self.assertIn("void upload_fixed_inputs() {", decoder)
+        upload_codes = decoder.split("int64_t upload_codes(const int32_t * codes, size_t code_count) {", 1)[1]
+        upload_codes = upload_codes.split("void compute() {", 1)[0]
+        self.assertIn("upload_fixed_inputs();", upload_codes)
+        self.assertIn("-        ggml_backend_tensor_set(positions_, positions.data(), 0, positions.size() * sizeof(int32_t));", decoder)
+        encoder = self.patch.split("b/src/models/qwen3_tts/tokenizer_speech_encoder.cpp", 1)[1]
+        self.assertIn("void upload_fixed_inputs() {", encoder)
+        # Once when the graph is built and once in run().
+        self.assertEqual(encoder.count("+        upload_fixed_inputs();"), 2)
+
+    def test_speaker_encoder_graph_is_built_for_the_exact_reference_length(self) -> None:
+        # Reusing a larger graph zero-pads the features into pooling that
+        # averages over every graph frame, which changes the speaker embedding
+        # of a reference once a longer one has been encoded.
+        self.assertIn("frames_ == frames && backend_ == backend", self.patch)
+        self.assertIn("-        return weights_.get() == &weights && frames_ >= frames", self.patch)
 
     def test_clone_prompt_material_cache_reuses_only_exact_static_conditioning(self) -> None:
         # Base-clone prompt text is fused into early reference-code rows, so a
@@ -181,7 +346,7 @@ class NativeStreamingContractTests(unittest.TestCase):
         self.assertIn("voice_clone_prompt_material_cache_", self.patch)
         self.assertIn("build_voice_clone_prompt_state_from_material", self.patch)
         self.assertIn("cannot be reused without changing model", self.patch)
-        self.assertIn("rebuild/replay only the required causal suffix", self.patch)
+        self.assertIn("No talker KV state is", self.patch)
 
     def test_patch_applies_and_matches_authoritative_tree(self) -> None:
         authoritative = os.environ.get("AUDIO_CPP_AUTHORITATIVE_TREE")

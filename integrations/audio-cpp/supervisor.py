@@ -149,10 +149,46 @@ def _finish_request_outcome(request_id: str, status: str, reason: str | None = N
     if record is None or record["state"] in {"completed", "error", "cancelled", "limited"}:
         return
     allowed = {"generatedFrames", "generationCap", "eos", "audioSeconds", "bytes", "elapsedSeconds",
-               "promptMs", "prefillMs", "talkerMs", "decodeMs"}
+               "promptMs", "prefillMs", "talkerMs", "decodeMs", *ENGINE_STAGE_OUTCOME_KEYS}
     record.update({key: value for key, value in fields.items() if key in allowed})
     record.update(state=status, reason=reason, _updated=time.monotonic())
     _prune_request_outcomes()
+
+
+# Engine stage detail relayed as-is: where the time before the first generated
+# frame went, and which stream decoder produced the blocks.  Older engines do
+# not report these, so every key is optional.
+ENGINE_STAGE_TIMINGS = (
+    ("prompt_embed_ms", "promptEmbedMs", "X-AudioCPP-Prompt-Embed-Ms"),
+    ("prompt_prefill_ms", "promptPrefillMs", "X-AudioCPP-Prompt-Prefill-Ms"),
+    ("prompt_import_ms", "promptImportMs", "X-AudioCPP-Prompt-Import-Ms"),
+    ("first_frame_ms", "firstFrameMs", "X-AudioCPP-First-Frame-Ms"),
+)
+ENGINE_STAGE_OUTCOME_KEYS = (*(key for _, key, _ in ENGINE_STAGE_TIMINGS), "promptRows", "streamDecoder")
+ENGINE_COMPLETED_TIMING_HEADERS = (
+    ("prompt_ms", "X-AudioCPP-Prompt-Ms"), ("prefill_ms", "X-AudioCPP-Prefill-Ms"),
+    ("talker_ms", "X-AudioCPP-Talker-Ms"), ("decode_ms", "X-AudioCPP-Decode-Ms"),
+    *((engine_key, header) for engine_key, _, header in ENGINE_STAGE_TIMINGS),
+)
+ENGINE_RELAYED_HEADERS = (
+    "X-AudioCPP-Generated-Frames", "X-AudioCPP-Generation-Cap", "X-AudioCPP-Termination",
+    "X-AudioCPP-Prompt-Rows", *(header for _, header in ENGINE_COMPLETED_TIMING_HEADERS),
+)
+
+
+def _completed_generation_event(headers: Any, termination: str) -> dict[str, Any]:
+    """Rebuild the engine's generation report from a completed response's headers."""
+    event: dict[str, Any] = {
+        "generated_frames": int(headers["X-AudioCPP-Generated-Frames"]),
+        "generation_cap": int(headers["X-AudioCPP-Generation-Cap"]),
+        "termination": termination,
+    }
+    for engine_key, header in ENGINE_COMPLETED_TIMING_HEADERS:
+        if header in headers:
+            event[engine_key] = float(headers[header])
+    if "X-AudioCPP-Prompt-Rows" in headers:
+        event["prompt_rows"] = int(headers["X-AudioCPP-Prompt-Rows"])
+    return event
 
 
 def _request_audio_limit_frames(payload: dict[str, Any], mode: str) -> int | None:
@@ -191,12 +227,20 @@ def _generation_event_fields(event: dict[str, Any]) -> dict[str, Any]:
     if cap < 1 or frames > cap or termination not in {"eos", "max_generated_frames"}:
         raise HTTPException(502, "Malformed audio.cpp generation outcome")
     result = {"generatedFrames": frames, "generationCap": cap, "eos": termination == "eos"}
-    for engine_key, key in (("prompt_ms", "promptMs"), ("prefill_ms", "prefillMs"), ("talker_ms", "talkerMs"), ("decode_ms", "decodeMs")):
+    for engine_key, key in (("prompt_ms", "promptMs"), ("prefill_ms", "prefillMs"), ("talker_ms", "talkerMs"), ("decode_ms", "decodeMs"),
+                            *((engine_key, key) for engine_key, key, _ in ENGINE_STAGE_TIMINGS)):
         if engine_key in event:
             value = event[engine_key]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 600000:
                 raise HTTPException(502, "Malformed audio.cpp stage timing")
             result[key] = value
+    if "prompt_rows" in event:
+        rows = event["prompt_rows"]
+        if isinstance(rows, bool) or not isinstance(rows, int) or not 0 <= rows <= 1_000_000:
+            raise HTTPException(502, "Malformed audio.cpp stage timing")
+        result["promptRows"] = rows
+    if event.get("stream_decoder") in {"offline-matched", "windowed"}:
+        result["streamDecoder"] = event["stream_decoder"]
     return result
 
 
@@ -363,7 +407,11 @@ def _default_tuning_profiles() -> dict[str, Any]:
         "profiles": {
         "quality": {"id": "quality", "name": "Quality", "revision": 2, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 30, "first_block_frames": 6, "steady_block_frames": 16, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 128, "phrase_flush_ms": 900, "temperature": 0.8, "top_k": 50, "top_p": 0.95, "repetition_penalty": 1.05, "seed": None},
         "balanced": {"id": "balanced", "name": "Balanced", "revision": 2, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 20, "first_block_frames": 4, "steady_block_frames": 12, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 64, "phrase_flush_ms": 500, "temperature": 1.0, "top_k": 50, "top_p": 0.95, "repetition_penalty": 1.05, "seed": None},
-        "low-latency": {"id": "low-latency", "name": "Low Latency", "revision": 2, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 12, "first_block_frames": 2, "steady_block_frames": 8, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 32, "phrase_flush_ms": 250, "temperature": 1.0, "top_k": 40, "top_p": 0.9, "repetition_penalty": 1.05, "seed": None},
+        # Headers can go out on the first block, so that block must hold at
+        # least as much audio as the second block takes to generate.  With 2
+        # frames (160 ms) a player that started at the first byte ran dry for
+        # about 70 ms before the 8-frame second block; 3 frames do not.
+        "low-latency": {"id": "low-latency", "name": "Low Latency", "revision": 3, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 12, "first_block_frames": 3, "steady_block_frames": 8, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 32, "phrase_flush_ms": 250, "temperature": 1.0, "top_k": 40, "top_p": 0.9, "repetition_penalty": 1.05, "seed": None},
     }}
 
 
@@ -674,9 +722,9 @@ def _start_engine(model_id: str) -> None:
         "qwen3_tts.mem_saver": "false" if NATIVE_INCREMENTAL_PCM_ENABLED else "true",
     }
     if NATIVE_INCREMENTAL_PCM_ENABLED and TALKER_PREFIX_CACHE_SLOTS > 0:
-        # Cache only immutable clone/language/control/reference talker state.
-        # Phrase-dependent suffix rows are replayed and generated speech state
-        # remains request-local inside audio.cpp.
+        # Sizes the engine's host-side clone prompt material cache.  The engine
+        # no longer caches talker KV state: every request prefills its whole
+        # prompt in one batched pass and generated speech stays request-local.
         model["session_options"]["qwen3_tts.talker_prefix_cache_slots"] = str(
             TALKER_PREFIX_CACHE_SLOTS
         )
@@ -1836,6 +1884,9 @@ async def _assert_synthesis_ready(payload: dict[str, Any]) -> str:
             status_code=422,
             detail="expected_engine_epoch and expected_supervisor_instance_id must be supplied together.",
         )
+    # Remembered for the native relay: a request that pins the lifecycle pair
+    # keeps the two-delta header proof exactly as it was.
+    payload["_lifecycle_pair_supplied"] = expected_epoch is not None
     admission_epoch = int(state.get("engineEpoch") or 0)
     if expected_epoch is not None and (
         expected_epoch != admission_epoch or expected_instance != SUPERVISOR_INSTANCE_ID
@@ -2329,11 +2380,39 @@ def _decode_native_pcm_delta(event: dict[str, Any]) -> bytes:
     return chunk
 
 
+NATIVE_CHUNK_PROOF_TWO_DELTAS = "two-distinct-sse-delta-events"
+NATIVE_CHUNK_PROOF_FIRST_BLOCK = "engine-attested-first-block"
+NATIVE_CHUNK_PROOF_SINGLE_BLOCK = "engine-attested-single-block"
+
+
+def _attested_block_proof(event: dict[str, Any], chunk: bytes) -> str | None:
+    """Name the proof the engine's own label on a first delta carries, if any.
+
+    A newer engine labels every streamed block with `seq`, `frames` and
+    `phase`.  Block 0 in phase `first` was emitted while the talker was still
+    generating; block 0 in phase `final` is a whole utterance shorter than one
+    block.  A missing label (older engine), another block, or a byte count
+    that contradicts `frames` proves nothing, and the caller then waits for a
+    second delta as before.
+    """
+    seq, frames, phase = event.get("seq"), event.get("frames"), event.get("phase")
+    if isinstance(seq, bool) or isinstance(frames, bool) or not isinstance(frames, int):
+        return None
+    if seq != 0 or frames <= 0 or len(chunk) != frames * 1920 * 2:
+        return None
+    if phase == "first":
+        return NATIVE_CHUNK_PROOF_FIRST_BLOCK
+    if phase == "final":
+        return NATIVE_CHUNK_PROOF_SINGLE_BLOCK
+    return None
+
+
 async def _prefetch_native_pcm_proof(
     lines: Any,
     *,
     verified_decode_mode: str,
     minimum_chunks: int = 2,
+    attested: dict[str, str] | None = None,
 ) -> list[tuple[bytes, float]]:
     """Require genuine engine delta boundaries before committing headers.
 
@@ -2342,6 +2421,10 @@ async def _prefetch_native_pcm_proof(
     reads.  This preflight consumes two *decoded* nonempty speech.audio.delta
     events from the same iterator, buffers them once, and lets the relay emit
     those exact bytes exactly once.
+
+    When the caller passes `attested`, a first delta that carries the engine's
+    own block label is enough: the proof name is stored under `proof` and the
+    headers can go out one block earlier.
     """
 
     prefetched: list[tuple[bytes, float]] = []
@@ -2413,6 +2496,11 @@ async def _prefetch_native_pcm_proof(
         chunk = _decode_native_pcm_delta(event)
         if chunk:
             prefetched.append((chunk, time.monotonic()))
+            if attested is not None and len(prefetched) == 1:
+                proof = _attested_block_proof(event, chunk)
+                if proof is not None:
+                    attested["proof"] = proof
+                    return prefetched
     return prefetched
 
 
@@ -2644,11 +2732,8 @@ async def _voice_clone_response(
         generation_fields = {}
         if termination == "eos":
             try:
-                generation_fields = _generation_event_fields({
-                    "generated_frames": int(response.headers["X-AudioCPP-Generated-Frames"]),
-                    "generation_cap": int(response.headers["X-AudioCPP-Generation-Cap"]),
-                    "termination": termination,
-                })
+                generation_fields = _generation_event_fields(
+                    _completed_generation_event(response.headers, termination))
             except (KeyError, ValueError) as exc:
                 raise HTTPException(502, "Malformed audio.cpp completed generation telemetry") from exc
         try:
@@ -2706,7 +2791,7 @@ async def _voice_clone_response(
         }
         if "seed" in engine_payload:
             result_headers["X-TTS-Seed"] = str(engine_payload["seed"])
-        for name in ("X-AudioCPP-Generated-Frames", "X-AudioCPP-Generation-Cap", "X-AudioCPP-Termination"):
+        for name in ENGINE_RELAYED_HEADERS:
             if name in response.headers:
                 result_headers[name] = response.headers[name]
         if decoder_mode != "unreported":
@@ -2749,6 +2834,9 @@ async def _native_clone_pcm_response(
     if not raw:
         raise HTTPException(status_code=400, detail="A Base clone reference WAV is required.")
     internal_warmup = bool(payload.get("_internal_warmup"))
+    # Only requests that do not pin the lifecycle pair may release headers on
+    # the engine's label of the first block.
+    attested_proof: dict[str, str] | None = None if payload.get("_lifecycle_pair_supplied") else {}
     engine_payload = dict(payload)
     tuning_snapshot = _apply_engine_tuning(engine_payload)
     delivery_mode = "native-incremental-pcm"
@@ -2895,6 +2983,7 @@ async def _native_clone_pcm_response(
             _prefetch_native_pcm_proof(
                 stream_lines,
                 verified_decode_mode=verified_decode_mode,
+                attested=attested_proof,
             ),
             request=request,
             stage="incremental-pcm-proof",
@@ -3195,10 +3284,11 @@ async def _native_clone_pcm_response(
             # engine-owned speech.decode_mode event from this response.
             "X-TTS-Streaming-Mode": "native-incremental-pcm",
             "X-TTS-Decoder-Mode": verified_decode_mode,
-            # This proof is generated only after the supervisor consumes two
-            # nonempty engine speech.audio.delta SSE events. Downstream HTTP
-            # read sizes are explicitly not part of the native proof.
-            "X-TTS-Native-Engine-Chunk-Proof": "two-distinct-sse-delta-events",
+            # Two nonempty engine speech.audio.delta SSE events, or one that
+            # the engine itself labelled as block 0 of a running generation
+            # (never for a request that pinned the lifecycle pair). Downstream
+            # HTTP read sizes are explicitly not part of the native proof.
+            "X-TTS-Native-Engine-Chunk-Proof": (attested_proof or {}).get("proof", NATIVE_CHUNK_PROOF_TWO_DELTAS),
             "X-TTS-Native-Preheader-Proof-First-PCM-Ms": str(
                 preheader_proof_metrics["preheaderProofFirstPcmMs"]
             ),
