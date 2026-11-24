@@ -127,6 +127,12 @@
   positions and the attention mask once at build time, so each run after a
   graph's first used overwritten values. Any new graph input needs the same
   per-run upload, or it must be allocated outside the graph allocator.
+- The batched prefill graph is as long as the prompt. It uses the graph
+  allocator: everything read back after the run (logits, last hidden, each
+  layer's K/V and the tensors they view) is marked as an output and its inputs
+  are uploaded before every run. Allocating every tensor of its context
+  instead kept each intermediate alive and cost about 1.1 GB of GPU memory on
+  the 1.7B model.
 - Normalize Gradio's `seed=-1` random-seed sentinel by omitting `seed` at the
   audio.cpp boundary; audio.cpp accepts only unsigned explicit seed values.
 - The actual editable Studio is the copied Gradio app at `/voice-studio/`. Keep the root HF Realtime

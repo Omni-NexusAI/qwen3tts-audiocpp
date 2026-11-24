@@ -1300,10 +1300,10 @@ index 45183b5..4033aff 100644
  
      std::vector<float> run(const audio::AudioTensor & features) {
 diff --git a/src/models/qwen3_tts/talker.cpp b/src/models/qwen3_tts/talker.cpp
-index 5bad35c..71af7ae 100644
+index 5bad35c..f66cf4b 100644
 --- a/src/models/qwen3_tts/talker.cpp
 +++ b/src/models/qwen3_tts/talker.cpp
-@@ -11,7 +11,9 @@
+@@ -11,11 +11,14 @@
  #include "engine/framework/modules/primitive_modules.h"
  #include "engine/framework/modules/structural_modules.h"
  #include "engine/framework/modules/weight_binding.h"
@@ -1313,7 +1313,12 @@ index 5bad35c..71af7ae 100644
  #include "engine/framework/sampling/torch_random.h"
  
  #include "engine/framework/core/constant_tensor_cache.h"
-@@ -29,6 +31,7 @@
+ 
++#include <ggml-alloc.h>
+ #include <ggml-backend.h>
+ #include <ggml.h>
+ 
+@@ -29,6 +32,7 @@
  #include <random>
  #include <stdexcept>
  #include <string>
@@ -1321,7 +1326,7 @@ index 5bad35c..71af7ae 100644
  #include <unordered_set>
  #include <utility>
  #include <vector>
-@@ -81,6 +84,14 @@ struct CodePredictorWeights {
+@@ -81,6 +85,14 @@ struct CodePredictorWeights {
      std::optional<GraphLinearTensorWeights> small_to_mtp_projection;
  };
  
@@ -1336,7 +1341,7 @@ index 5bad35c..71af7ae 100644
  struct Qwen3TalkerWeights {
      std::shared_ptr<core::BackendWeightStore> store;
      assets::TensorData codec_embedding;
-@@ -89,6 +100,8 @@ struct Qwen3TalkerWeights {
+@@ -89,6 +101,8 @@ struct Qwen3TalkerWeights {
      assets::TensorData text_embedding;
      LinearTensorWeights text_projection_fc1;
      LinearTensorWeights text_projection_fc2;
@@ -1345,7 +1350,7 @@ index 5bad35c..71af7ae 100644
      std::vector<TalkerLayerWeights> layers;
      assets::TensorDataF32 norm;
      core::TensorValue codec_head;
-@@ -100,6 +113,69 @@ struct PromptEmbeddingState {
+@@ -100,6 +114,69 @@ struct PromptEmbeddingState {
      std::vector<float> tts_pad;
  };
  
@@ -1415,7 +1420,7 @@ index 5bad35c..71af7ae 100644
  bool speech_codes_equal(const Qwen3SpeechCodes & lhs, const Qwen3SpeechCodes & rhs) {
      return lhs.frames == rhs.frames &&
             lhs.code_groups == rhs.code_groups &&
-@@ -117,10 +193,11 @@ bool talker_prefill_equal(const Qwen3TalkerPrefill & lhs, const Qwen3TalkerPrefi
+@@ -117,10 +194,11 @@ bool talker_prefill_equal(const Qwen3TalkerPrefill & lhs, const Qwen3TalkerPrefi
          lhs.instruct_ids != rhs.instruct_ids ||
          lhs.reference_ids != rhs.reference_ids ||
          lhs.speaker != rhs.speaker ||
@@ -1431,7 +1436,7 @@ index 5bad35c..71af7ae 100644
          lhs.speaker_embedding.has_value() != rhs.speaker_embedding.has_value()) {
          return false;
      }
-@@ -271,30 +348,107 @@ float silu(float value) {
+@@ -271,30 +349,107 @@ float silu(float value) {
      return value / (1.0F + std::exp(-value));
  }
  
@@ -1556,7 +1561,7 @@ index 5bad35c..71af7ae 100644
      return output;
  }
  
-@@ -303,11 +457,12 @@ std::vector<float> text_project_host(
+@@ -303,11 +458,12 @@ std::vector<float> text_project_host(
      int64_t rows,
      const Qwen3TalkerWeights & weights,
      const Qwen3TTSTalkerConfig & config) {
@@ -1571,7 +1576,7 @@ index 5bad35c..71af7ae 100644
  }
  
  core::TensorValue project_code_predictor_input(
-@@ -394,14 +549,143 @@ std::vector<float> repeat_row(const std::vector<float> & row, int64_t repeats) {
+@@ -394,14 +550,143 @@ std::vector<float> repeat_row(const std::vector<float> & row, int64_t repeats) {
      return out;
  }
  
@@ -1716,7 +1721,7 @@ index 5bad35c..71af7ae 100644
      const auto tts_special_hidden = lookup_rows(
          weights.text_embedding,
          config.text_hidden_size,
-@@ -641,6 +925,8 @@ Qwen3TalkerWeights load_talker_weights(
+@@ -641,6 +926,8 @@ Qwen3TalkerWeights load_talker_weights(
              assets::TensorStorageType::F32,
              {config.hidden_size}),
      };
@@ -1725,7 +1730,96 @@ index 5bad35c..71af7ae 100644
      weights.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
      const int64_t dim = attention_head_dim(config);
      for (int64_t layer = 0; layer < config.num_hidden_layers; ++layer) {
-@@ -1641,10 +1927,12 @@ public:
+@@ -925,30 +1212,48 @@ public:
+         }
+         hidden_output_ = decoder_out.hidden.tensor;
+         logits_output_ = decoder_out.logits.tensor;
+-        ggml_set_output(logits_output_);
++        // The whole prompt goes through this graph in one pass, so it is as
++        // long as the prompt.  Allocating every tensor of the context kept
++        // each intermediate of every layer alive (about 1.1 GB for a 230-row
++        // prompt on the 1.7B model).  The graph allocator reuses that memory;
++        // what is read back after the run must be marked as an output, and
++        // inputs are uploaded before every run because their memory is reused.
++        ggml_set_input(input_);
++        ggml_set_input(positions_);
++        if (attention_mask_ != nullptr) {
++            ggml_set_input(attention_mask_);
++        }
++        keep_after_compute(logits_output_);
++        keep_after_compute(hidden_output_);
++        for (size_t layer = 0; layer < keys_.size(); ++layer) {
++            keep_after_compute(keys_[layer]);
++            keep_after_compute(values_[layer]);
++        }
+         graph_ = ggml_new_graph_custom(ctx_.get(), 65536, false);
+         ggml_build_forward_expand(graph_, logits_output_);
+         constants.finish_graph();
+         constants.ensure_uploaded();
+-        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), weights_->backend());
+-        if (buffer_ == nullptr) {
++        gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(weights_->backend()));
++        if (gallocr_ == nullptr || !ggml_gallocr_alloc_graph(gallocr_, graph_)) {
++            if (gallocr_ != nullptr) {
++                ggml_gallocr_free(gallocr_);
++                gallocr_ = nullptr;
++            }
+             throw std::runtime_error("failed to allocate Qwen3 talker prefill graph");
+         }
+-        std::vector<int32_t> positions(static_cast<size_t>(prompt_capacity_), 0);
++        positions_data_.resize(static_cast<size_t>(prompt_capacity_), 0);
+         for (int64_t i = 0; i < prompt_capacity_; ++i) {
+-            positions[static_cast<size_t>(i)] = static_cast<int32_t>(i);
++            positions_data_[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+         }
+-        ggml_backend_tensor_set(positions_, positions.data(), 0, positions.size() * sizeof(int32_t));
+         if (attention_mask_ != nullptr) {
+-            auto mask = modules::qwen_causal_prefill_mask_values(1, prompt_capacity_);
+-            ggml_backend_tensor_set(attention_mask_, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
++            mask_data_ = modules::qwen_causal_prefill_mask_values(1, prompt_capacity_);
+         }
+     }
+ 
+     ~TalkerPrefillGraph() {
+         engine::core::release_backend_graph_resources(weights_->backend(), graph_);
+-        if (buffer_ != nullptr) {
+-            ggml_backend_buffer_free(buffer_);
++        if (gallocr_ != nullptr) {
++            ggml_gallocr_free(gallocr_);
+         }
+     }
+ 
+@@ -967,6 +1272,10 @@ public:
+             throw std::runtime_error("Qwen3 talker prefill embedding size mismatch");
+         }
+         ggml_backend_tensor_set(input_, embeddings.data(), 0, embeddings.size() * sizeof(float));
++        ggml_backend_tensor_set(positions_, positions_data_.data(), 0, positions_data_.size() * sizeof(int32_t));
++        if (attention_mask_ != nullptr) {
++            ggml_backend_tensor_set(attention_mask_, mask_data_.data(), 0, mask_data_.size() * sizeof(ggml_fp16_t));
++        }
+         core::set_backend_threads(weights_->backend(), weights_->threads());
+         const ggml_status status = engine::core::compute_backend_graph(weights_->backend(), graph_);
+         ggml_backend_synchronize(weights_->backend());
+@@ -1006,8 +1315,17 @@ private:
+     ggml_tensor * logits_output_ = nullptr;
+     std::vector<ggml_tensor *> keys_;
+     std::vector<ggml_tensor *> values_;
++    std::vector<int32_t> positions_data_;
++    std::vector<ggml_fp16_t> mask_data_;
+     ggml_cgraph * graph_ = nullptr;
+-    ggml_backend_buffer_t buffer_ = nullptr;
++    ggml_gallocr_t gallocr_ = nullptr;
++
++    // A tensor read back after the run, and the tensor whose memory it views.
++    static void keep_after_compute(ggml_tensor * tensor) {
++        for (; tensor != nullptr; tensor = tensor->view_src) {
++            ggml_set_output(tensor);
++        }
++    }
+ };
+ 
+ class TalkerCachedStepGraph {
+@@ -1641,10 +1959,12 @@ public:
      Impl(
          std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
          int64_t prompt_capacity,
@@ -1740,7 +1834,7 @@ index 5bad35c..71af7ae 100644
          if (weights_ == nullptr) {
              throw std::runtime_error("Qwen3 talker step runtime requires weights runtime");
          }
-@@ -1656,7 +1944,8 @@ public:
+@@ -1656,7 +1976,8 @@ public:
      Qwen3TalkerCodes generate(
          const Qwen3TalkerPrefill & request,
          const Qwen3TTSGenerationOptions & options,
@@ -1750,7 +1844,7 @@ index 5bad35c..71af7ae 100644
          const auto total_start = Clock::now();
          const int64_t max_new_tokens = options.max_new_tokens;
          if (max_new_tokens <= 0 || max_new_tokens > generation_capacity_) {
-@@ -1664,10 +1953,53 @@ public:
+@@ -1664,10 +1985,53 @@ public:
          }
          std::mt19937 rng(options.seed);
          const auto prompt_state_start = Clock::now();
@@ -1805,7 +1899,7 @@ index 5bad35c..71af7ae 100644
              cached_prompt_prefill_ = request;
              cached_prefill_output_.reset();
          }
-@@ -1681,11 +2013,16 @@ public:
+@@ -1681,11 +2045,16 @@ public:
          const auto prefill_start = Clock::now();
          const bool prefill_cache_hit = cached_prefill_output_.has_value();
          if (!prefill_cache_hit) {
@@ -1823,7 +1917,7 @@ index 5bad35c..71af7ae 100644
          double code_predictor_build_ms = 0.0;
          if (code_predictor_graph_ == nullptr) {
              const auto build_start = Clock::now();
-@@ -1694,8 +2031,12 @@ public:
+@@ -1694,8 +2063,12 @@ public:
          }
          double cached_step_build_ms = 0.0;
          double import_prefill_state_ms = 0.0;
@@ -1836,7 +1930,7 @@ index 5bad35c..71af7ae 100644
          const runtime::TransformerKVState * cached_state = &prefill_output.state;
          bool cached_graph_has_state = false;
          auto ensure_cached_step_capacity = [&](int64_t required_capacity) {
-@@ -1730,9 +2071,13 @@ public:
+@@ -1730,9 +2103,13 @@ public:
              }
              cached_step_capacity = cached_step_graph_->cache_steps();
          };
@@ -1850,7 +1944,7 @@ index 5bad35c..71af7ae 100644
          const int64_t trailing_rows = static_cast<int64_t>(state.trailing_text.size()) / config.hidden_size;
          std::vector<int32_t> generated_first_codes;
          generated_first_codes.reserve(static_cast<size_t>(max_new_tokens));
-@@ -1744,6 +2089,11 @@ public:
+@@ -1744,6 +2121,11 @@ public:
          CodePredictorTiming code_predictor_timing;
          CachedStepTiming cached_step_timing;
          for (int64_t step = 0; step < max_new_tokens; ++step) {
@@ -1862,7 +1956,7 @@ index 5bad35c..71af7ae 100644
              auto logits = current.logits.values;
              const auto processor_start = Clock::now();
              apply_main_talker_processors(logits, config, generated_first_codes, step, repetition_penalty);
-@@ -1760,6 +2110,7 @@ public:
+@@ -1760,6 +2142,7 @@ public:
                  : argmax_index(logits);
              processor_ms += engine::debug::elapsed_ms(processor_start, Clock::now());
              if (first_code == config.codec_eos_token_id) {
@@ -1870,7 +1964,7 @@ index 5bad35c..71af7ae 100644
                  break;
              }
              if (step + 1 >= max_new_tokens) {
-@@ -1778,6 +2129,16 @@ public:
+@@ -1778,6 +2161,16 @@ public:
              code_predictor_timing.output_read_ms += predictor_timing.output_read_ms;
              out.generated_codes.codes.insert(out.generated_codes.codes.end(), frame.codes.begin(), frame.codes.end());
              ++out.generated_codes.frames;
@@ -1887,7 +1981,7 @@ index 5bad35c..71af7ae 100644
  
              const auto frame_embed_start = Clock::now();
              const auto text_hidden = step < trailing_rows
-@@ -1809,7 +2170,17 @@ public:
+@@ -1809,7 +2202,17 @@ public:
          out.decoder_input_codes.frames += out.generated_codes.frames;
          debug::timing_log_scalar("qwen3_tts.talker.prompt_state_ms", engine::debug::elapsed_ms(prompt_state_start, prompt_state_end));
          debug::timing_log_scalar("qwen3_tts.talker.prefill_ms", engine::debug::elapsed_ms(prefill_start, prefill_end));
@@ -1905,7 +1999,7 @@ index 5bad35c..71af7ae 100644
          debug::timing_log_scalar("qwen3_tts.talker.code_predictor_build_ms", code_predictor_build_ms);
          debug::timing_log_scalar("qwen3_tts.talker.cached_step_build_ms", cached_step_build_ms);
          debug::timing_log_scalar("qwen3_tts.talker.import_prefill_state_ms", import_prefill_state_ms);
-@@ -1863,6 +2234,10 @@ private:
+@@ -1863,6 +2266,10 @@ private:
      std::optional<Qwen3TalkerPrefill> cached_prompt_prefill_;
      std::optional<PromptEmbeddingState> cached_prompt_state_;
      std::optional<TalkerPrefillGraph::OutputWithCache> cached_prefill_output_;
@@ -1916,7 +2010,7 @@ index 5bad35c..71af7ae 100644
  };
  
  Qwen3TalkerStepRuntime::Qwen3TalkerStepRuntime(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
-@@ -1876,8 +2251,9 @@ Qwen3TalkerStepRuntime::~Qwen3TalkerStepRuntime() = default;
+@@ -1876,8 +2283,9 @@ Qwen3TalkerStepRuntime::~Qwen3TalkerStepRuntime() = default;
  Qwen3TalkerCodes Qwen3TalkerStepRuntime::generate(
      const Qwen3TalkerPrefill & prefill,
      const Qwen3TTSGenerationOptions & options,
@@ -1928,7 +2022,7 @@ index 5bad35c..71af7ae 100644
  }
  
  int64_t Qwen3TalkerStepRuntime::release_cached_step_graph() {
-@@ -1915,9 +2291,11 @@ std::shared_ptr<const Qwen3TalkerWeightsRuntime> Qwen3Talker::create_weights_run
+@@ -1915,9 +2323,11 @@ std::shared_ptr<const Qwen3TalkerWeightsRuntime> Qwen3Talker::create_weights_run
  std::shared_ptr<Qwen3TalkerStepRuntime> Qwen3Talker::create_step_runtime(
      std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
      int64_t prompt_capacity,

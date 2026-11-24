@@ -286,6 +286,29 @@ class NativeStreamingContractTests(unittest.TestCase):
         # A client that stops reading must fail the write, not pin the model.
         self.assertIn("+            if (speech_request) {\n+                set_send_timeout(socket.get(), LiveIngestLimits{}.send_timeout_ms);", self.patch)
 
+    def test_batched_prefill_graph_reuses_its_memory(self) -> None:
+        # The prefill graph is as long as the prompt.  Allocating every tensor
+        # of its context kept each intermediate of every layer alive: about
+        # 1.1 GB more GPU memory on the 1.7B model for a 230-row prompt.
+        talker = self.patch.split("b/src/models/qwen3_tts/talker.cpp", 1)[1].split("diff --git ", 1)[0]
+        self.assertIn("-        buffer_ = ggml_backend_alloc_ctx_tensors(ctx_.get(), weights_->backend());", talker)
+        self.assertIn(
+            "+        gallocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(weights_->backend()));", talker)
+        # Everything read back after the run stays allocated, including the
+        # tensor a view points into.
+        for kept in ("logits_output_", "hidden_output_", "keys_[layer]", "values_[layer]"):
+            self.assertIn(f"keep_after_compute({kept});", talker)
+        self.assertIn("+        for (; tensor != nullptr; tensor = tensor->view_src) {", talker)
+        # The allocator reuses input memory, so inputs are uploaded per run,
+        # between the embeddings upload and the graph run.
+        embeddings = talker.index("ggml_backend_tensor_set(input_, embeddings.data()")
+        positions = talker.index("+        ggml_backend_tensor_set(positions_, positions_data_.data()")
+        mask = talker.index("+            ggml_backend_tensor_set(attention_mask_, mask_data_.data()")
+        compute = talker.index("engine::core::compute_backend_graph(weights_->backend(), graph_);", embeddings)
+        self.assertLess(embeddings, positions)
+        self.assertLess(positions, mask)
+        self.assertLess(mask, compute)
+
     def test_graph_inputs_are_uploaded_before_every_run(self) -> None:
         # The graph allocator frees an input after its last consumer and reuses
         # the memory, so positions and the attention mask written once at build
