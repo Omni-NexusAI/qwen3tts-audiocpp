@@ -170,6 +170,34 @@ class AttestedBlockProofTests(unittest.TestCase):
         _chunks, _headers, failure = self.relay([MODE, delta(2), generation(2), *DONE])
         self.assertIsInstance(failure, supervisor.HTTPException)
 
+    def test_low_latency_first_block_outlasts_the_wait_for_the_second_block(self) -> None:
+        # With headers released on the first block, a 2-frame first block left
+        # a player that starts at the first byte without audio for about 70 ms
+        # (measured on the GPU with the 1.7B model); 3 frames do not.
+        low = supervisor._default_tuning_profiles()["profiles"]["low-latency"]
+        self.assertEqual((low["id"], low["name"]), ("low-latency", "Low Latency"))
+        self.assertEqual(low["first_block_frames"], 3)
+        self.assertEqual(low["steady_block_frames"], 8)
+        self.assertEqual(low["revision"], 3)
+
+    def test_saved_documents_pick_up_the_new_built_in_and_keep_custom_profiles(self) -> None:
+        provider = supervisor.TUNING_PROVIDER
+        old_low = {**supervisor._default_tuning_profiles()["profiles"]["low-latency"],
+                   "revision": 2, "first_block_frames": 2}
+        custom = {**old_low, "id": "mine", "name": "Mine", "revision": 1}
+        document = supervisor._normalize_tuning_document({
+            "version": 2,
+            "profiles": {"low-latency": old_low, "mine": custom},
+            "selections": {"realtime": {provider: "low-latency"}, "voice-studio": {provider: "mine"}},
+        })
+        # The saved selection still names the built-in and now resolves to 3 frames.
+        self.assertEqual(document["selections"]["realtime"][provider], "low-latency")
+        self.assertEqual(document["profiles"]["low-latency"]["first_block_frames"], 3)
+        self.assertEqual(document["profiles"]["low-latency"]["revision"], 3)
+        # A custom profile cloned from the old built-in keeps what its owner saved.
+        self.assertEqual(document["selections"]["voice-studio"][provider], "mine")
+        self.assertEqual(document["profiles"]["mine"]["first_block_frames"], 2)
+
     def test_the_pin_is_recorded_at_admission_and_never_forwarded(self) -> None:
         source = SUPERVISOR.read_text(encoding="utf-8")
         self.assertIn('payload["_lifecycle_pair_supplied"] = expected_epoch is not None', source)

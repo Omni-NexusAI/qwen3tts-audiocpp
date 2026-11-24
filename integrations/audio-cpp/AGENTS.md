@@ -38,6 +38,14 @@
   one block). A missing label, another `seq`, or a byte count that contradicts
   `frames` falls back to two deltas. Never derive the label from request
   fields or from HTTP read sizes.
+- Because headers can go out on the first block, a built-in profile's first
+  block must hold at least as much audio as its second block takes to
+  generate, or a player that starts at the first byte runs dry. Low Latency is
+  therefore 3 first / 8 steady frames (revision 3): with 2 frames the 1.7B
+  model left a gap of about 70 ms. Built-ins are replaced from the product
+  defaults whenever the saved profile document is read, so a saved selection
+  of `low-latency` follows the new value; custom profiles and a response's
+  frozen tuning snapshot keep the values they were saved or frozen with.
 - audio.cpp lazy loading retains models. Use `supervisor.py` so only one model
   process/config is active; model switches must stop the old child first and
   must reject GPU-busy or insufficient-VRAM conditions before a load.

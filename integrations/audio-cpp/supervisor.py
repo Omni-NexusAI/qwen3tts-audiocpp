@@ -407,7 +407,11 @@ def _default_tuning_profiles() -> dict[str, Any]:
         "profiles": {
         "quality": {"id": "quality", "name": "Quality", "revision": 2, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 30, "first_block_frames": 6, "steady_block_frames": 16, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 128, "phrase_flush_ms": 900, "temperature": 0.8, "top_k": 50, "top_p": 0.95, "repetition_penalty": 1.05, "seed": None},
         "balanced": {"id": "balanced", "name": "Balanced", "revision": 2, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 20, "first_block_frames": 4, "steady_block_frames": 12, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 64, "phrase_flush_ms": 500, "temperature": 1.0, "top_k": 50, "top_p": 0.95, "repetition_penalty": 1.05, "seed": None},
-        "low-latency": {"id": "low-latency", "name": "Low Latency", "revision": 2, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 12, "first_block_frames": 2, "steady_block_frames": 8, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 32, "phrase_flush_ms": 250, "temperature": 1.0, "top_k": 40, "top_p": 0.9, "repetition_penalty": 1.05, "seed": None},
+        # Headers can go out on the first block, so that block must hold at
+        # least as much audio as the second block takes to generate.  With 2
+        # frames (160 ms) a player that started at the first byte ran dry for
+        # about 70 ms before the 8-frame second block; 3 frames do not.
+        "low-latency": {"id": "low-latency", "name": "Low Latency", "revision": 3, "model": None, "clone_mode": "full_icl", "max_reference_seconds": 12, "first_block_frames": 3, "steady_block_frames": 8, "left_context_frames": MODEL_REQUIRED_LEFT_CONTEXT_FRAMES, "crossfade_samples": 0, "text_lookahead": 32, "phrase_flush_ms": 250, "temperature": 1.0, "top_k": 40, "top_p": 0.9, "repetition_penalty": 1.05, "seed": None},
     }}
 
 

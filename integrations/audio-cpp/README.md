@@ -188,7 +188,9 @@ lifecycle pair gets its headers after the first labelled block
 `engine-attested-single-block` for an utterance shorter than one block), while
 a request that pins the pair keeps the two-delta proof. A closed connection
 stops generation within one frame on the streamed and the non-streamed path,
-and streamed speech has a 30 s send timeout. Native first-PCM latency remains
+and streamed speech has a 30 s send timeout. The Low Latency built-in uses a
+3-frame first block (240 ms of audio) so that a player which starts at the
+first byte still has audio when the second block arrives. Native first-PCM latency remains
 a measured gate. Physical
 speaker-loopback AEC3 suppression and human double-talk preservation remain
 user-owned acoustic validation.
