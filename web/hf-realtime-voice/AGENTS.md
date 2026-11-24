@@ -12,6 +12,7 @@
 - Startup is fail-fast: wait for the pipeline configuration acknowledgement before entering Listening or uploading microphone frames, and surface pre-ack errors or timeout instead of looping on Connecting.
 - Treat native PCM as available only when live capability and response headers prove it. Label buffered and offline delivery accurately.
 - Native browser AEC remains the default. Adaptive uses only the bundled hash-verified AEC3 module and must fall back truthfully; physical loopback and human double-talk remain user validation.
+- Where the Gradio Voice Studio is mounted, `/` redirects to `/voice-studio/` and this client is served at `/realtime` (`/index.html`); keep its asset and API paths working from there. Without the mount, `/` serves this client as before.
 - Keep API keys browser-session-only and persist only non-secret UI selections through server-managed settings.
 
 ## Verification

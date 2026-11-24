@@ -122,7 +122,8 @@ the `qwen3-tts-faster` container.
 3. Open `http://127.0.0.1:8891/voice-studio/` for the candidate's copied
    Gradio Voice
    Studio. It is the orange copied Gradio surface with visible candidate model
-   controls. The root page remains the separate HF Realtime integration test UI.
+   controls. The bare addresses of both published ports redirect a browser
+   there; the separate HF Realtime integration test UI is at `/realtime`.
    Confirm the
    private API endpoint `http://127.0.0.1:8890` reports both
    `qwen3-tts-0.6b-base-bf16` and `qwen3-tts-1.7b-base-bf16`.

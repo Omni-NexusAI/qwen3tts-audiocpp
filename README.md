@@ -188,8 +188,10 @@ are not forwarded to audio.cpp.
 
 ## Realtime test page
 
-The container root at [http://127.0.0.1:8891/](http://127.0.0.1:8891/) is a
-separate Hugging Face Realtime integration surface. It can connect microphone
+The page at [http://127.0.0.1:8891/realtime](http://127.0.0.1:8891/realtime) is a
+separate Hugging Face Realtime integration surface. (The bare address
+`http://127.0.0.1:8891/` opens Voice Studio; set `AUDIO_CPP_ROOT_PAGE=realtime`
+on the container to put this test page there instead.) It can connect microphone
 capture and a local OpenAI-compatible multimodal LLM endpoint to the audio.cpp
 candidate, then show phrase, TTS, playback, reference-pairing, GPU, and echo
 diagnostics.
@@ -203,6 +205,16 @@ speech still require real speaker-loopback validation on each device pair.
 
 The API listens only on `http://127.0.0.1:8890`; its OpenAI-compatible base URL
 is `http://127.0.0.1:8890/v1`.
+
+Both published ports lead to Voice Studio when opened in a browser, so the port
+links in Docker Desktop work: `http://127.0.0.1:8891/` redirects to
+`/voice-studio/`, and `http://127.0.0.1:8890/` redirects to the Voice Studio
+address. Any other client asking the API port for `/` gets a small JSON
+description with `voiceStudioUrl`. The container also prints both addresses
+when it starts. Compose passes the addresses in as
+`AUDIO_CPP_STUDIO_PUBLIC_URL` and `AUDIO_CPP_API_PUBLIC_URL`, following
+`AUDIO_CPP_STUDIO_PORT` and `AUDIO_CPP_API_PORT`; set them yourself when
+starting the image another way.
 
 Useful endpoints include:
 

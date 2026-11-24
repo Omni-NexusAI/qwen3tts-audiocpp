@@ -52,7 +52,7 @@ import auth
 import httpx
 import limiter
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -1966,6 +1966,9 @@ async def session_end(request: Request):
 # The recovered copied Faster-side Gradio Voice Studio is an additional testing
 # surface. The root HF Realtime page remains independent for future streaming
 # integration work.
+VOICE_STUDIO_MOUNTED = False
+VOICE_STUDIO_PATH = "/voice-studio/"
+REALTIME_PAGE_PATH = "/index.html"
 try:
     import gradio as gr
     from gradio_voice_studio import build_app as build_gradio_voice_studio
@@ -1980,6 +1983,7 @@ try:
             ),
             path="/voice-studio",
         )
+        VOICE_STUDIO_MOUNTED = True
     else:
         # Repository test/development environments may carry a pre-mount
         # Gradio release.  Keep the HF Realtime server usable there; the
@@ -1990,5 +1994,67 @@ except ImportError:
     # The regular Realtime server stays runnable outside the candidate image.
     pass
 
-# index.html at "/". The repo is public anyway, so serving the dir is fine.
+def _root_page() -> str:
+    """What the bare address of this port opens: "voice-studio" or "realtime".
+
+    Docker Desktop and similar tools link a published port to its bare address.
+    Where the Gradio Voice Studio is mounted (the container), that address
+    lands on it; AUDIO_CPP_ROOT_PAGE=realtime keeps the Realtime test page
+    there instead. Without a mounted Voice Studio the Realtime page is the only
+    choice, as before.
+    """
+    if not VOICE_STUDIO_MOUNTED:
+        return "realtime"
+    choice = os.environ.get("AUDIO_CPP_ROOT_PAGE", "").strip().lower()
+    return "realtime" if choice == "realtime" else "voice-studio"
+
+
+def _redirect(request: Request, path: str) -> RedirectResponse:
+    # 307, not 301: a browser must not remember the choice after the setting changes.
+    query = request.url.query
+    return RedirectResponse(f"{path}?{query}" if query else path, status_code=307)
+
+
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+async def root_page(request: Request) -> Response:
+    if _root_page() == "voice-studio":
+        return _redirect(request, VOICE_STUDIO_PATH)
+    return FileResponse(os.path.join(HERE, "index.html"))
+
+
+@app.api_route("/voice-studio", methods=["GET", "HEAD"], include_in_schema=False)
+async def voice_studio_without_slash(request: Request) -> Response:
+    # The Gradio mount only answers below "/voice-studio/".
+    if not VOICE_STUDIO_MOUNTED:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return _redirect(request, VOICE_STUDIO_PATH)
+
+
+@app.api_route("/realtime", methods=["GET", "HEAD"], include_in_schema=False)
+@app.api_route("/realtime/", methods=["GET", "HEAD"], include_in_schema=False)
+async def realtime_page(request: Request) -> Response:
+    """A stable address for the Realtime test page, whatever "/" opens."""
+    return _redirect(request, REALTIME_PAGE_PATH)
+
+
+def _published_addresses() -> list[str]:
+    """Lines naming where this container is reachable from the host, for its log."""
+    studio = os.environ.get("AUDIO_CPP_STUDIO_PUBLIC_URL", "").strip()
+    api = os.environ.get("AUDIO_CPP_API_PUBLIC_URL", "").strip().rstrip("/")
+    lines = []
+    if VOICE_STUDIO_MOUNTED:
+        lines.append("Voice Studio: " + (studio or "http://127.0.0.1:<port published for 7860>/voice-studio/"))
+    if api:
+        lines.append(f"Speech API:   {api}/v1")
+    return lines
+
+
+@app.on_event("startup")
+async def _announce_addresses() -> None:
+    for line in _published_addresses():
+        print(line, flush=True)
+
+
+# index.html at "/" unless the route above claims it. The repo is public anyway,
+# so serving the dir is fine.
 app.mount("/", StaticFiles(directory=HERE, html=True), name="static")
