@@ -1,6 +1,6 @@
 """Regression checks for the reproducible native/offline Qwen3-TTS patch.
 
-The package is one eleven-file patch based on a pinned upstream tree.  The
+The package is one thirteen-file patch based on a pinned upstream tree.  The
 optional parity test is enabled by ``AUDIO_CPP_AUTHORITATIVE_TREE`` during
 release validation; it intentionally does not require CUDA or model assets.
 """
@@ -16,7 +16,9 @@ PATCH = Path(__file__).parents[1] / "patches" / "qwen3-native-pcm-streaming.patc
 DOCKERFILE = Path(__file__).parents[1] / "Dockerfile"
 PINNED_REV = "238ab6a9e321c17de8e120559f57efeedaeb1345"
 TOUCHED_FILES = (
+    "app/server/http.cpp",
     "app/server/runtime.cpp",
+    "include/engine/framework/runtime/cancellation.h",
     "include/engine/models/qwen3_tts/session.h",
     "include/engine/models/qwen3_tts/talker.h",
     "include/engine/models/qwen3_tts/tokenizer_speech_decoder.h",
@@ -210,7 +212,7 @@ class NativeStreamingContractTests(unittest.TestCase):
         self.assertIn("cached_graph_has_state = false", self.patch)
 
     def test_prompt_stage_timings_reach_the_event_and_the_headers(self) -> None:
-        for field in ("prompt_rows", "prompt_prefill_ms", "prompt_import_ms", "first_frame_ms"):
+        for field in ("prompt_rows", "prompt_embed_ms", "prompt_prefill_ms", "prompt_import_ms", "first_frame_ms"):
             self.assertIn(f'artifact.meta.emplace("{field}"', self.patch)
             self.assertIn(f'\\"{field}\\":', self.patch)
         for header in (
@@ -219,11 +221,70 @@ class NativeStreamingContractTests(unittest.TestCase):
             "X-AudioCPP-Talker-Ms",
             "X-AudioCPP-Decode-Ms",
             "X-AudioCPP-Prompt-Rows",
+            "X-AudioCPP-Prompt-Embed-Ms",
             "X-AudioCPP-Prompt-Prefill-Ms",
             "X-AudioCPP-Prompt-Import-Ms",
             "X-AudioCPP-First-Frame-Ms",
         ):
             self.assertIn(header, self.patch)
+
+    def test_text_projection_cost_does_not_grow_ten_ms_per_text_token(self) -> None:
+        # Upstream converted the whole projection weight on every call and
+        # summed one scalar chain per output: about 10 ms per text token on
+        # the 1.7B model, so first audio grew with the length of the text
+        # (and looked like it grew with the generation cap, which the
+        # supervisor derives from the text).
+        talker = self.patch.split("b/src/models/qwen3_tts/talker.cpp", 1)[1].split("diff --git ", 1)[0]
+        self.assertIn("+HostLinearWeights make_host_linear(", talker)
+        self.assertIn("+    weights.text_projection_fc1_host = make_host_linear(", talker)
+        self.assertIn("+    weights.text_projection_fc2_host = make_host_linear(", talker)
+        # Converted once at load (inside make_host_linear), not per call.
+        convert = 'assets::tensor_data_to_f32("Qwen3 talker host linear weight"'
+        self.assertEqual(talker.count(convert), 1)
+        self.assertLess(talker.index("+HostLinearWeights make_host_linear("), talker.index(convert))
+        self.assertLess(talker.index(convert), talker.index("+void linear_host_rows("))
+        # One independent update per output keeps each output's summation
+        # order (same values as the plain dot product) and vectorizes.
+        self.assertIn("+                    y[out] += column[out] * x;", talker)
+        self.assertIn("-                sum += weight_values[static_cast<size_t>(out * in_features + in)] *", talker)
+        self.assertIn("+        out.prompt_embed_ms = engine::debug::elapsed_ms(prompt_state_start, prompt_state_end);", talker)
+
+    def test_every_stream_block_carries_the_engines_own_label(self) -> None:
+        # seq / frames / phase let a relay tell from the first block alone
+        # that audio is produced while the talker is still generating.
+        self.assertIn('constexpr const char * kStreamBlockArtifactId = "qwen3_tts.stream_block";', self.patch)
+        self.assertIn('final_block ? "final" : emitted_blocks == 0 ? "first" : "steady"', self.patch)
+        self.assertIn("emit_pending(false);", self.patch)
+        # Only the EOS tail is final; a generation-cap exit emits no tail.
+        eos = self.patch.index("if (codes.termination == Qwen3GenerationTermination::Eos) {")
+        self.assertLess(eos, self.patch.index("emit_pending(true);"))
+        self.assertEqual(self.patch.count("emit_pending(true);"), 1)
+        self.assertIn('if (artifact.id != "qwen3_tts.stream_block") continue;', self.patch)
+        self.assertIn('",\\"seq\\":" + seq->second + ",\\"frames\\":" + frames->second +', self.patch)
+        self.assertIn('",\\"phase\\":" + json_quote(phase->second);', self.patch)
+
+    def test_a_closed_connection_stops_generation_within_one_frame(self) -> None:
+        http = self.patch.split("b/app/server/http.cpp", 1)[1].split("diff --git ", 1)[0]
+        self.assertIn("+bool socket_peer_closed(SocketHandle socket) {", http)
+        self.assertIn('+constexpr std::string_view kSpeechPath = "/v1/audio/speech";', http)
+        self.assertIn("+        const engine::runtime::ScopedCancellationProbe cancel_when_peer_closes(", http)
+        # Installed before the handler runs, so it covers the non-streamed
+        # path (generated inside handle()) and the streamed body alike.
+        self.assertLess(
+            http.index("ScopedCancellationProbe cancel_when_peer_closes("),
+            http.index(" const auto response = handler.handle(request);"),
+        )
+        talker = self.patch.split("b/src/models/qwen3_tts/talker.cpp", 1)[1].split("diff --git ", 1)[0]
+        loop = talker.index(" for (int64_t step = 0; step < max_new_tokens; ++step) {")
+        check = talker.index("+            if (runtime::cancellation_requested()) {")
+        sample = talker.index("apply_main_talker_processors(logits, config, generated_first_codes, step, repetition_penalty);")
+        self.assertLess(loop, check)
+        self.assertLess(check, sample)
+        self.assertIn("inline thread_local const CancellationProbe * active_cancellation_probe = nullptr;", self.patch)
+
+    def test_streamed_speech_has_a_send_timeout(self) -> None:
+        # A client that stops reading must fail the write, not pin the model.
+        self.assertIn("+            if (speech_request) {\n+                set_send_timeout(socket.get(), LiveIngestLimits{}.send_timeout_ms);", self.patch)
 
     def test_graph_inputs_are_uploaded_before_every_run(self) -> None:
         # The graph allocator frees an input after its last consumer and reuses

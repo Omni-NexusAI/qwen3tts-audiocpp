@@ -27,6 +27,17 @@
   native label from request metadata. Automated transport validation does not prove
   speaker-loopback suppression or human double-talk preservation; those remain
   physical microphone/output-device tests owned by the user.
+- Before headers go out the supervisor also needs proof that the engine is
+  producing blocks, reported in `X-TTS-Native-Engine-Chunk-Proof`. A request
+  that carries the lifecycle pair keeps `two-distinct-sse-delta-events`
+  exactly: two nonempty engine deltas are consumed first. Any other request
+  may release headers on the engine's own label of block 0 (`seq`, `frames`,
+  `phase` on `speech.audio.delta`): `engine-attested-first-block` when the
+  phase is `first` (emitted while the talker is still generating) and
+  `engine-attested-single-block` when it is `final` (an utterance shorter than
+  one block). A missing label, another `seq`, or a byte count that contradicts
+  `frames` falls back to two deltas. Never derive the label from request
+  fields or from HTTP read sizes.
 - audio.cpp lazy loading retains models. Use `supervisor.py` so only one model
   process/config is active; model switches must stop the old child first and
   must reject GPU-busy or insufficient-VRAM conditions before a load.
@@ -66,7 +77,21 @@
 - The speaker encoder graph must match the reference's frame count exactly.
   Its pooling averages over every graph frame, so a reused larger graph changes
   the speaker embedding and breaks seed reproducibility for that voice.
-- The engine reports `prompt_rows`, `prompt_prefill_ms`, `prompt_import_ms`,
+- The text projection runs on the host for every text token of a request.
+  Keep its weights converted once at load and the per-output update loop: it
+  vectorizes and keeps each output's summation order, so the values equal the
+  plain dot product. Upstream's per-call conversion and scalar chain cost about
+  10 ms per text token on the 1.7B model, which made first audio grow with the
+  length of the text (it looked like a cost of the generation cap, which is
+  derived from the text). `prompt_embed_ms` reports this stage.
+- A closed client connection ends generation within one talker frame on the
+  streamed and the non-streamed path: the HTTP server installs a peer-closed
+  probe for `/v1/audio/speech` and the talker asks it once per frame. Streamed
+  speech responses also get the 30 s send timeout live ingest has, so a client
+  that stops reading cannot pin the model. The probe treats a half-closed
+  request socket as gone, so a client must keep its connection open until the
+  response ends.
+- The engine reports `prompt_rows`, `prompt_embed_ms`, `prompt_prefill_ms`, `prompt_import_ms`,
   `first_frame_ms` and (streams) `stream_decoder` in `speech.generation` and as
   `X-AudioCPP-*` headers on completed responses. The supervisor relays them
   unchanged into request outcomes and response headers; they are optional so

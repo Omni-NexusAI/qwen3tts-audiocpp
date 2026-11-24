@@ -159,6 +159,7 @@ def _finish_request_outcome(request_id: str, status: str, reason: str | None = N
 # frame went, and which stream decoder produced the blocks.  Older engines do
 # not report these, so every key is optional.
 ENGINE_STAGE_TIMINGS = (
+    ("prompt_embed_ms", "promptEmbedMs", "X-AudioCPP-Prompt-Embed-Ms"),
     ("prompt_prefill_ms", "promptPrefillMs", "X-AudioCPP-Prompt-Prefill-Ms"),
     ("prompt_import_ms", "promptImportMs", "X-AudioCPP-Prompt-Import-Ms"),
     ("first_frame_ms", "firstFrameMs", "X-AudioCPP-First-Frame-Ms"),
@@ -1879,6 +1880,9 @@ async def _assert_synthesis_ready(payload: dict[str, Any]) -> str:
             status_code=422,
             detail="expected_engine_epoch and expected_supervisor_instance_id must be supplied together.",
         )
+    # Remembered for the native relay: a request that pins the lifecycle pair
+    # keeps the two-delta header proof exactly as it was.
+    payload["_lifecycle_pair_supplied"] = expected_epoch is not None
     admission_epoch = int(state.get("engineEpoch") or 0)
     if expected_epoch is not None and (
         expected_epoch != admission_epoch or expected_instance != SUPERVISOR_INSTANCE_ID
@@ -2372,11 +2376,39 @@ def _decode_native_pcm_delta(event: dict[str, Any]) -> bytes:
     return chunk
 
 
+NATIVE_CHUNK_PROOF_TWO_DELTAS = "two-distinct-sse-delta-events"
+NATIVE_CHUNK_PROOF_FIRST_BLOCK = "engine-attested-first-block"
+NATIVE_CHUNK_PROOF_SINGLE_BLOCK = "engine-attested-single-block"
+
+
+def _attested_block_proof(event: dict[str, Any], chunk: bytes) -> str | None:
+    """Name the proof the engine's own label on a first delta carries, if any.
+
+    A newer engine labels every streamed block with `seq`, `frames` and
+    `phase`.  Block 0 in phase `first` was emitted while the talker was still
+    generating; block 0 in phase `final` is a whole utterance shorter than one
+    block.  A missing label (older engine), another block, or a byte count
+    that contradicts `frames` proves nothing, and the caller then waits for a
+    second delta as before.
+    """
+    seq, frames, phase = event.get("seq"), event.get("frames"), event.get("phase")
+    if isinstance(seq, bool) or isinstance(frames, bool) or not isinstance(frames, int):
+        return None
+    if seq != 0 or frames <= 0 or len(chunk) != frames * 1920 * 2:
+        return None
+    if phase == "first":
+        return NATIVE_CHUNK_PROOF_FIRST_BLOCK
+    if phase == "final":
+        return NATIVE_CHUNK_PROOF_SINGLE_BLOCK
+    return None
+
+
 async def _prefetch_native_pcm_proof(
     lines: Any,
     *,
     verified_decode_mode: str,
     minimum_chunks: int = 2,
+    attested: dict[str, str] | None = None,
 ) -> list[tuple[bytes, float]]:
     """Require genuine engine delta boundaries before committing headers.
 
@@ -2385,6 +2417,10 @@ async def _prefetch_native_pcm_proof(
     reads.  This preflight consumes two *decoded* nonempty speech.audio.delta
     events from the same iterator, buffers them once, and lets the relay emit
     those exact bytes exactly once.
+
+    When the caller passes `attested`, a first delta that carries the engine's
+    own block label is enough: the proof name is stored under `proof` and the
+    headers can go out one block earlier.
     """
 
     prefetched: list[tuple[bytes, float]] = []
@@ -2456,6 +2492,11 @@ async def _prefetch_native_pcm_proof(
         chunk = _decode_native_pcm_delta(event)
         if chunk:
             prefetched.append((chunk, time.monotonic()))
+            if attested is not None and len(prefetched) == 1:
+                proof = _attested_block_proof(event, chunk)
+                if proof is not None:
+                    attested["proof"] = proof
+                    return prefetched
     return prefetched
 
 
@@ -2789,6 +2830,9 @@ async def _native_clone_pcm_response(
     if not raw:
         raise HTTPException(status_code=400, detail="A Base clone reference WAV is required.")
     internal_warmup = bool(payload.get("_internal_warmup"))
+    # Only requests that do not pin the lifecycle pair may release headers on
+    # the engine's label of the first block.
+    attested_proof: dict[str, str] | None = None if payload.get("_lifecycle_pair_supplied") else {}
     engine_payload = dict(payload)
     tuning_snapshot = _apply_engine_tuning(engine_payload)
     delivery_mode = "native-incremental-pcm"
@@ -2935,6 +2979,7 @@ async def _native_clone_pcm_response(
             _prefetch_native_pcm_proof(
                 stream_lines,
                 verified_decode_mode=verified_decode_mode,
+                attested=attested_proof,
             ),
             request=request,
             stage="incremental-pcm-proof",
@@ -3235,10 +3280,11 @@ async def _native_clone_pcm_response(
             # engine-owned speech.decode_mode event from this response.
             "X-TTS-Streaming-Mode": "native-incremental-pcm",
             "X-TTS-Decoder-Mode": verified_decode_mode,
-            # This proof is generated only after the supervisor consumes two
-            # nonempty engine speech.audio.delta SSE events. Downstream HTTP
-            # read sizes are explicitly not part of the native proof.
-            "X-TTS-Native-Engine-Chunk-Proof": "two-distinct-sse-delta-events",
+            # Two nonempty engine speech.audio.delta SSE events, or one that
+            # the engine itself labelled as block 0 of a running generation
+            # (never for a request that pinned the lifecycle pair). Downstream
+            # HTTP read sizes are explicitly not part of the native proof.
+            "X-TTS-Native-Engine-Chunk-Proof": (attested_proof or {}).get("proof", NATIVE_CHUNK_PROOF_TWO_DELTAS),
             "X-TTS-Native-Preheader-Proof-First-PCM-Ms": str(
                 preheader_proof_metrics["preheaderProofFirstPcmMs"]
             ),

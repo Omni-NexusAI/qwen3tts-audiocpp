@@ -23,9 +23,10 @@ class EngineStageTelemetryTests(unittest.TestCase):
             **BASE_EVENT,
             "prompt_ms": 3.5, "prefill_ms": 2.0, "talker_ms": 1500.0, "decode_ms": 240.0,
             "prompt_rows": 231, "prompt_prefill_ms": 140.25, "prompt_import_ms": 31.5,
-            "first_frame_ms": 190.0, "stream_decoder": "offline-matched",
+            "prompt_embed_ms": 21.75, "first_frame_ms": 190.0, "stream_decoder": "offline-matched",
         })
         self.assertEqual(fields["promptRows"], 231)
+        self.assertEqual(fields["promptEmbedMs"], 21.75)
         self.assertEqual(fields["promptPrefillMs"], 140.25)
         self.assertEqual(fields["promptImportMs"], 31.5)
         self.assertEqual(fields["firstFrameMs"], 190.0)
@@ -65,9 +66,11 @@ class EngineStageTelemetryTests(unittest.TestCase):
         )
 
     def test_stage_fields_are_stored_in_outcomes_and_relayed_as_headers(self) -> None:
-        for key in ("promptRows", "promptPrefillMs", "promptImportMs", "firstFrameMs", "streamDecoder"):
+        for key in ("promptRows", "promptEmbedMs", "promptPrefillMs", "promptImportMs", "firstFrameMs",
+                    "streamDecoder"):
             self.assertIn(key, supervisor.ENGINE_STAGE_OUTCOME_KEYS)
         for header in ("X-AudioCPP-Generated-Frames", "X-AudioCPP-Termination", "X-AudioCPP-Prompt-Rows",
+                       "X-AudioCPP-Prompt-Embed-Ms",
                        "X-AudioCPP-Prompt-Prefill-Ms", "X-AudioCPP-First-Frame-Ms", "X-AudioCPP-Talker-Ms"):
             self.assertIn(header, supervisor.ENGINE_RELAYED_HEADERS)
 

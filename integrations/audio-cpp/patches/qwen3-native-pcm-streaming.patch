@@ -1,8 +1,95 @@
+diff --git a/app/server/http.cpp b/app/server/http.cpp
+index 304864f..9b3c191 100644
+--- a/app/server/http.cpp
++++ b/app/server/http.cpp
+@@ -1,6 +1,7 @@
+ #include "http.h"
+ 
+ #include "engine/framework/io/json.h"
++#include "engine/framework/runtime/cancellation.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -172,6 +173,56 @@ void set_send_timeout(SocketHandle socket, int timeout_ms) {
+ #endif
+ }
+ 
++// True once the peer has closed the connection (or it has failed).  A speech
++// request is one JSON body followed by silence from the client, so a readable
++// socket that yields no byte means the client is gone.  Never blocks.
++bool socket_peer_closed(SocketHandle socket) {
++#ifdef _WIN32
++    fd_set read_set;
++    FD_ZERO(&read_set);
++    FD_SET(socket, &read_set);
++    timeval no_wait{};
++    if (select(0, &read_set, nullptr, nullptr, &no_wait) <= 0) {
++        return false;
++    }
++    char byte = 0;
++    const int received = recv(socket, &byte, 1, MSG_PEEK);
++    if (received == 0) {
++        return true;
++    }
++    if (received < 0) {
++        const int error = WSAGetLastError();
++        return error != WSAEWOULDBLOCK && error != WSAEINTR;
++    }
++    return false;
++#else
++    pollfd probe{};
++    probe.fd = socket;
++    probe.events = POLLIN;
++    if (poll(&probe, 1, 0) <= 0) {
++        return false;
++    }
++    if ((probe.revents & (POLLERR | POLLNVAL)) != 0) {
++        return true;
++    }
++    char byte = 0;
++    const ssize_t received = recv(socket, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
++    if (received == 0) {
++        return true;
++    }
++    if (received < 0) {
++        return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
++    }
++    return false;
++#endif
++}
++
++// Speech synthesis holds a model for the whole request.  On this route a
++// closed connection stops generation (the talker asks once per frame), and a
++// client that stops reading a streamed response fails the write instead of
++// pinning the model.
++constexpr std::string_view kSpeechPath = "/v1/audio/speech";
++
+ // The one endpoint that consumes its body incrementally. Gating on the path as
+ // well as the encoding keeps every other endpoint's request handling bit-for-bit
+ // unchanged, instead of silently altering how any chunked request is read.
+@@ -746,8 +797,17 @@ void handle_client(SocketHandle client, IHttpHandler & handler, uint64_t max_req
+         if (incremental_body) {
+             request.body_stream = &body_stream;
+         }
++        const bool speech_request = request.path == kSpeechPath;
++        const engine::runtime::ScopedCancellationProbe cancel_when_peer_closes(
++            speech_request
++                ? engine::runtime::CancellationProbe(
++                    [handle = socket.get()]() { return socket_peer_closed(handle); })
++                : engine::runtime::CancellationProbe());
+         const auto response = handler.handle(request);
+         if (response.stream_body) {
++            if (speech_request) {
++                set_send_timeout(socket.get(), LiveIngestLimits{}.send_timeout_ms);
++            }
+             send_all(socket.get(), serialize_stream_headers(response));
+             ChunkedHttpStreamWriter writer(socket.get());
+             try {
 diff --git a/app/server/runtime.cpp b/app/server/runtime.cpp
-index 33027e9..b22a01d 100644
+index 33027e9..47be240 100644
 --- a/app/server/runtime.cpp
 +++ b/app/server/runtime.cpp
-@@ -404,6 +404,104 @@ std::unordered_map<std::string, std::string> timing_headers(
+@@ -404,6 +404,129 @@ std::unordered_map<std::string, std::string> timing_headers(
      };
  }
  
@@ -29,6 +116,28 @@ index 33027e9..b22a01d 100644
 +    return qwen3_decode_mode_artifact(event.output_artifacts);
 +}
 +
++// The Qwen session labels each streamed PCM block (see attach_stream_block).
++// Returns the JSON members to append to that block's speech.audio.delta, or an
++// empty string when the session sent no label.
++std::string qwen3_stream_block_json(const engine::runtime::StreamEvent & event) {
++    for (const auto & artifact : event.output_artifacts) {
++        if (artifact.id != "qwen3_tts.stream_block") continue;
++        const auto seq = artifact.meta.find("seq");
++        const auto frames = artifact.meta.find("frames");
++        const auto phase = artifact.meta.find("phase");
++        if (seq == artifact.meta.end() || frames == artifact.meta.end() || phase == artifact.meta.end()) {
++            return {};
++        }
++        const auto digits = [](const std::string & value) {
++            return !value.empty() && value.find_first_not_of("0123456789") == std::string::npos;
++        };
++        if (!digits(seq->second) || !digits(frames->second)) return {};
++        return ",\"seq\":" + seq->second + ",\"frames\":" + frames->second +
++            ",\"phase\":" + json_quote(phase->second);
++    }
++    return {};
++}
++
 +void attach_qwen3_decode_mode_header(
 +    HttpResponse & response,
 +    const engine::runtime::TaskResult & result) {
@@ -47,6 +156,7 @@ index 33027e9..b22a01d 100644
 +    std::string decoder_ms;
 +    // Stage detail added later; absent on older artifacts.
 +    std::string prompt_rows = "0";
++    std::string prompt_embed_ms = "0";
 +    std::string prompt_prefill_ms = "0";
 +    std::string prompt_import_ms = "0";
 +    std::string first_frame_ms = "0";
@@ -76,6 +186,7 @@ index 33027e9..b22a01d 100644
 +            if (found != artifact.meta.end()) out = found->second;
 +        };
 +        optional_meta("prompt_rows", telemetry.prompt_rows);
++        optional_meta("prompt_embed_ms", telemetry.prompt_embed_ms);
 +        optional_meta("prompt_prefill_ms", telemetry.prompt_prefill_ms);
 +        optional_meta("prompt_import_ms", telemetry.prompt_import_ms);
 +        optional_meta("first_frame_ms", telemetry.first_frame_ms);
@@ -99,6 +210,7 @@ index 33027e9..b22a01d 100644
 +    response.headers.emplace("X-AudioCPP-Talker-Ms", telemetry->talker_ms);
 +    response.headers.emplace("X-AudioCPP-Decode-Ms", telemetry->decoder_ms);
 +    response.headers.emplace("X-AudioCPP-Prompt-Rows", telemetry->prompt_rows);
++    response.headers.emplace("X-AudioCPP-Prompt-Embed-Ms", telemetry->prompt_embed_ms);
 +    response.headers.emplace("X-AudioCPP-Prompt-Prefill-Ms", telemetry->prompt_prefill_ms);
 +    response.headers.emplace("X-AudioCPP-Prompt-Import-Ms", telemetry->prompt_import_ms);
 +    response.headers.emplace("X-AudioCPP-First-Frame-Ms", telemetry->first_frame_ms);
@@ -107,7 +219,7 @@ index 33027e9..b22a01d 100644
  std::string task_result_json_with_timing(
      const engine::runtime::TaskResult & result,
      const std::string & timing) {
-@@ -1017,15 +1115,20 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
+@@ -1017,15 +1140,20 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
      const auto wav = encode_pcm16_wav(audio);
      const auto response_format = engine::io::json::optional_string(body, "response_format", "wav");
      if (response_format == "json" || response_format == "b64_json") {
@@ -129,7 +241,7 @@ index 33027e9..b22a01d 100644
      return response;
  }
  
-@@ -1047,12 +1150,30 @@ HttpResponse ServerState::handle_speech_stream(
+@@ -1047,12 +1175,30 @@ HttpResponse ServerState::handle_speech_stream(
  
      const auto busy_timeout_ms = parse_busy_timeout_override(body);
      LoadedModel * model_ptr = &model;
@@ -161,7 +273,23 @@ index 33027e9..b22a01d 100644
                  std::vector<engine::runtime::AudioBuffer> buffers;
                  if (event.audio_output.has_value()) {
                      buffers.push_back(*event.audio_output);
-@@ -1074,11 +1195,44 @@ HttpResponse ServerState::handle_speech_stream(
+@@ -1060,12 +1206,15 @@ HttpResponse ServerState::handle_speech_stream(
+                 for (const auto & named : event.named_audio_outputs) {
+                     buffers.push_back(named.audio);
+                 }
++                // One Qwen event carries one PCM block and its label.
++                const std::string block = buffers.size() == 1 ? qwen3_stream_block_json(event) : std::string();
+                 for (const auto & audio : buffers) {
+                     const auto pcm = encode_pcm16_samples(audio);
+                     write_sse(
+                         writer,
+                         "{\"type\":\"speech.audio.delta\",\"audio\":" +
+                             json_quote(base64_encode(pcm)) +
++                            block +
+                             "}");
+                     wrote_audio = true;
+                 }
+@@ -1074,11 +1223,45 @@ HttpResponse ServerState::handle_speech_stream(
          if (!wrote_audio) {
              throw std::runtime_error("streaming speech model produced no audio delta events");
          }
@@ -188,6 +316,7 @@ index 33027e9..b22a01d 100644
 +                    ",\"talker_ms\":" + generation->talker_ms +
 +                    ",\"decode_ms\":" + generation->decoder_ms +
 +                    ",\"prompt_rows\":" + generation->prompt_rows +
++                    ",\"prompt_embed_ms\":" + generation->prompt_embed_ms +
 +                    ",\"prompt_prefill_ms\":" + generation->prompt_prefill_ms +
 +                    ",\"prompt_import_ms\":" + generation->prompt_import_ms +
 +                    ",\"first_frame_ms\":" + generation->first_frame_ms +
@@ -210,6 +339,59 @@ index 33027e9..b22a01d 100644
          write_sse_done(writer);
      };
      if (stream_format == "sse") {
+diff --git a/include/engine/framework/runtime/cancellation.h b/include/engine/framework/runtime/cancellation.h
+new file mode 100644
+index 0000000..848ea9f
+--- /dev/null
++++ b/include/engine/framework/runtime/cancellation.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <functional>
++#include <stdexcept>
++#include <utility>
++
++namespace engine::runtime {
++
++// Lets the code that owns a request (the HTTP server) tell a long model loop
++// that nobody is waiting for the result any more.  The probe belongs to the
++// thread that runs the model, so no session interface has to carry it.  A loop
++// that never asks is unaffected.
++using CancellationProbe = std::function<bool()>;
++
++namespace detail {
++inline thread_local const CancellationProbe * active_cancellation_probe = nullptr;
++}
++
++class ScopedCancellationProbe {
++public:
++    explicit ScopedCancellationProbe(CancellationProbe probe)
++        : probe_(std::move(probe)),
++          previous_(detail::active_cancellation_probe) {
++        detail::active_cancellation_probe = probe_ ? &probe_ : nullptr;
++    }
++    ~ScopedCancellationProbe() {
++        detail::active_cancellation_probe = previous_;
++    }
++    ScopedCancellationProbe(const ScopedCancellationProbe &) = delete;
++    ScopedCancellationProbe & operator=(const ScopedCancellationProbe &) = delete;
++
++private:
++    CancellationProbe probe_;
++    const CancellationProbe * previous_ = nullptr;
++};
++
++inline bool cancellation_requested() {
++    const auto * probe = detail::active_cancellation_probe;
++    return probe != nullptr && (*probe)();
++}
++
++class RequestCancelled : public std::runtime_error {
++public:
++    using std::runtime_error::runtime_error;
++};
++
++}  // namespace engine::runtime
 diff --git a/include/engine/models/qwen3_tts/session.h b/include/engine/models/qwen3_tts/session.h
 index be6213c..3c22d7c 100644
 --- a/include/engine/models/qwen3_tts/session.h
@@ -267,7 +449,7 @@ index be6213c..3c22d7c 100644
  
  }  // namespace engine::models::qwen3_tts
 diff --git a/include/engine/models/qwen3_tts/talker.h b/include/engine/models/qwen3_tts/talker.h
-index 70ca372..7fd869c 100644
+index 70ca372..5118ee5 100644
 --- a/include/engine/models/qwen3_tts/talker.h
 +++ b/include/engine/models/qwen3_tts/talker.h
 @@ -6,6 +6,7 @@
@@ -298,7 +480,7 @@ index 70ca372..7fd869c 100644
  struct Qwen3TalkerPrefill {
      Qwen3TalkerPromptMode prompt_mode = Qwen3TalkerPromptMode::VoiceClone;
      std::vector<int32_t> input_ids;
-@@ -30,11 +44,24 @@ struct Qwen3TalkerPrefill {
+@@ -30,11 +44,26 @@ struct Qwen3TalkerPrefill {
      std::string language = "Auto";
      bool icl_mode = false;
      bool x_vector_only_mode = false;
@@ -314,16 +496,18 @@ index 70ca372..7fd869c 100644
 +    Qwen3GenerationTermination termination = Qwen3GenerationTermination::MaxGeneratedFrames;
 +    int64_t generation_cap = 0;
 +    // Where the time before the first generated frame went.  `prompt_rows` is
-+    // the prompt length; the prefill time is zero when the same prompt was
-+    // prefilled by the previous request.
++    // the prompt length; `prompt_embed_ms` is the host work that builds the
++    // prompt rows (it grows with the request text); the prefill time is zero
++    // when the same prompt was prefilled by the previous request.
 +    int64_t prompt_rows = 0;
++    double prompt_embed_ms = 0.0;
 +    double prompt_prefill_ms = 0.0;
 +    double prompt_import_ms = 0.0;
 +    double first_frame_ms = 0.0;
  };
  
  class Qwen3TalkerWeightsRuntime;
-@@ -42,6 +69,12 @@ class Qwen3TalkerStepRuntime;
+@@ -42,6 +71,12 @@ class Qwen3TalkerStepRuntime;
  
  class Qwen3TalkerStepRuntime {
  public:
@@ -336,7 +520,7 @@ index 70ca372..7fd869c 100644
      class Impl;
      explicit Qwen3TalkerStepRuntime(std::unique_ptr<Impl> impl);
      ~Qwen3TalkerStepRuntime();
-@@ -49,7 +82,8 @@ public:
+@@ -49,7 +84,8 @@ public:
      Qwen3TalkerCodes generate(
          const Qwen3TalkerPrefill & prefill,
          const Qwen3TTSGenerationOptions & options,
@@ -346,7 +530,7 @@ index 70ca372..7fd869c 100644
      int64_t release_cached_step_graph();
  
  private:
-@@ -76,7 +110,8 @@ public:
+@@ -76,7 +112,8 @@ public:
      std::shared_ptr<Qwen3TalkerStepRuntime> create_step_runtime(
          std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
          int64_t prompt_capacity,
@@ -465,10 +649,10 @@ index 8077210..bbc390d 100644
          throw std::runtime_error("Qwen3 voice design model only supports the VoiceDesign task");
      }
 diff --git a/src/models/qwen3_tts/session.cpp b/src/models/qwen3_tts/session.cpp
-index 970aed6..f46b937 100644
+index 970aed6..87d4673 100644
 --- a/src/models/qwen3_tts/session.cpp
 +++ b/src/models/qwen3_tts/session.cpp
-@@ -18,6 +18,140 @@ namespace {
+@@ -18,6 +18,158 @@ namespace {
  
  using Clock = std::chrono::steady_clock;
  constexpr int64_t kDefaultTextChunkSize = 8192;
@@ -478,6 +662,7 @@ index 970aed6..f46b937 100644
 +constexpr const char * kDecodeModeArtifactId = "qwen3_tts.decode_mode";
 +constexpr const char * kMaxGeneratedFramesOption = "qwen3_tts.max_generated_frames";
 +constexpr const char * kGenerationArtifactId = "qwen3_tts.generation";
++constexpr const char * kStreamBlockArtifactId = "qwen3_tts.stream_block";
 +constexpr const char * kStreamDecoderOption = "qwen3_tts.stream_decoder";
 +constexpr const char * kOfflineMatchedStreamDecoder = "offline_matched";
 +constexpr const char * kWindowedStreamDecoder = "windowed";
@@ -519,6 +704,7 @@ index 970aed6..f46b937 100644
 +
 +struct TalkerStageTimings {
 +    int64_t prompt_rows = 0;
++    double prompt_embed_ms = 0.0;
 +    double prompt_prefill_ms = 0.0;
 +    double prompt_import_ms = 0.0;
 +    double first_frame_ms = 0.0;
@@ -528,6 +714,7 @@ index 970aed6..f46b937 100644
 +            first_frame_ms = codes.first_frame_ms;
 +        }
 +        prompt_rows = std::max(prompt_rows, codes.prompt_rows);
++        prompt_embed_ms += codes.prompt_embed_ms;
 +        prompt_prefill_ms += codes.prompt_prefill_ms;
 +        prompt_import_ms += codes.prompt_import_ms;
 +    }
@@ -582,6 +769,7 @@ index 970aed6..f46b937 100644
 +    artifact.meta.emplace("talker_ms", std::to_string(talker_ms));
 +    artifact.meta.emplace("decoder_ms", std::to_string(decoder_ms));
 +    artifact.meta.emplace("prompt_rows", std::to_string(stages.prompt_rows));
++    artifact.meta.emplace("prompt_embed_ms", std::to_string(stages.prompt_embed_ms));
 +    artifact.meta.emplace("prompt_prefill_ms", std::to_string(stages.prompt_prefill_ms));
 +    artifact.meta.emplace("prompt_import_ms", std::to_string(stages.prompt_import_ms));
 +    artifact.meta.emplace("first_frame_ms", std::to_string(stages.first_frame_ms));
@@ -606,10 +794,24 @@ index 970aed6..f46b937 100644
 +    artifact.meta.emplace("mode", mode);
 +    event.output_artifacts.push_back(std::move(artifact));
 +}
++
++// Every streamed PCM block says which block it is.  `first` and `steady`
++// blocks are emitted while the talker is still generating; `final` is the
++// tail after EOS.  A relay can therefore tell from the first block alone that
++// the audio is being produced incrementally.
++void attach_stream_block(runtime::StreamEvent & event, int64_t seq, int64_t frames, const char * phase) {
++    runtime::VoiceArtifact artifact;
++    artifact.kind = runtime::ArtifactKind::Custom;
++    artifact.id = kStreamBlockArtifactId;
++    artifact.meta.emplace("seq", std::to_string(seq));
++    artifact.meta.emplace("frames", std::to_string(frames));
++    artifact.meta.emplace("phase", phase);
++    event.output_artifacts.push_back(std::move(artifact));
++}
  
  std::shared_ptr<const Qwen3TTSAssets> require_assets(std::shared_ptr<const Qwen3TTSAssets> assets) {
      if (assets == nullptr) {
-@@ -37,6 +171,9 @@ Qwen3TTSGenerationOptions generation_options_from_request(
+@@ -37,6 +189,9 @@ Qwen3TTSGenerationOptions generation_options_from_request(
          }
          options.max_new_tokens = *value;
      }
@@ -619,7 +821,7 @@ index 970aed6..f46b937 100644
      if (const auto value = runtime::find_option(request.options, {"do_sample"})) {
          options.do_sample = runtime::parse_bool_option(*value, "do_sample");
      }
-@@ -98,6 +235,19 @@ uint64_t hash_audio_samples(const runtime::AudioBuffer & audio) {
+@@ -98,6 +253,19 @@ uint64_t hash_audio_samples(const runtime::AudioBuffer & audio) {
      return hash;
  }
  
@@ -639,7 +841,7 @@ index 970aed6..f46b937 100644
  core::BackendConfig voice_prompt_backend_config(const runtime::SessionOptions & options) {
      core::BackendConfig config = options.backend;
      // Voice-clone prompt codes are discrete argmax outputs; keep this stage on CPU so CUDA TF32 math
-@@ -148,6 +298,19 @@ std::size_t voice_prompt_cache_slots_from_options(const runtime::SessionOptions
+@@ -148,6 +316,19 @@ std::size_t voice_prompt_cache_slots_from_options(const runtime::SessionOptions
      return static_cast<std::size_t>(slots);
  }
  
@@ -659,7 +861,7 @@ index 970aed6..f46b937 100644
  void validate_talker_weight_storage(engine::assets::TensorStorageType storage_type) {
      if (storage_type == engine::assets::TensorStorageType::Native ||
          storage_type == engine::assets::TensorStorageType::F32 ||
-@@ -200,6 +363,7 @@ Qwen3TTSSession::Qwen3TTSSession(
+@@ -200,6 +381,7 @@ Qwen3TTSSession::Qwen3TTSSession(
        task_(task),
        assets_(require_assets(std::move(assets))),
        mem_saver_(mem_saver_from_options(options)),
@@ -667,7 +869,7 @@ index 970aed6..f46b937 100644
        perf_mode_(perf_mode_from_options(options)),
        text_tokenizer_(assets_),
        talker_(assets_->config.talker),
-@@ -261,6 +425,7 @@ Qwen3TTSSession::Qwen3TTSSession(
+@@ -261,6 +443,7 @@ Qwen3TTSSession::Qwen3TTSSession(
              key != "qwen3_tts.speech_encoder_weight_type" &&
              key != "qwen3_tts.speech_decoder_weight_type" &&
              key != "qwen3_tts.voice_prompt_cache_slots" &&
@@ -675,7 +877,7 @@ index 970aed6..f46b937 100644
              key != "qwen3_tts.perf_mode" &&
              key != "qwen3_tts.mem_saver") {
              throw std::runtime_error("unknown Qwen3 TTS session option: " + key);
-@@ -279,7 +444,8 @@ Qwen3TTSSession::Qwen3TTSSession(
+@@ -279,7 +462,8 @@ Qwen3TTSSession::Qwen3TTSSession(
      talker_step_ = talker_.create_step_runtime(
          talker_weights_,
          assets_->config.talker.max_position_embeddings,
@@ -685,7 +887,7 @@ index 970aed6..f46b937 100644
      speech_decoder_ = std::make_unique<Qwen3SpeechTokenizerDecoderRuntime>(
          assets_,
          execution_context(),
-@@ -288,8 +454,8 @@ Qwen3TTSSession::Qwen3TTSSession(
+@@ -288,8 +472,8 @@ Qwen3TTSSession::Qwen3TTSSession(
          speech_decoder_weight_storage_type_,
          conv_weight_storage_type_,
          perf_mode_);
@@ -696,7 +898,7 @@ index 970aed6..f46b937 100644
      }
      if (assets_->config.variant == Qwen3TTSVariant::Base && task_.task != runtime::VoiceTaskKind::Tts) {
          throw std::runtime_error("Qwen3 base TTS model only supports the Tts task");
-@@ -300,6 +466,9 @@ Qwen3TTSSession::Qwen3TTSSession(
+@@ -300,6 +484,9 @@ Qwen3TTSSession::Qwen3TTSSession(
      if (assets_->config.variant == Qwen3TTSVariant::CustomVoice && task_.task != runtime::VoiceTaskKind::Tts) {
          throw std::runtime_error("Qwen3 custom voice model only supports the Tts task");
      }
@@ -706,7 +908,7 @@ index 970aed6..f46b937 100644
      if (assets_->config.variant == Qwen3TTSVariant::Base) {
          speech_encoder_ = std::make_unique<Qwen3SpeechTokenizerEncoderRuntime>(
              assets_,
-@@ -333,9 +502,298 @@ void Qwen3TTSSession::prepare(const runtime::SessionPreparationRequest & request
+@@ -333,9 +520,302 @@ void Qwen3TTSSession::prepare(const runtime::SessionPreparationRequest & request
      mark_prepared();
  }
  
@@ -872,10 +1074,11 @@ index 970aed6..f46b937 100644
 +        dst.codes.insert(dst.codes.end(), src.codes.begin(), src.codes.end());
 +        dst.frames += src.frames;
 +    };
-+    const auto emit_pending = [&]() {
++    const auto emit_pending = [&](bool final_block) {
 +        if (pending.frames == 0) {
 +            return;
 +        }
++        const int64_t block_frames = pending.frames;
 +        runtime::AudioBuffer audio;
 +        const auto decoder_start = Clock::now();
 +        if (stream_decoder == Qwen3StreamDecoder::OfflineMatched) {
@@ -916,6 +1119,9 @@ index 970aed6..f46b937 100644
 +            // first PCM delta. It is proof of the actual session mode, not a
 +            // supervisor inference from request metadata.
 +            attach_decode_mode(event, "native-incremental-pcm");
++            attach_stream_block(
++                event, emitted_blocks, block_frames,
++                final_block ? "final" : emitted_blocks == 0 ? "first" : "steady");
 +            event.audio_output = std::move(audio);
 +            stream_event_sink_(event);
 +        }
@@ -936,7 +1142,7 @@ index 970aed6..f46b937 100644
 +                    append_codes(pending, frame);
 +                    const int64_t target = emitted_first_block ? steady_block_frames : first_block_frames;
 +                    if (pending.frames >= target) {
-+                        emit_pending();
++                        emit_pending(false);
 +                    }
 +                });
 +        } catch (...) {
@@ -951,7 +1157,7 @@ index 970aed6..f46b937 100644
 +    const double talker_ms = engine::debug::elapsed_ms(talker_start, Clock::now());
 +    // Only EOS has a valid final causal tail. A generation-cap exit is not complete.
 +    if (codes.termination == Qwen3GenerationTermination::Eos) {
-+        emit_pending();
++        emit_pending(true);
 +    } else {
 +        pending.codes.clear();
 +        pending.frames = 0;
@@ -1005,7 +1211,7 @@ index 970aed6..f46b937 100644
      auto release_talker_cached_step_graph = [&]() {
          if (mem_saver_) {
              const auto release_start = Clock::now();
-@@ -436,13 +894,28 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
+@@ -436,13 +916,28 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
      double talker_ms = 0.0;
      double decoder_ms = 0.0;
      runtime::AudioBuffer merged_audio;
@@ -1036,7 +1242,7 @@ index 970aed6..f46b937 100644
          prefill_ms += engine::debug::elapsed_ms(prefill_start, Clock::now());
          if (!voice_prompt.reference_codes.has_value()) {
              throw std::runtime_error("Qwen3 base TTS talker currently requires ICL reference codes");
-@@ -453,6 +926,19 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
+@@ -453,6 +948,19 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
              qwen_request.generation,
              qwen_request.generation.repetition_penalty);
          talker_ms += engine::debug::elapsed_ms(talker_start, Clock::now());
@@ -1056,7 +1262,7 @@ index 970aed6..f46b937 100644
          const auto decoder_start = Clock::now();
          runtime::append_audio_buffer(
              merged_audio,
-@@ -464,6 +950,18 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
+@@ -464,6 +972,18 @@ runtime::TaskResult Qwen3TTSSession::run(const runtime::TaskRequest & request) {
      release_talker_cached_step_graph();
      runtime::TaskResult result;
      result.audio_output = std::move(merged_audio);
@@ -1094,18 +1300,52 @@ index 45183b5..4033aff 100644
  
      std::vector<float> run(const audio::AudioTensor & features) {
 diff --git a/src/models/qwen3_tts/talker.cpp b/src/models/qwen3_tts/talker.cpp
-index 5bad35c..3365239 100644
+index 5bad35c..71af7ae 100644
 --- a/src/models/qwen3_tts/talker.cpp
 +++ b/src/models/qwen3_tts/talker.cpp
-@@ -12,6 +12,7 @@
+@@ -11,7 +11,9 @@
+ #include "engine/framework/modules/primitive_modules.h"
  #include "engine/framework/modules/structural_modules.h"
  #include "engine/framework/modules/weight_binding.h"
++#include "engine/framework/runtime/cancellation.h"
  #include "engine/framework/runtime/kv_cache.h"
 +#include "engine/framework/runtime/cache_slots.h"
  #include "engine/framework/sampling/torch_random.h"
  
  #include "engine/framework/core/constant_tensor_cache.h"
-@@ -100,6 +101,69 @@ struct PromptEmbeddingState {
+@@ -29,6 +31,7 @@
+ #include <random>
+ #include <stdexcept>
+ #include <string>
++#include <thread>
+ #include <unordered_set>
+ #include <utility>
+ #include <vector>
+@@ -81,6 +84,14 @@ struct CodePredictorWeights {
+     std::optional<GraphLinearTensorWeights> small_to_mtp_projection;
+ };
+ 
++// A linear layer kept on the host as F32, one input column per contiguous run.
++struct HostLinearWeights {
++    int64_t in_features = 0;
++    int64_t out_features = 0;
++    std::vector<float> columns;
++    std::vector<float> bias;
++};
++
+ struct Qwen3TalkerWeights {
+     std::shared_ptr<core::BackendWeightStore> store;
+     assets::TensorData codec_embedding;
+@@ -89,6 +100,8 @@ struct Qwen3TalkerWeights {
+     assets::TensorData text_embedding;
+     LinearTensorWeights text_projection_fc1;
+     LinearTensorWeights text_projection_fc2;
++    HostLinearWeights text_projection_fc1_host;
++    HostLinearWeights text_projection_fc2_host;
+     std::vector<TalkerLayerWeights> layers;
+     assets::TensorDataF32 norm;
+     core::TensorValue codec_head;
+@@ -100,6 +113,69 @@ struct PromptEmbeddingState {
      std::vector<float> tts_pad;
  };
  
@@ -1175,7 +1415,7 @@ index 5bad35c..3365239 100644
  bool speech_codes_equal(const Qwen3SpeechCodes & lhs, const Qwen3SpeechCodes & rhs) {
      return lhs.frames == rhs.frames &&
             lhs.code_groups == rhs.code_groups &&
-@@ -117,10 +181,11 @@ bool talker_prefill_equal(const Qwen3TalkerPrefill & lhs, const Qwen3TalkerPrefi
+@@ -117,10 +193,11 @@ bool talker_prefill_equal(const Qwen3TalkerPrefill & lhs, const Qwen3TalkerPrefi
          lhs.instruct_ids != rhs.instruct_ids ||
          lhs.reference_ids != rhs.reference_ids ||
          lhs.speaker != rhs.speaker ||
@@ -1191,7 +1431,147 @@ index 5bad35c..3365239 100644
          lhs.speaker_embedding.has_value() != rhs.speaker_embedding.has_value()) {
          return false;
      }
-@@ -394,14 +459,143 @@ std::vector<float> repeat_row(const std::vector<float> & row, int64_t repeats) {
+@@ -271,30 +348,107 @@ float silu(float value) {
+     return value / (1.0F + std::exp(-value));
+ }
+ 
+-std::vector<float> linear_host(
+-    const std::vector<float> & input,
+-    int64_t rows,
+-    int64_t in_features,
+-    const LinearTensorWeights & weights) {
++// The text projection runs on the host for every text token of every request.
++// The weight is converted once at load and stored one input column at a time,
++// so the inner loop updates every output independently: it vectorizes, and
++// each output still adds its terms in the same order as a plain dot product,
++// so the values do not change.  The original code converted the whole weight
++// on each call and summed one scalar chain per output (about 10 ms per text
++// token on the 1.7B model, which is what made first audio grow with the text).
++HostLinearWeights make_host_linear(const LinearTensorWeights & weights, int64_t in_features) {
+     if (weights.weight.shape.dims[0] <= 0 || weights.weight.shape.dims[1] != in_features) {
+         throw std::runtime_error("Qwen3 talker host linear weight shape mismatch");
+     }
+-    const int64_t out_features = weights.weight.shape.dims[0];
++    HostLinearWeights out;
++    out.in_features = in_features;
++    out.out_features = weights.weight.shape.dims[0];
+     const auto weight_values = assets::tensor_data_to_f32("Qwen3 talker host linear weight", weights.weight);
+-    const auto bias_values = weights.bias.has_value()
+-        ? assets::tensor_data_to_f32("Qwen3 talker host linear bias", *weights.bias)
+-        : std::vector<float>{};
+-    std::vector<float> output(static_cast<size_t>(rows * out_features), 0.0F);
+-    for (int64_t row = 0; row < rows; ++row) {
+-        for (int64_t out = 0; out < out_features; ++out) {
+-            float sum = weights.bias.has_value() ? bias_values[static_cast<size_t>(out)] : 0.0F;
+-            for (int64_t in = 0; in < in_features; ++in) {
+-                sum += weight_values[static_cast<size_t>(out * in_features + in)] *
+-                    input[static_cast<size_t>(row * in_features + in)];
++    out.columns.resize(weight_values.size());
++    for (int64_t row = 0; row < out.out_features; ++row) {
++        for (int64_t column = 0; column < in_features; ++column) {
++            out.columns[static_cast<size_t>(column * out.out_features + row)] =
++                weight_values[static_cast<size_t>(row * in_features + column)];
++        }
++    }
++    if (weights.bias.has_value()) {
++        out.bias = assets::tensor_data_to_f32("Qwen3 talker host linear bias", *weights.bias);
++        if (static_cast<int64_t>(out.bias.size()) != out.out_features) {
++            throw std::runtime_error("Qwen3 talker host linear bias shape mismatch");
++        }
++    }
++    return out;
++}
++
++void linear_host_rows(
++    const HostLinearWeights & weights,
++    const float * input,
++    float * output,
++    int64_t rows) {
++    const int64_t in_features = weights.in_features;
++    const int64_t out_features = weights.out_features;
++    // A few rows share one pass over the weight, which stays in cache per column.
++    constexpr int64_t kRowBlock = 4;
++    for (int64_t begin = 0; begin < rows; begin += kRowBlock) {
++        const int64_t count = std::min<int64_t>(kRowBlock, rows - begin);
++        for (int64_t row = 0; row < count; ++row) {
++            float * y = output + (begin + row) * out_features;
++            if (weights.bias.empty()) {
++                std::fill(y, y + out_features, 0.0F);
++            } else {
++                std::copy(weights.bias.begin(), weights.bias.end(), y);
++            }
++        }
++        for (int64_t in = 0; in < in_features; ++in) {
++            const float * column = weights.columns.data() + in * out_features;
++            for (int64_t row = 0; row < count; ++row) {
++                const float x = input[(begin + row) * in_features + in];
++                float * y = output + (begin + row) * out_features;
++                for (int64_t out = 0; out < out_features; ++out) {
++                    y[out] += column[out] * x;
++                }
+             }
+-            output[static_cast<size_t>(row * out_features + out)] = sum;
+         }
+     }
++}
++
++std::vector<float> linear_host(
++    const std::vector<float> & input,
++    int64_t rows,
++    const HostLinearWeights & weights) {
++    if (rows < 0 || static_cast<int64_t>(input.size()) != rows * weights.in_features) {
++        throw std::runtime_error("Qwen3 talker host linear input shape mismatch");
++    }
++    std::vector<float> output(static_cast<size_t>(rows * weights.out_features), 0.0F);
++    // Rows are independent, so splitting them over threads changes no value.
++    constexpr int64_t kRowsPerThread = 8;
++    constexpr int64_t kMaxThreads = 8;
++    const int64_t hardware = static_cast<int64_t>(std::max(1U, std::thread::hardware_concurrency()));
++    const int64_t workers = std::max<int64_t>(
++        1, std::min<int64_t>({kMaxThreads, hardware, rows / kRowsPerThread}));
++    if (workers <= 1) {
++        linear_host_rows(weights, input.data(), output.data(), rows);
++        return output;
++    }
++    std::vector<std::thread> threads;
++    threads.reserve(static_cast<size_t>(workers - 1));
++    const int64_t share = (rows + workers - 1) / workers;
++    const auto run = [&](int64_t begin) {
++        const int64_t count = std::min<int64_t>(share, rows - begin);
++        if (count > 0) {
++            linear_host_rows(
++                weights,
++                input.data() + begin * weights.in_features,
++                output.data() + begin * weights.out_features,
++                count);
++        }
++    };
++    for (int64_t worker = 1; worker < workers; ++worker) {
++        threads.emplace_back(run, worker * share);
++    }
++    run(0);
++    for (auto & thread : threads) {
++        thread.join();
++    }
+     return output;
+ }
+ 
+@@ -303,11 +457,12 @@ std::vector<float> text_project_host(
+     int64_t rows,
+     const Qwen3TalkerWeights & weights,
+     const Qwen3TTSTalkerConfig & config) {
+-    auto hidden = linear_host(text_hidden, rows, config.text_hidden_size, weights.text_projection_fc1);
++    (void)config;
++    auto hidden = linear_host(text_hidden, rows, weights.text_projection_fc1_host);
+     for (float & value : hidden) {
+         value = silu(value);
+     }
+-    return linear_host(hidden, rows, config.text_hidden_size, weights.text_projection_fc2);
++    return linear_host(hidden, rows, weights.text_projection_fc2_host);
+ }
+ 
+ core::TensorValue project_code_predictor_input(
+@@ -394,14 +549,143 @@ std::vector<float> repeat_row(const std::vector<float> & row, int64_t repeats) {
      return out;
  }
  
@@ -1336,7 +1716,16 @@ index 5bad35c..3365239 100644
      const auto tts_special_hidden = lookup_rows(
          weights.text_embedding,
          config.text_hidden_size,
-@@ -1641,10 +1835,12 @@ public:
+@@ -641,6 +925,8 @@ Qwen3TalkerWeights load_talker_weights(
+             assets::TensorStorageType::F32,
+             {config.hidden_size}),
+     };
++    weights.text_projection_fc1_host = make_host_linear(weights.text_projection_fc1, config.text_hidden_size);
++    weights.text_projection_fc2_host = make_host_linear(weights.text_projection_fc2, config.text_hidden_size);
+     weights.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
+     const int64_t dim = attention_head_dim(config);
+     for (int64_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+@@ -1641,10 +1927,12 @@ public:
      Impl(
          std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
          int64_t prompt_capacity,
@@ -1351,7 +1740,7 @@ index 5bad35c..3365239 100644
          if (weights_ == nullptr) {
              throw std::runtime_error("Qwen3 talker step runtime requires weights runtime");
          }
-@@ -1656,7 +1852,8 @@ public:
+@@ -1656,7 +1944,8 @@ public:
      Qwen3TalkerCodes generate(
          const Qwen3TalkerPrefill & request,
          const Qwen3TTSGenerationOptions & options,
@@ -1361,7 +1750,7 @@ index 5bad35c..3365239 100644
          const auto total_start = Clock::now();
          const int64_t max_new_tokens = options.max_new_tokens;
          if (max_new_tokens <= 0 || max_new_tokens > generation_capacity_) {
-@@ -1664,10 +1861,53 @@ public:
+@@ -1664,10 +1953,53 @@ public:
          }
          std::mt19937 rng(options.seed);
          const auto prompt_state_start = Clock::now();
@@ -1416,7 +1805,7 @@ index 5bad35c..3365239 100644
              cached_prompt_prefill_ = request;
              cached_prefill_output_.reset();
          }
-@@ -1681,11 +1921,16 @@ public:
+@@ -1681,11 +2013,16 @@ public:
          const auto prefill_start = Clock::now();
          const bool prefill_cache_hit = cached_prefill_output_.has_value();
          if (!prefill_cache_hit) {
@@ -1434,7 +1823,7 @@ index 5bad35c..3365239 100644
          double code_predictor_build_ms = 0.0;
          if (code_predictor_graph_ == nullptr) {
              const auto build_start = Clock::now();
-@@ -1694,8 +1939,12 @@ public:
+@@ -1694,8 +2031,12 @@ public:
          }
          double cached_step_build_ms = 0.0;
          double import_prefill_state_ms = 0.0;
@@ -1447,7 +1836,7 @@ index 5bad35c..3365239 100644
          const runtime::TransformerKVState * cached_state = &prefill_output.state;
          bool cached_graph_has_state = false;
          auto ensure_cached_step_capacity = [&](int64_t required_capacity) {
-@@ -1730,9 +1979,13 @@ public:
+@@ -1730,9 +2071,13 @@ public:
              }
              cached_step_capacity = cached_step_graph_->cache_steps();
          };
@@ -1461,7 +1850,19 @@ index 5bad35c..3365239 100644
          const int64_t trailing_rows = static_cast<int64_t>(state.trailing_text.size()) / config.hidden_size;
          std::vector<int32_t> generated_first_codes;
          generated_first_codes.reserve(static_cast<size_t>(max_new_tokens));
-@@ -1760,6 +2013,7 @@ public:
+@@ -1744,6 +2089,11 @@ public:
+         CodePredictorTiming code_predictor_timing;
+         CachedStepTiming cached_step_timing;
+         for (int64_t step = 0; step < max_new_tokens; ++step) {
++            // Asked once per frame on the streaming and the offline path: a
++            // request nobody is waiting for must not keep the model.
++            if (runtime::cancellation_requested()) {
++                throw runtime::RequestCancelled("Qwen3 generation cancelled: the client disconnected");
++            }
+             auto logits = current.logits.values;
+             const auto processor_start = Clock::now();
+             apply_main_talker_processors(logits, config, generated_first_codes, step, repetition_penalty);
+@@ -1760,6 +2110,7 @@ public:
                  : argmax_index(logits);
              processor_ms += engine::debug::elapsed_ms(processor_start, Clock::now());
              if (first_code == config.codec_eos_token_id) {
@@ -1469,7 +1870,7 @@ index 5bad35c..3365239 100644
                  break;
              }
              if (step + 1 >= max_new_tokens) {
-@@ -1778,6 +2032,16 @@ public:
+@@ -1778,6 +2129,16 @@ public:
              code_predictor_timing.output_read_ms += predictor_timing.output_read_ms;
              out.generated_codes.codes.insert(out.generated_codes.codes.end(), frame.codes.begin(), frame.codes.end());
              ++out.generated_codes.frames;
@@ -1486,11 +1887,12 @@ index 5bad35c..3365239 100644
  
              const auto frame_embed_start = Clock::now();
              const auto text_hidden = step < trailing_rows
-@@ -1809,7 +2073,16 @@ public:
+@@ -1809,7 +2170,17 @@ public:
          out.decoder_input_codes.frames += out.generated_codes.frames;
          debug::timing_log_scalar("qwen3_tts.talker.prompt_state_ms", engine::debug::elapsed_ms(prompt_state_start, prompt_state_end));
          debug::timing_log_scalar("qwen3_tts.talker.prefill_ms", engine::debug::elapsed_ms(prefill_start, prefill_end));
 +        out.prompt_rows = prompt_steps;
++        out.prompt_embed_ms = engine::debug::elapsed_ms(prompt_state_start, prompt_state_end);
 +        out.prompt_prefill_ms = prefill_cache_hit ? 0.0 : engine::debug::elapsed_ms(prefill_start, prefill_end);
 +        out.prompt_import_ms = import_prefill_state_ms;
 +        out.first_frame_ms = first_frame_ms;
@@ -1503,7 +1905,7 @@ index 5bad35c..3365239 100644
          debug::timing_log_scalar("qwen3_tts.talker.code_predictor_build_ms", code_predictor_build_ms);
          debug::timing_log_scalar("qwen3_tts.talker.cached_step_build_ms", cached_step_build_ms);
          debug::timing_log_scalar("qwen3_tts.talker.import_prefill_state_ms", import_prefill_state_ms);
-@@ -1863,6 +2136,10 @@ private:
+@@ -1863,6 +2234,10 @@ private:
      std::optional<Qwen3TalkerPrefill> cached_prompt_prefill_;
      std::optional<PromptEmbeddingState> cached_prompt_state_;
      std::optional<TalkerPrefillGraph::OutputWithCache> cached_prefill_output_;
@@ -1514,7 +1916,7 @@ index 5bad35c..3365239 100644
  };
  
  Qwen3TalkerStepRuntime::Qwen3TalkerStepRuntime(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
-@@ -1876,8 +2153,9 @@ Qwen3TalkerStepRuntime::~Qwen3TalkerStepRuntime() = default;
+@@ -1876,8 +2251,9 @@ Qwen3TalkerStepRuntime::~Qwen3TalkerStepRuntime() = default;
  Qwen3TalkerCodes Qwen3TalkerStepRuntime::generate(
      const Qwen3TalkerPrefill & prefill,
      const Qwen3TTSGenerationOptions & options,
@@ -1526,7 +1928,7 @@ index 5bad35c..3365239 100644
  }
  
  int64_t Qwen3TalkerStepRuntime::release_cached_step_graph() {
-@@ -1915,9 +2193,11 @@ std::shared_ptr<const Qwen3TalkerWeightsRuntime> Qwen3Talker::create_weights_run
+@@ -1915,9 +2291,11 @@ std::shared_ptr<const Qwen3TalkerWeightsRuntime> Qwen3Talker::create_weights_run
  std::shared_ptr<Qwen3TalkerStepRuntime> Qwen3Talker::create_step_runtime(
      std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
      int64_t prompt_capacity,

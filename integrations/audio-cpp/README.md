@@ -160,7 +160,7 @@ uses one completed `offline_full` decoder pass before playback and is not labele
 native streaming. It retains the selected profile's sampler and phrase-queue
 policy while requiring result-derived `offline-full-decoder` proof, so a native
 block loop cannot be silently buffered behind the fallback label. The development
-override enables the pinned eleven-file engine patch, keeps one model resident,
+override enables the pinned thirteen-file engine patch, keeps one model resident,
 and makes **Native incremental PCM (experimental)** selectable through
 `/v1/audio/speech` with `stream:true` and `response_format:"pcm"`. Buffered
 phrase PCM remains the Playground default until native passes the live timing,
@@ -177,10 +177,19 @@ batched pass and keeps generated speech state request-local.
 `qwen3_tts.talker_prefix_cache_slots` keeps its name but only sizes the
 host-side clone prompt material cache (zero by default, four in the
 native-development override). The engine reports where the time before the
-first frame went (`prompt_rows`, `prompt_prefill_ms`, `prompt_import_ms`,
-`first_frame_ms`) in the `speech.generation` event and in `X-AudioCPP-*`
-headers on completed responses. Native first-PCM latency remains a measured
-gate: the batched prefill has not yet been timed on the GPU. Physical
+first frame went (`prompt_rows`, `prompt_embed_ms`, `prompt_prefill_ms`,
+`prompt_import_ms`, `first_frame_ms`) in the `speech.generation` event and in
+`X-AudioCPP-*` headers on completed responses. The host-side text projection
+no longer costs about 10 ms per text token, so the time to the first frame
+does not grow with the length of the text. Every streamed block carries the
+engine's own `seq`, `frames` and `phase`; a request that does not pin the
+lifecycle pair gets its headers after the first labelled block
+(`X-TTS-Native-Engine-Chunk-Proof: engine-attested-first-block`, or
+`engine-attested-single-block` for an utterance shorter than one block), while
+a request that pins the pair keeps the two-delta proof. A closed connection
+stops generation within one frame on the streamed and the non-streamed path,
+and streamed speech has a 30 s send timeout. Native first-PCM latency remains
+a measured gate. Physical
 speaker-loopback AEC3 suppression and human double-talk preservation remain
 user-owned acoustic validation.
 The streaming Playground starts by default for evaluation. Non-streaming uses

@@ -728,7 +728,11 @@ class CandidateNativeWiringTests(unittest.TestCase):
         self.assertIn('line = await lines.__anext__()', source)
         self.assertIn('"X-TTS-Streaming-Mode": "native-incremental-pcm"', source)
         self.assertIn('"X-TTS-Decoder-Mode": verified_decode_mode', source)
-        self.assertIn('"X-TTS-Native-Engine-Chunk-Proof": "two-distinct-sse-delta-events"', source)
+        self.assertIn('NATIVE_CHUNK_PROOF_TWO_DELTAS = "two-distinct-sse-delta-events"', source)
+        self.assertIn(
+            '"X-TTS-Native-Engine-Chunk-Proof": (attested_proof or {}).get("proof", NATIVE_CHUNK_PROOF_TWO_DELTAS)',
+            source,
+        )
 
     def test_thin_overlay_rebuilds_and_copies_the_patched_engine(self) -> None:
         overlay = (INTEGRATION / "Dockerfile.overlay").read_text(encoding="utf-8")
