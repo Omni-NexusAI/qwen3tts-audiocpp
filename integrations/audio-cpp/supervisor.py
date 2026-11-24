@@ -24,7 +24,7 @@ from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 MODULE_DIR = Path(__file__).resolve().parent
 if str(MODULE_DIR) not in sys.path:
@@ -223,6 +223,29 @@ SUPERVISOR_INSTANCE_ID = uuid4().hex
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("audio_cpp_candidate")
 app = FastAPI(title="audio.cpp candidate supervisor")
+
+
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+async def root(request: Request) -> Response:
+    """The bare address of the API port.
+
+    Docker Desktop and similar tools link a published port to its bare address.
+    A browser opening it is sent to Voice Studio, which lives on the other
+    published port; any other client is told where things are.
+    """
+    studio = os.environ.get("AUDIO_CPP_STUDIO_PUBLIC_URL", "").strip()
+    if not re.match(r"https?://", studio):
+        studio = ""
+    if studio and "text/html" in request.headers.get("accept", ""):
+        # 307, not 301: a browser must not remember the address after the port mapping changes.
+        return RedirectResponse(studio, status_code=307)
+    return JSONResponse({
+        "service": "audio.cpp Qwen3-TTS speech server",
+        "voiceStudioUrl": studio or None,
+        "apiBasePath": "/v1",
+        "healthPath": "/health",
+        "statusPath": "/control/status",
+    })
 
 
 @app.get("/v1/audio/outcomes/{request_id}")

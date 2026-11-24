@@ -86,9 +86,16 @@
   masquerading as a safe latency optimization.
 - Normalize Gradio's `seed=-1` random-seed sentinel by omitting `seed` at the
   audio.cpp boundary; audio.cpp accepts only unsigned explicit seed values.
-- The actual editable Studio is the copied Gradio app at `/voice-studio/`. Keep the root HF Realtime
+- The actual editable Studio is the copied Gradio app at `/voice-studio/`. Keep the HF Realtime
   page separate for later streaming/integration testing; never relabel it as
   Voice Studio.
+- The bare address of each published port must lead a browser to Voice Studio, because Docker
+  Desktop links ports that way: the Studio port's `/` and `/voice-studio` redirect (307) to
+  `/voice-studio/`, and the API port's `/` redirects to `AUDIO_CPP_STUDIO_PUBLIC_URL` for a
+  browser and answers JSON with `voiceStudioUrl` otherwise. The Realtime page stays at `/realtime`
+  (`/index.html`); `AUDIO_CPP_ROOT_PAGE=realtime` puts it back at `/`. Compose derives the public
+  addresses from the same port variables it publishes, and the web host prints them at start-up
+  (not `entrypoint.sh`, which the overlay Dockerfiles do not replace).
 - `gradio_voice_studio.py` is the recovered Faster-side copy, adapted only at
   its candidate boundary: preserve its orange custom Studio surface and full
   clone/library/playground layout. Keep model controls visible; Base model

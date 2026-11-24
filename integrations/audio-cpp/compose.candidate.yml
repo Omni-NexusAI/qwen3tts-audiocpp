@@ -17,6 +17,10 @@ services:
       AUDIO_CPP_TTS_MODELS: qwen3-tts-0.6b-base-bf16,qwen3-tts-1.7b-base-bf16
       AUDIO_CPP_NATIVE_INCREMENTAL_PCM: "false"
       VOICE_LIBRARY_DIR: /voices
+      # The addresses as published on the host. They are printed when the
+      # container starts, and a browser opening the API port is sent to Voice Studio.
+      AUDIO_CPP_STUDIO_PUBLIC_URL: http://127.0.0.1:${AUDIO_CPP_STUDIO_PORT:-8891}/voice-studio/
+      AUDIO_CPP_API_PUBLIC_URL: http://127.0.0.1:${AUDIO_CPP_API_PORT:-8890}
     ports:
       - "127.0.0.1:${AUDIO_CPP_API_PORT:-8890}:8080"
       - "127.0.0.1:${AUDIO_CPP_STUDIO_PORT:-8891}:7860"
